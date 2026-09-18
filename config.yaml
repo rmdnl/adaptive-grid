@@ -1,5 +1,4 @@
 environment:
-  # testnet | demo | live
   mode: testnet
   dry_run: true
 
@@ -13,17 +12,17 @@ grid:
   hard_min_net_pct: 0.003
 
 range:
-  mode: auto              # auto | manual
-  lower_price: 90000
-  upper_price: 120000
+  mode: auto
+  lower_price: 0
+  upper_price: 0
   lookback: 200
   buffer_pct: 0.01
   auto:
-    atr_length: 14
     support_quantile: 0.10
     resistance_quantile: 0.90
     min_width_pct: 0.03
     max_width_pct: 0.25
+    min_quality_score: 65
 
 market_filter:
   adx_max: 28
