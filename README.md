@@ -1,37 +1,156 @@
-# Adaptive Risk-Controlled Grid Engine v3.1
+# Adaptive Risk-Controlled Grid Engine v3.2
 
-This is the cleaned foundation for the Binance Spot grid project.
+This package is a full replacement of the previous v3.1 foundation.
 
-## What is fixed in v3.1
+## What changed
 
-- Real Binance kline retrieval through the official `binance-sdk-spot`.
-- Testnet is the default.
-- AUTO range now uses real candle data, not dummy prices.
-- MANUAL range remains available.
-- Range Quality Score now combines range width, ADX, ATR%, Bollinger width, and volume ratio.
-- Real market filter gate for sideways conditions.
-- Fixed geometric grid at 0.60%.
-- Net-profit gate with 0.30% hard minimum.
-- Corrected profit test.
-- SQLite schema foundation.
-- Explicitly keeps live order execution disabled in this foundation release.
+The replacement is deliberately **dry-run only**. It does not submit orders.
 
-## Run
+The main safety changes are:
+
+- Risk decisions are now a real veto. A blocked condition prevents the order plan.
+- Unknown Binance modes fail closed. There is no silent fallback from a typo to production.
+- `Decimal` is used for grid price math.
+- Grid profit is validated across every adjacent cell.
+- Binance `exchangeInfo` is read and symbol filters are parsed.
+- Price/quantity/notional quantization helpers are included.
+- Indicators use Wilder-style RMA smoothing.
+- RSI handles flat and one-sided markets without returning unnecessary NaN values.
+- Volume ratio uses prior closed candles as its baseline.
+- Incomplete 15m candles are removed before decisions.
+- Auto range uses high/low quantiles instead of close-only quantiles.
+- Range Quality includes width, ADX, ATR%, Bollinger width, volume, and current position.
+- Fee retrieval is attempted through Binance account commission when credentials are available, with configured fallback rates otherwise.
+- SQLite uses WAL, busy timeout, foreign keys, and persistent risk events.
+- `.gitignore` protects `.env`, SQLite, and logs.
+- Dependency versions are pinned to the tested package set.
+
+## Safety status
+
+This version is **not live-trading ready**.
+
+There is intentionally no order placement, user-data WebSocket, inventory reservation, or exchange reconciliation in this replacement. Those need a separate implementation and test cycle.
+
+Do not set `dry_run=false` in this version. The config validator fails closed on that state.
+
+## Install
+
+Python 3.10+ is required.
 
 ```bash
 python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Linux/Armbian: source .venv/bin/activate
+```
+
+Windows:
+
+```bash
+.venv\Scripts\activate
+```
+
+Linux / Armbian:
+
+```bash
+source .venv/bin/activate
+```
+
+Install:
+
+```bash
 pip install -r requirements.txt
+```
+
+Create local env:
+
+```bash
 cp .env.example .env
+```
+
+Populate API keys only when needed. Public market-data calls do not require keys.
+
+Run:
+
+```bash
 python main.py
+```
+
+Run tests:
+
+```bash
 pytest -q
 ```
 
-The Binance Spot SDK officially supports Python 3.10+ and the `binance-sdk-spot` package. Binance's official docs list `/api/v3/klines`, exchange information, and Spot Testnet endpoints. Testnet supports Spot `/api/*` endpoints and uses `https://testnet.binance.vision/api`. 
+## Binance Testnet
 
-IMPORTANT: v3.1 is deliberately NOT live-trading-ready. Order placement, user-data WebSocket, reconciliation, symbol-filter quantization, inventory engine, and kill-switch execution must be completed and tested before live funds are enabled.
+Use the Binance Spot Test Network first. The config is already set to:
 
-Official references:
-- https://github.com/binance/binance-connector-python
-- https://github.com/binance/binance-spot-api-docs
+```yaml
+environment:
+  mode: testnet
+  dry_run: true
+```
+
+The testnet endpoint is:
+
+```text
+https://testnet.binance.vision/api
+```
+
+The Spot Test Network supports `/api/*` endpoints and is periodically reset, so local test balances and test orders should not be treated as permanent state.
+
+## Expected validation behavior
+
+Example shape:
+
+```text
+Result:
+  Risk decision : PASS
+  Reason        : PASS
+  Price         : 650.1234
+  Range         : 620 -> 660
+  Grid cells    : 10
+  Net/grid      : 0.3487%
+  Range quality : 78.50/100
+  Fee source    : FALLBACK:...
+  Execution     : DRY RUN, no order placement
+```
+
+An unsafe configuration should look like:
+
+```text
+Result:
+  Risk decision : BLOCK
+  Reason        : NET_PROFIT_BELOW_HARD_MIN | MARKET_FILTER_BLOCK:ADX
+```
+
+The program must never submit an order in this version.
+
+## Design rules
+
+- Spot only.
+- No leverage.
+- No futures.
+- No margin.
+- No martingale.
+- No aggressive averaging.
+- Net profit below 0.30% blocks the grid.
+- 15m closed candles are the decision source.
+- The risk engine is the veto layer.
+- Exchange filters are treated as hard constraints.
+- State storage is persistent, but Binance remains the source of truth for future reconciliation.
+
+## Next implementation stage
+
+The next stage should add, in this order:
+
+1. Inventory manager.
+2. User-data WebSocket.
+3. REST reconciliation.
+4. LIMIT_MAKER order engine.
+5. Partial-fill handling.
+6. Cancel / replace lifecycle.
+7. Crash recovery.
+8. Kill-switch execution.
+9. Testnet integration tests.
+10. Long dry-run soak test.
+
+Only after those pass should live execution be considered.
