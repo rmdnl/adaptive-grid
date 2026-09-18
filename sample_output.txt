@@ -1,0 +1,16 @@
+=== Example only ===
+
+Result:
+  Risk decision : PASS
+  Reason        : PASS
+  Price         : 650.1234
+  Range         : 620 -> 660
+  Grid cells    : 10
+  Net/grid      : 0.3487%
+  Range quality : 78.50/100
+  Fee source    : FALLBACK:...
+  Execution     : DRY RUN, no order placement
+
+BLOCK example:
+  Risk decision : BLOCK
+  Reason        : NET_PROFIT_BELOW_HARD_MIN | MARKET_FILTER_BLOCK:ADX
