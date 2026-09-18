@@ -1,19 +1,15 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-
 ALLOWED_MODES = {"testnet", "live"}
-
 
 class ConfigError(ValueError):
     pass
-
 
 def load_config(path: str = "config.yaml") -> dict[str, Any]:
     p = Path(path)
@@ -24,13 +20,11 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
     validate_config(cfg)
     return cfg
 
-
 def _d(value: Any) -> Decimal:
     try:
         return Decimal(str(value))
     except Exception as exc:
         raise ConfigError(f"Invalid decimal value: {value!r}") from exc
-
 
 def validate_config(cfg: dict[str, Any]) -> None:
     env = cfg.get("environment", {})
@@ -40,17 +34,13 @@ def validate_config(cfg: dict[str, Any]) -> None:
 
     if mode not in ALLOWED_MODES:
         raise ConfigError(f"environment.mode must be one of {sorted(ALLOWED_MODES)}")
-
     if not isinstance(dry_run, bool):
         raise ConfigError("environment.dry_run must be boolean")
-
     if not isinstance(allow_live, bool):
         raise ConfigError("environment.allow_live_execution must be boolean")
-
     if mode == "live" and (dry_run or not allow_live):
         raise ConfigError(
-            "Live mode is fail-closed: use mode=live, dry_run=false, "
-            "and allow_live_execution=true only after live execution is implemented."
+            "Live mode is fail-closed: live execution is not implemented in this release."
         )
 
     symbol = str(cfg.get("symbol", "")).upper().strip()
@@ -75,10 +65,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ConfigError("grid min_cells/max_levels are invalid")
 
     rng = cfg.get("range", {})
-    range_mode = rng.get("mode")
-    if range_mode not in {"auto", "manual"}:
+    if rng.get("mode") not in {"auto", "manual"}:
         raise ConfigError("range.mode must be auto or manual")
-    if range_mode == "manual":
+    if rng.get("mode") == "manual":
         lo = _d(rng.get("lower_price"))
         hi = _d(rng.get("upper_price"))
         if lo <= 0 or hi <= lo:
@@ -101,12 +90,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if _d(execution.get("order_quote_size")) <= 0:
         raise ConfigError("execution.order_quote_size must be > 0")
 
-    # Hard safety invariant for this foundation.
     if not dry_run:
         raise ConfigError(
             "This replacement is deliberately dry-run only. "
             "Keep environment.dry_run=true until a separately audited order engine exists."
         )
-
-    # Return a deep copy is unnecessary for validation, but the function is intentionally side-effect free.
-    _ = deepcopy(cfg)
