@@ -7,35 +7,19 @@ def init_db(path):
     con.executescript('''
     CREATE TABLE IF NOT EXISTS orders (
       client_order_id TEXT PRIMARY KEY,
-      symbol TEXT,
-      side TEXT,
-      grid_index INTEGER,
-      price REAL,
-      quantity REAL,
-      status TEXT,
-      created_at TEXT,
-      updated_at TEXT
+      symbol TEXT NOT NULL, side TEXT NOT NULL, grid_index INTEGER NOT NULL,
+      price REAL NOT NULL, quantity REAL NOT NULL, status TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS fills (
-      trade_id TEXT PRIMARY KEY,
-      order_id TEXT,
-      symbol TEXT,
-      side TEXT,
-      price REAL,
-      quantity REAL,
-      fee REAL,
-      fee_asset TEXT,
-      event_time TEXT
+      trade_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, symbol TEXT NOT NULL,
+      side TEXT NOT NULL, price REAL NOT NULL, quantity REAL NOT NULL,
+      fee REAL NOT NULL, fee_asset TEXT NOT NULL, event_time TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS equity_snapshots (
-      ts TEXT PRIMARY KEY,
-      equity_quote REAL,
-      drawdown_pct REAL
+      ts TEXT PRIMARY KEY, equity_quote REAL NOT NULL, drawdown_pct REAL NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS bot_state (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    );
+    CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     ''')
     con.commit()
     con.close()
