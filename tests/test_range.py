@@ -1,16 +1,21 @@
 import pandas as pd
+import numpy as np
+
+from indicators import enrich
 from range_engine import auto_range
 
-def test_auto_range():
-    close = [100 + (i % 20) * 0.25 for i in range(100)]
+
+def test_auto_range_returns_candidate():
+    n = 160
+    base = 100 + np.sin(np.linspace(0, 12, n)) * 3
     df = pd.DataFrame({
-        "close": close,
-        "adx": [15]*100,
-        "atr_pct": [0.01]*100,
-        "bb_width": [0.03]*100,
-        "volume_ratio": [1.0]*100,
+        "high": base + 1,
+        "low": base - 1,
+        "close": base,
+        "volume": np.full(n, 1000.0),
     })
-    r = auto_range(df)
-    assert r.lower > 0
-    assert r.upper > r.lower
-    assert 0 <= r.quality <= 100
+    df = enrich(df)
+    result = auto_range(df, min_quality_score=0)
+    assert result.lower > 0
+    assert result.upper > result.lower
+    assert 0 <= result.quality <= 100
