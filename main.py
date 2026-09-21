@@ -14,10 +14,12 @@ from indicators import enrich, latest_valid_row
 from market_data import (
     AccountDataError,
     MAX_TICKER_AGE_SECONDS,
+    MarketDataError,
     build_account_risk_state,
     fetch_account_commission,
     fetch_account_snapshot,
     fetch_klines,
+    fetch_open_orders,
     fetch_symbol_info,
     fetch_ticker_price,
     is_ticker_fresh,
@@ -27,7 +29,7 @@ from profit_model import profit_class
 from range_engine import auto_range
 from risk_engine import (
     account_state_gate, combine, cooldown_gate, daily_profit_lock, equity_dd_kill,
-    inventory_gate, market_gate, profit_gate,
+    inventory_gate, market_gate, open_orders_gate, profit_gate,
     open_orders_available_gate, range_break_kill, strict_order_price_gate,
 )
 from storage import init_db, record_risk_event, set_state
@@ -65,21 +67,45 @@ def main():
 
     df=fetch_klines(client,symbol,cfg["timeframe"],cfg["range"]["lookback"],drop_incomplete=True)
     enriched=enrich(df); last=latest_valid_row(enriched)
-    ticker=fetch_ticker_price(client,symbol)
-    if not is_ticker_fresh(ticker, MAX_TICKER_AGE_SECONDS):
-        raise RuntimeError(f"Ticker price is stale or invalid for {ticker.symbol}")
+    ticker=None; ticker_error=None
+    try:
+        ticker=fetch_ticker_price(client,symbol)
+        if not is_ticker_fresh(ticker, MAX_TICKER_AGE_SECONDS):
+            raise MarketDataError(f"Ticker price is stale or invalid for {ticker.symbol}")
+    except MarketDataError as exc:
+        ticker_error=str(exc)
+        logger.error("TICKER DATA BLOCK: %s",ticker_error)
 
     account_snapshot=None; account_risk=None; account_error=None
     try:
         account_snapshot=fetch_account_snapshot(client,rules.base_asset,rules.quote_asset)
-        account_risk=build_account_risk_state(
-            account_snapshot,ticker.price,_SESSION_REFERENCE_EQUITY,
-        )
-        if _SESSION_REFERENCE_EQUITY is None:
-            _SESSION_REFERENCE_EQUITY=account_risk.reference_equity
     except AccountDataError as exc:
         account_error=str(exc)
         logger.error("ACCOUNT DATA BLOCK: %s",account_error)
+
+    open_orders=None; open_orders_error=None
+    try:
+        open_orders=fetch_open_orders(client,symbol)
+    except Exception as exc:
+        # Reconciliation is independent of account-state validation and cannot
+        # be replaced by a persisted count or an assumed empty response.
+        open_orders_error=str(exc)
+        logger.error("OPEN-ORDER RECONCILIATION BLOCK: %s",open_orders_error)
+
+    # Ticker, account, and open orders have now each been independently queried.
+    # A ticker failure still stops this run: there is no safe price fallback.
+    if ticker is None:
+        raise RuntimeError(f"Ticker data unavailable: {ticker_error}")
+    if account_snapshot is not None:
+        try:
+            account_risk=build_account_risk_state(
+                account_snapshot,ticker.price,_SESSION_REFERENCE_EQUITY,
+            )
+            if _SESSION_REFERENCE_EQUITY is None:
+                _SESSION_REFERENCE_EQUITY=account_risk.reference_equity
+        except AccountDataError as exc:
+            account_error=str(exc)
+            logger.error("ACCOUNT RISK BLOCK: %s",account_error)
 
     commission_payload, fee_source_raw=fetch_account_commission(client,symbol)
     fees=effective_fees(
@@ -159,8 +185,13 @@ def main():
         ))
     else:
         decisions.append(account_state_gate(False))
-    # This phase does not reconcile open orders, so unknown is never treated as zero.
-    decisions.append(open_orders_available_gate(False))
+    if open_orders is None:
+        decisions.append(open_orders_available_gate(False))
+    else:
+        decisions.extend((
+            open_orders_available_gate(True),
+            open_orders_gate(len(open_orders),cfg["execution"]["max_open_orders"]),
+        ))
     combined=combine(*decisions)
 
     if not range_approved:
@@ -181,7 +212,9 @@ def main():
         "drawdown_pct":str(account_risk.drawdown_pct) if account_risk else None,
         "base_inventory":str(account_risk.base_inventory) if account_risk else None,
         "account_error":account_error,
-        "open_orders":"UNKNOWN",
+        "open_orders_count":len(open_orders) if open_orders is not None else None,
+        "open_orders_status":"VERIFIED" if open_orders is not None else "UNAVAILABLE",
+        "open_orders_error":open_orders_error,
     })
 
     set_state(db_path,"last_symbol",symbol)
@@ -196,6 +229,12 @@ def main():
             "base_inventory":str(account_risk.base_inventory),
             "inventory_pct":str(account_risk.inventory_pct),
         })
+    # Informational only: this state is never read as current exchange truth.
+    set_state(db_path,"last_open_order_reconciliation",{
+        "count":len(open_orders) if open_orders is not None else None,
+        "status":"VERIFIED" if open_orders is not None else "UNAVAILABLE",
+        "error":open_orders_error,
+    })
 
     cells=validation.cells if validation else 0
     min_net=plan_validation.min_net_pct if plan_validation else Decimal("0")
@@ -221,7 +260,10 @@ def main():
                     float(account_risk.drawdown_pct)*100,account_risk.base_inventory,rules.base_asset)
     else:
         logger.error("Account risk state unavailable: %s",account_error)
-    logger.warning("Open-order state is unavailable in Phase 2B; grid remains blocked.")
+    if open_orders is None:
+        logger.error("Open-order reconciliation unavailable: %s",open_orders_error)
+    else:
+        logger.info("Open orders verified: count=%d",len(open_orders))
 
     if not combined.allowed:
         logger.warning("ORDER PLAN BLOCKED: %s",combined.reason)
@@ -242,7 +284,10 @@ def main():
         print(f"  Drawdown      : {account_risk.drawdown_pct*100:.4f}%")
     else:
         print(f"  Account state : BLOCKED ({account_error})")
-    print("  Open orders   : UNKNOWN (blocked)")
+    if open_orders is None:
+        print(f"  Open orders   : UNAVAILABLE ({open_orders_error})")
+    else:
+        print(f"  Open orders   : VERIFIED ({len(open_orders)})")
     print("  Execution     : DRY RUN, no order placement")
     return 0
 

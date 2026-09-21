@@ -38,6 +38,18 @@ class AccountValidationError(AccountDataError):
     """Raised when Binance account information is malformed or unsafe."""
 
 
+class OpenOrdersDataError(MarketDataError):
+    """Raised when Binance open-order reconciliation cannot be safely used."""
+
+
+class OpenOrdersRequestError(OpenOrdersDataError):
+    """Raised when the read-only Binance open-orders request fails."""
+
+
+class OpenOrdersValidationError(OpenOrdersDataError):
+    """Raised when Binance open-order data is malformed or unsafe."""
+
+
 @dataclass(frozen=True)
 class TickerSnapshot:
     symbol: str
@@ -71,6 +83,23 @@ class AccountRiskState:
     drawdown_pct: Decimal
     base_inventory: Decimal
     inventory_pct: Decimal
+
+
+@dataclass(frozen=True)
+class OpenOrder:
+    """A validated, currently open Binance Spot order."""
+
+    order_id: int
+    client_order_id: str
+    symbol: str
+    side: str
+    order_type: str
+    status: str
+    price: Decimal
+    orig_qty: Decimal
+    executed_qty: Decimal
+    time_in_force: str
+    is_working: bool
 
 @dataclass(frozen=True)
 class MarketSnapshot:
@@ -242,6 +271,135 @@ def fetch_account_snapshot(client, base_asset: str, quote_asset: str) -> Account
         quote_locked=quote_locked,
         fetched_at=datetime.now(timezone.utc),
     )
+
+
+_OPEN_ORDER_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED"})
+_LIMIT_STYLE_ORDER_TYPES = frozenset({
+    "LIMIT", "LIMIT_MAKER", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT",
+})
+
+
+def _open_order_decimal(value: Any, field: str, symbol: str) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise OpenOrdersValidationError(f"Missing {field} for open order on {symbol}")
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise OpenOrdersValidationError(
+            f"Invalid {field} for open order on {symbol}: {value!r}"
+        ) from exc
+    if not decimal_value.is_finite() or decimal_value < 0:
+        raise OpenOrdersValidationError(
+            f"Invalid {field} for open order on {symbol}: {value!r}"
+        )
+    return decimal_value
+
+
+def _parse_open_order(raw: Any, symbol: str) -> OpenOrder:
+    if not isinstance(raw, dict):
+        raise OpenOrdersValidationError(f"Malformed open order for {symbol}: expected object")
+
+    raw_order_id = raw.get("orderId")
+    if raw_order_id is None or isinstance(raw_order_id, bool):
+        raise OpenOrdersValidationError(f"Missing orderId for open order on {symbol}")
+    if isinstance(raw_order_id, int):
+        order_id = raw_order_id
+    elif isinstance(raw_order_id, str) and raw_order_id.isdigit():
+        order_id = int(raw_order_id)
+    else:
+        raise OpenOrdersValidationError(f"Invalid orderId for open order on {symbol}")
+    if order_id <= 0:
+        raise OpenOrdersValidationError(f"Invalid orderId for open order on {symbol}")
+
+    client_order_id = raw.get("clientOrderId")
+    if not isinstance(client_order_id, str) or not client_order_id.strip():
+        raise OpenOrdersValidationError(f"Missing clientOrderId for open order on {symbol}")
+
+    returned_symbol = raw.get("symbol")
+    if not isinstance(returned_symbol, str) or returned_symbol.upper() != symbol:
+        raise OpenOrdersValidationError(
+            f"Open order symbol mismatch: expected {symbol}, received {returned_symbol!r}"
+        )
+
+    side = raw.get("side")
+    if not isinstance(side, str) or side.upper() not in {"BUY", "SELL"}:
+        raise OpenOrdersValidationError(f"Invalid side for open order on {symbol}: {side!r}")
+    order_type = raw.get("type")
+    if not isinstance(order_type, str) or not order_type.strip():
+        raise OpenOrdersValidationError(f"Missing type for open order on {symbol}")
+    status = raw.get("status")
+    if not isinstance(status, str) or status.upper() not in _OPEN_ORDER_STATUSES:
+        raise OpenOrdersValidationError(f"Unexpected open-order status for {symbol}: {status!r}")
+    time_in_force = raw.get("timeInForce")
+    if not isinstance(time_in_force, str) or not time_in_force.strip():
+        raise OpenOrdersValidationError(f"Missing timeInForce for open order on {symbol}")
+    is_working = raw.get("isWorking")
+    if not isinstance(is_working, bool):
+        raise OpenOrdersValidationError(f"Invalid isWorking for open order on {symbol}")
+
+    price = _open_order_decimal(raw.get("price"), "price", symbol)
+    orig_qty = _open_order_decimal(raw.get("origQty"), "origQty", symbol)
+    executed_qty = _open_order_decimal(raw.get("executedQty"), "executedQty", symbol)
+    normalized_type = order_type.upper()
+    if normalized_type in _LIMIT_STYLE_ORDER_TYPES and price <= 0:
+        raise OpenOrdersValidationError(f"Limit-style open order has invalid price on {symbol}")
+    if orig_qty <= 0:
+        raise OpenOrdersValidationError(f"Open order has invalid origQty on {symbol}")
+    if executed_qty > orig_qty:
+        raise OpenOrdersValidationError(f"Open order executedQty exceeds origQty on {symbol}")
+
+    return OpenOrder(
+        order_id=order_id,
+        client_order_id=client_order_id,
+        symbol=symbol,
+        side=side.upper(),
+        order_type=normalized_type,
+        status=status.upper(),
+        price=price,
+        orig_qty=orig_qty,
+        executed_qty=executed_qty,
+        time_in_force=time_in_force.upper(),
+        is_working=is_working,
+    )
+
+
+def fetch_open_orders(client, symbol: str) -> tuple[OpenOrder, ...]:
+    """Read and validate current open Spot orders for exactly one symbol.
+
+    This deliberately calls only the SDK's USER_DATA ``get_open_orders`` endpoint.
+    Request failures and response-validation failures remain distinct so callers
+    cannot mistake an unavailable response for a verified empty order list.
+    """
+    normalized_symbol = str(symbol).upper()
+    if not normalized_symbol:
+        raise OpenOrdersValidationError("Open-order symbol must be non-empty")
+    try:
+        response = client.rest_api.get_open_orders(symbol=normalized_symbol)
+    except Exception as exc:
+        raise OpenOrdersRequestError(
+            f"Binance open-orders request failed for {normalized_symbol}: {exc}"
+        ) from exc
+    try:
+        payload = _model_to_plain(response.data())
+    except Exception as exc:
+        raise OpenOrdersValidationError(
+            f"Malformed Binance open-orders response for {normalized_symbol}: {exc}"
+        ) from exc
+    if not isinstance(payload, list):
+        raise OpenOrdersValidationError(
+            f"Malformed Binance open-orders response for {normalized_symbol}: expected list"
+        )
+
+    orders = tuple(_parse_open_order(raw, normalized_symbol) for raw in payload)
+    order_ids = [order.order_id for order in orders]
+    client_order_ids = [order.client_order_id for order in orders]
+    if len(set(order_ids)) != len(order_ids):
+        raise OpenOrdersValidationError(f"Duplicate orderId in open-orders response for {normalized_symbol}")
+    if len(set(client_order_ids)) != len(client_order_ids):
+        raise OpenOrdersValidationError(
+            f"Duplicate clientOrderId in open-orders response for {normalized_symbol}"
+        )
+    return orders
 
 
 def calculate_spot_equity(snapshot: AccountSnapshot, current_ticker_price: Decimal) -> Decimal:

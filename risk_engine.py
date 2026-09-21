@@ -64,7 +64,7 @@ def open_orders_gate(open_orders, max_open_orders):
     return RiskDecision(False, ("MAX_OPEN_ORDERS_REACHED",)) if int(open_orders) >= int(max_open_orders) else RiskDecision(True)
 
 def open_orders_available_gate(available):
-    return RiskDecision(True) if available else RiskDecision(False, ("OPEN_ORDERS_UNKNOWN",))
+    return RiskDecision(True) if available else RiskDecision(False, ("OPEN_ORDERS_UNAVAILABLE",))
 
 def cooldown_gate(active):
     return RiskDecision(False, ("COOLDOWN_ACTIVE",)) if active else RiskDecision(True)

@@ -233,5 +233,5 @@ def test_account_risk_uses_first_observed_equity_not_fake_history_and_calculates
     assert later.inventory_pct == Decimal("270") / Decimal("390")
 
 
-def test_unknown_open_orders_fails_closed():
-    assert not open_orders_available_gate(False).allowed
+def test_unavailable_open_orders_fails_closed():
+    assert open_orders_available_gate(False).reason == "OPEN_ORDERS_UNAVAILABLE"
