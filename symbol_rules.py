@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
-from typing import Any
+from typing import Any, Iterable
+
+from grid_engine import GridLevel
+from profit_model import net_pct_from_prices
 
 def D(value): return Decimal(str(value))
 
@@ -35,6 +38,126 @@ class SymbolRules:
     max_num_algo_orders: int
 
 class SymbolRuleError(ValueError): pass
+
+@dataclass(frozen=True)
+class OrderPlanCell:
+    index: int
+    buy_price: Decimal
+    sell_price: Decimal
+    quantity: Decimal
+    gross_pct: Decimal
+    net_pct: Decimal
+    allowed: bool
+    reasons: tuple[str, ...]
+
+@dataclass(frozen=True)
+class OrderPlanValidation:
+    allowed: bool
+    reason: str
+    cells: tuple[OrderPlanCell, ...]
+    planned_open_orders: int
+    min_net_pct: Decimal
+    effective_upper: Decimal
+
+def _plan_limit(rules, max_open_orders):
+    limits = [int(max_open_orders)]
+    if rules.max_num_orders > 0:
+        limits.append(rules.max_num_orders)
+    return min(limits)
+
+def validate_quantized_order_plan(
+    levels: Iterable[GridLevel],
+    rules: SymbolRules,
+    quote_size,
+    weighted_avg_price,
+    buy_fee,
+    sell_fee,
+    roundtrip_slippage,
+    hard_min_net_pct,
+    max_open_orders,
+) -> OrderPlanValidation:
+    """Validate a dry-run grid plan after exchange-required rounding.
+
+    Each adjacent pair is modelled as a buy at the lower level followed by a
+    sell at the upper level.  A plan is fail-closed: one rejected cell blocks
+    the complete plan.
+    """
+    level_list = list(levels)
+    if len(level_list) < 2:
+        return OrderPlanValidation(False, "LESS_THAN_ONE_CELL", (), 0, Decimal("0"), Decimal("0"))
+    if rules.tick_size <= 0 or rules.step_size <= 0:
+        return OrderPlanValidation(
+            False, "MISSING_PRICE_OR_LOT_SIZE_RULE", (), 0, Decimal("0"), Decimal("0")
+        )
+
+    quote = D(quote_size)
+    average = D(weighted_avg_price)
+    hard_min = D(hard_min_net_pct)
+    if quote <= 0 or average <= 0:
+        return OrderPlanValidation(False, "INVALID_PLAN_INPUT", (), 0, Decimal("0"), Decimal("0"))
+
+    planned_open_orders = len(level_list) - 1
+    limit = _plan_limit(rules, max_open_orders)
+    if limit < 1 or planned_open_orders > limit:
+        return OrderPlanValidation(
+            False,
+            "MAX_OPEN_ORDERS_PLAN_EXCEEDED",
+            (),
+            planned_open_orders,
+            Decimal("0"),
+            Decimal("0"),
+        )
+
+    cells = []
+    for lower, upper in zip(level_list[:-1], level_list[1:]):
+        reasons = []
+        buy_price = floor_to_step(lower.price, rules.tick_size)
+        sell_price = floor_to_step(upper.price, rules.tick_size)
+        quantity = Decimal("0")
+        gross = Decimal("0")
+        net = Decimal("0")
+        try:
+            buy_price = quantize_price(buy_price, rules)
+            sell_price = quantize_price(sell_price, rules)
+            if sell_price <= buy_price:
+                raise SymbolRuleError("Quantization removes positive grid spread")
+            quantity = quantize_quantity(quote / buy_price, rules)
+            validate_notional(buy_price, quantity, rules)
+            validate_notional(sell_price, quantity, rules)
+            validate_percent_price(buy_price, average, "BUY", rules)
+            validate_percent_price(sell_price, average, "SELL", rules)
+            gross = sell_price / buy_price - Decimal("1")
+            net = net_pct_from_prices(
+                buy_price, sell_price, buy_fee, sell_fee, roundtrip_slippage
+            )
+            if net < hard_min:
+                reasons.append("NET_PROFIT_BELOW_HARD_MIN_AFTER_QUANTIZATION")
+        except (ArithmeticError, SymbolRuleError, ValueError) as exc:
+            reasons.append(f"SYMBOL_RULE_BLOCK:{exc}")
+
+        cells.append(
+            OrderPlanCell(
+                lower.index,
+                buy_price,
+                sell_price,
+                quantity,
+                gross,
+                net,
+                not reasons,
+                tuple(reasons),
+            )
+        )
+
+    minimum = min(cell.net_pct for cell in cells)
+    blocked = [reason for cell in cells for reason in cell.reasons]
+    return OrderPlanValidation(
+        not blocked,
+        "ORDER_PLAN_PASS" if not blocked else " | ".join(blocked),
+        tuple(cells),
+        planned_open_orders,
+        minimum,
+        cells[-1].sell_price,
+    )
 
 def _filter(filters, kind):
     for item in filters:

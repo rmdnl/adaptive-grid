@@ -20,7 +20,7 @@ from risk_engine import (
     range_break_kill, strict_order_price_gate,
 )
 from storage import init_db, record_risk_event, set_state
-from symbol_rules import parse_symbol_info
+from symbol_rules import parse_symbol_info, validate_quantized_order_plan
 
 def _logger(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -72,7 +72,7 @@ def main():
 
     current_price=Decimal(str(last["close"]))
 
-    levels=[]; effective_upper=upper; validation=None; grid_allowed=False; grid_reason="NOT_BUILT"
+    levels=[]; effective_upper=upper; validation=None; plan_validation=None; grid_allowed=False; grid_reason="NOT_BUILT"
     if lower > 0 and upper > lower:
         try:
             levels,effective_upper=build_geometric_grid(
@@ -86,17 +86,35 @@ def main():
                 cfg["fees"]["slippage_roundtrip_pct"],
                 cfg["grid"]["hard_min_net_pct"],
             )
-            grid_allowed=validation.allowed; grid_reason=validation.reason
+            plan_validation=validate_quantized_order_plan(
+                levels,
+                rules,
+                cfg["execution"]["order_quote_size"],
+                current_price,
+                fees.maker,
+                sell_fee,
+                cfg["fees"]["slippage_roundtrip_pct"],
+                cfg["grid"]["hard_min_net_pct"],
+                cfg["execution"]["max_open_orders"],
+            )
+            effective_upper=plan_validation.effective_upper
+            grid_allowed=validation.allowed and plan_validation.allowed
+            grid_reason=(
+                validation.reason if not validation.allowed else plan_validation.reason
+            )
         except (ValueError,ArithmeticError) as exc:
             grid_reason=f"GRID_BUILD_BLOCK:{exc}"
     else:
         grid_reason="INVALID_RANGE"
 
     decisions=[
-        profit_gate(validation.min_net_pct if validation else Decimal("0"),cfg["grid"]["hard_min_net_pct"]),
+        profit_gate(
+            plan_validation.min_net_pct if plan_validation else Decimal("0"),
+            cfg["grid"]["hard_min_net_pct"],
+        ),
         market_gate(last,cfg["market_filter"]),
-        strict_order_price_gate(lower,upper,current_price),
-        range_break_kill(lower,upper,current_price,cfg["risk"]["range_break_buffer_pct"]),
+        strict_order_price_gate(lower,effective_upper,current_price),
+        range_break_kill(lower,effective_upper,current_price,cfg["risk"]["range_break_buffer_pct"]),
         equity_dd_kill(Decimal("0"),cfg["risk"]["max_equity_drawdown_pct"]),
         inventory_gate(Decimal("0"),cfg["execution"]["max_inventory_pct"]),
         open_orders_gate(0,cfg["execution"]["max_open_orders"]),
@@ -112,10 +130,10 @@ def main():
 
     record_risk_event(db_path,combined.allowed,combined.reason,{
         "symbol":symbol,"price":str(current_price),
-        "range":[str(lower),str(upper)],
+        "range":[str(lower),str(effective_upper)],
         "range_quality":range_quality,
         "grid_levels":len(levels),
-        "min_net_pct":str(validation.min_net_pct if validation else Decimal("0")),
+        "min_net_pct":str(plan_validation.min_net_pct if plan_validation else Decimal("0")),
         "grid_reason":grid_reason,
         "fee_source":fee_source,
     })
@@ -126,12 +144,12 @@ def main():
     set_state(db_path,"last_risk_decision",{"allowed":combined.allowed,"reason":combined.reason})
 
     cells=validation.cells if validation else 0
-    min_net=validation.min_net_pct if validation else Decimal("0")
+    min_net=plan_validation.min_net_pct if plan_validation else Decimal("0")
 
     logger.info("=== Adaptive Grid v3.2.1 Safety Foundation ===")
     logger.info("Mode=%s dry_run=%s symbol=%s",mode,cfg["environment"]["dry_run"],symbol)
     logger.info("Price=%s Range=%s -> %s Quality=%.2f Reason=%s Position=%.2f",
-                current_price,lower,upper,range_quality,range_reason,position_in_range)
+                current_price,lower,effective_upper,range_quality,range_reason,position_in_range)
     logger.info("Fees maker=%s taker=%s source=%s | Grid step=%.3f%% cells=%d effective_upper=%s",
                 fees.maker,fees.taker,fee_source,float(cfg["grid"]["step_pct"])*100,cells,effective_upper)
     logger.info("Indicators ADX=%.2f ATR=%.3f%% BB=%.3f%% Vol=%.2fx RSI=%.2f",

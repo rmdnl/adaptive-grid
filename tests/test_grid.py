@@ -22,3 +22,8 @@ def test_range_boundary():
     assert range_break(100,110,98.9,0.01)
     assert not range_break(100,110,100,0.01)
     assert inside_range(100,110,105)
+
+def test_effective_upper_is_last_executable_grid_level():
+    levels, effective_upper = build_geometric_grid(100, 110, 0.006, min_cells=6, max_levels=40)
+    assert effective_upper == levels[-1].price
+    assert effective_upper < Decimal("110")

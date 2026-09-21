@@ -1,5 +1,6 @@
 from decimal import Decimal
 from profit_model import net_pct_from_step, passes, profit_class
+from backtest import net_pct_from_step as backtest_net_pct_from_step
 
 def test_locked_grid_net_is_above_hard_min():
     value=net_pct_from_step("0.006","0.001","0.001","0.0005")
@@ -13,3 +14,6 @@ def test_profit_class():
     assert profit_class("0.0029","0.003","0.004") == "BLOCK"
     assert profit_class("0.0035","0.003","0.004") == "PREFERRED"
     assert profit_class("0.0045","0.003","0.004") == "PASS_ABOVE_TARGET"
+
+def test_backtest_uses_available_profit_model_function():
+    assert backtest_net_pct_from_step("0.006", "0.001", "0.001", "0.0005") > Decimal("0.003")
