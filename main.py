@@ -11,7 +11,15 @@ from config_loader import ConfigError, load_config
 from fee_model import effective_fees
 from grid_engine import build_geometric_grid, validate_grid_profit
 from indicators import enrich, latest_valid_row
-from market_data import fetch_account_commission, fetch_klines, fetch_symbol_info, make_client
+from market_data import (
+    MAX_TICKER_AGE_SECONDS,
+    fetch_account_commission,
+    fetch_klines,
+    fetch_symbol_info,
+    fetch_ticker_price,
+    is_ticker_fresh,
+    make_client,
+)
 from profit_model import profit_class
 from range_engine import auto_range
 from risk_engine import (
@@ -50,6 +58,9 @@ def main():
 
     df=fetch_klines(client,symbol,cfg["timeframe"],cfg["range"]["lookback"],drop_incomplete=True)
     enriched=enrich(df); last=latest_valid_row(enriched)
+    ticker=fetch_ticker_price(client,symbol)
+    if not is_ticker_fresh(ticker, MAX_TICKER_AGE_SECONDS):
+        raise RuntimeError(f"Ticker price is stale or invalid for {ticker.symbol}")
 
     commission_payload, fee_source_raw=fetch_account_commission(client,symbol)
     fees=effective_fees(
@@ -70,7 +81,7 @@ def main():
         range_quality, range_reason = candidate.quality, candidate.reason
         range_approved, position_in_range = candidate.approved, candidate.position_in_range
 
-    current_price=Decimal(str(last["close"]))
+    current_price=ticker.price
 
     levels=[]; effective_upper=upper; validation=None; plan_validation=None; grid_allowed=False; grid_reason="NOT_BUILT"
     if lower > 0 and upper > lower:

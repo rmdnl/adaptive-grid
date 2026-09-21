@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,6 +19,18 @@ INTERVAL_MAP = {
     "30m":"INTERVAL_30m","1h":"INTERVAL_1h","2h":"INTERVAL_2h","4h":"INTERVAL_4h",
     "6h":"INTERVAL_6h","8h":"INTERVAL_8h","12h":"INTERVAL_12h","1d":"INTERVAL_1d",
 }
+MAX_TICKER_AGE_SECONDS = 10
+
+
+class MarketDataError(RuntimeError):
+    """Raised when Binance market data cannot be safely used."""
+
+
+@dataclass(frozen=True)
+class TickerSnapshot:
+    symbol: str
+    price: Decimal
+    fetched_at: datetime
 
 @dataclass(frozen=True)
 class MarketSnapshot:
@@ -59,6 +72,75 @@ def _enum_value(name):
     if member is not None:
         return getattr(member, "value", member)
     return KlinesIntervalEnum[name].value
+
+
+def fetch_ticker_price(client, symbol) -> TickerSnapshot:
+    """Fetch the current Spot ticker price for risk and execution gates.
+
+    The Binance ticker response has no market-data timestamp, so ``fetched_at``
+    deliberately records the local UTC time at which this request completed.
+    """
+    normalized_symbol = str(symbol).upper()
+    try:
+        response = client.rest_api.ticker_price(symbol=normalized_symbol)
+        payload = _model_to_plain(response.data())
+    except Exception as exc:
+        raise MarketDataError(
+            f"Binance ticker price request failed for {normalized_symbol}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise MarketDataError(
+            f"Malformed Binance ticker price response for {normalized_symbol}: expected object"
+        )
+
+    returned_symbol = payload.get("symbol")
+    if returned_symbol is not None and str(returned_symbol).upper() != normalized_symbol:
+        raise MarketDataError(
+            f"Malformed Binance ticker price response for {normalized_symbol}: "
+            f"received symbol {returned_symbol!r}"
+        )
+
+    raw_price = payload.get("price")
+    if raw_price is None or isinstance(raw_price, bool):
+        raise MarketDataError(
+            f"Malformed Binance ticker price response for {normalized_symbol}: missing price"
+        )
+    try:
+        price = Decimal(str(raw_price))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise MarketDataError(
+            f"Invalid Binance ticker price for {normalized_symbol}: {raw_price!r}"
+        ) from exc
+    if not price.is_finite() or price <= 0:
+        raise MarketDataError(
+            f"Invalid Binance ticker price for {normalized_symbol}: {raw_price!r}"
+        )
+
+    return TickerSnapshot(
+        symbol=normalized_symbol,
+        price=price,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
+def is_ticker_fresh(snapshot: TickerSnapshot, max_age_seconds=MAX_TICKER_AGE_SECONDS) -> bool:
+    """Return whether a locally timestamped ticker is still safe to use."""
+    try:
+        max_age = Decimal(str(max_age_seconds))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("max_age_seconds must be a non-negative number") from exc
+    if not max_age.is_finite() or max_age < 0:
+        raise ValueError("max_age_seconds must be a non-negative number")
+
+    fetched_at = getattr(snapshot, "fetched_at", None)
+    if not isinstance(fetched_at, datetime) or fetched_at.tzinfo is None:
+        return False
+    if fetched_at.utcoffset() != timezone.utc.utcoffset(fetched_at):
+        return False
+
+    age_seconds = Decimal(str((datetime.now(timezone.utc) - fetched_at).total_seconds()))
+    return Decimal("0") <= age_seconds <= max_age
 
 def fetch_klines(client, symbol, interval="15m", limit=200, drop_incomplete=True):
     if interval not in INTERVAL_MAP:
