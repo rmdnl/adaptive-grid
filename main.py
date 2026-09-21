@@ -12,8 +12,11 @@ from fee_model import effective_fees
 from grid_engine import build_geometric_grid, validate_grid_profit
 from indicators import enrich, latest_valid_row
 from market_data import (
+    AccountDataError,
     MAX_TICKER_AGE_SECONDS,
+    build_account_risk_state,
     fetch_account_commission,
+    fetch_account_snapshot,
     fetch_klines,
     fetch_symbol_info,
     fetch_ticker_price,
@@ -23,12 +26,15 @@ from market_data import (
 from profit_model import profit_class
 from range_engine import auto_range
 from risk_engine import (
-    combine, cooldown_gate, daily_profit_lock, equity_dd_kill,
-    inventory_gate, market_gate, open_orders_gate, profit_gate,
-    range_break_kill, strict_order_price_gate,
+    account_state_gate, combine, cooldown_gate, daily_profit_lock, equity_dd_kill,
+    inventory_gate, market_gate, profit_gate,
+    open_orders_available_gate, range_break_kill, strict_order_price_gate,
 )
 from storage import init_db, record_risk_event, set_state
 from symbol_rules import parse_symbol_info, validate_quantized_order_plan
+
+# Intentionally process-local: no historical equity is inferred or persisted.
+_SESSION_REFERENCE_EQUITY: Decimal | None = None
 
 def _logger(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -40,6 +46,7 @@ def _logger(path):
     return logger
 
 def main():
+    global _SESSION_REFERENCE_EQUITY
     load_dotenv()
     try:
         cfg=load_config()
@@ -61,6 +68,18 @@ def main():
     ticker=fetch_ticker_price(client,symbol)
     if not is_ticker_fresh(ticker, MAX_TICKER_AGE_SECONDS):
         raise RuntimeError(f"Ticker price is stale or invalid for {ticker.symbol}")
+
+    account_snapshot=None; account_risk=None; account_error=None
+    try:
+        account_snapshot=fetch_account_snapshot(client,rules.base_asset,rules.quote_asset)
+        account_risk=build_account_risk_state(
+            account_snapshot,ticker.price,_SESSION_REFERENCE_EQUITY,
+        )
+        if _SESSION_REFERENCE_EQUITY is None:
+            _SESSION_REFERENCE_EQUITY=account_risk.reference_equity
+    except AccountDataError as exc:
+        account_error=str(exc)
+        logger.error("ACCOUNT DATA BLOCK: %s",account_error)
 
     commission_payload, fee_source_raw=fetch_account_commission(client,symbol)
     fees=effective_fees(
@@ -118,6 +137,10 @@ def main():
     else:
         grid_reason="INVALID_RANGE"
 
+    if account_error:
+        grid_allowed=False
+        grid_reason=f"{grid_reason}|ACCOUNT_DATA_UNAVAILABLE"
+
     decisions=[
         profit_gate(
             plan_validation.min_net_pct if plan_validation else Decimal("0"),
@@ -126,12 +149,18 @@ def main():
         market_gate(last,cfg["market_filter"]),
         strict_order_price_gate(lower,effective_upper,current_price),
         range_break_kill(lower,effective_upper,current_price,cfg["risk"]["range_break_buffer_pct"]),
-        equity_dd_kill(Decimal("0"),cfg["risk"]["max_equity_drawdown_pct"]),
-        inventory_gate(Decimal("0"),cfg["execution"]["max_inventory_pct"]),
-        open_orders_gate(0,cfg["execution"]["max_open_orders"]),
         cooldown_gate(False),
         daily_profit_lock(Decimal("0"),cfg["risk"]["daily_profit_lock_pct"]),
     ]
+    if account_risk:
+        decisions.extend((
+            equity_dd_kill(account_risk.drawdown_pct,cfg["risk"]["max_equity_drawdown_pct"]),
+            inventory_gate(account_risk.inventory_pct,cfg["execution"]["max_inventory_pct"]),
+        ))
+    else:
+        decisions.append(account_state_gate(False))
+    # This phase does not reconcile open orders, so unknown is never treated as zero.
+    decisions.append(open_orders_available_gate(False))
     combined=combine(*decisions)
 
     if not range_approved:
@@ -147,12 +176,26 @@ def main():
         "min_net_pct":str(plan_validation.min_net_pct if plan_validation else Decimal("0")),
         "grid_reason":grid_reason,
         "fee_source":fee_source,
+        "current_equity":str(account_risk.current_equity) if account_risk else None,
+        "reference_equity":str(account_risk.reference_equity) if account_risk else None,
+        "drawdown_pct":str(account_risk.drawdown_pct) if account_risk else None,
+        "base_inventory":str(account_risk.base_inventory) if account_risk else None,
+        "account_error":account_error,
+        "open_orders":"UNKNOWN",
     })
 
     set_state(db_path,"last_symbol",symbol)
     set_state(db_path,"last_price",str(current_price))
     set_state(db_path,"last_range",{"lower":str(lower),"upper":str(effective_upper)})
     set_state(db_path,"last_risk_decision",{"allowed":combined.allowed,"reason":combined.reason})
+    if account_risk:
+        set_state(db_path,"last_account_risk",{
+            "current_equity":str(account_risk.current_equity),
+            "reference_equity":str(account_risk.reference_equity),
+            "drawdown_pct":str(account_risk.drawdown_pct),
+            "base_inventory":str(account_risk.base_inventory),
+            "inventory_pct":str(account_risk.inventory_pct),
+        })
 
     cells=validation.cells if validation else 0
     min_net=plan_validation.min_net_pct if plan_validation else Decimal("0")
@@ -172,6 +215,13 @@ def main():
                 grid_reason,combined.reason)
     logger.info("Symbol rules tick=%s step=%s minQty=%s minNotional=%s",
                 rules.tick_size,rules.step_size,rules.min_qty,rules.min_notional)
+    if account_risk:
+        logger.info("Account equity=%s %s reference=%s drawdown=%.4f%% base_inventory=%s %s",
+                    account_risk.current_equity,rules.quote_asset,account_risk.reference_equity,
+                    float(account_risk.drawdown_pct)*100,account_risk.base_inventory,rules.base_asset)
+    else:
+        logger.error("Account risk state unavailable: %s",account_error)
+    logger.warning("Open-order state is unavailable in Phase 2B; grid remains blocked.")
 
     if not combined.allowed:
         logger.warning("ORDER PLAN BLOCKED: %s",combined.reason)
@@ -187,6 +237,12 @@ def main():
     print(f"  Net/grid      : {min_net*100:.4f}%")
     print(f"  Range quality : {range_quality:.2f}/100")
     print(f"  Fee source    : {fee_source}")
+    if account_risk:
+        print(f"  Equity        : {account_risk.current_equity} {rules.quote_asset}")
+        print(f"  Drawdown      : {account_risk.drawdown_pct*100:.4f}%")
+    else:
+        print(f"  Account state : BLOCKED ({account_error})")
+    print("  Open orders   : UNKNOWN (blocked)")
     print("  Execution     : DRY RUN, no order placement")
     return 0
 

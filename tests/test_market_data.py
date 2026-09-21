@@ -5,12 +5,18 @@ from types import SimpleNamespace
 import pytest
 
 from market_data import (
+    AccountRequestError,
+    AccountValidationError,
     MarketDataError,
     TickerSnapshot,
+    build_account_risk_state,
+    calculate_spot_equity,
+    fetch_account_snapshot,
     fetch_klines,
     fetch_ticker_price,
     is_ticker_fresh,
 )
+from risk_engine import account_state_gate, open_orders_available_gate
 
 
 class FakeResponse:
@@ -140,3 +146,92 @@ def test_ticker_failure_never_falls_back_to_candle_close():
         fetch_ticker_price(client, "BTCUSDT")
 
     assert client.rest_api.kline_calls == []
+
+
+def _account_client(payload=None, error=None):
+    def get_account(**kwargs):
+        if error:
+            raise error
+        return FakeResponse(payload)
+    return SimpleNamespace(rest_api=SimpleNamespace(get_account=get_account))
+
+
+def _account_payload(base="BTC", quote="USDT", base_free="1.25", base_locked="0.25",
+                     quote_free="100", quote_locked="20"):
+    return {"balances": [
+        {"asset": base, "free": base_free, "locked": base_locked},
+        {"asset": quote, "free": quote_free, "locked": quote_locked},
+    ]}
+
+
+@pytest.mark.parametrize(("base", "quote"), [("BTC", "USDT"), ("BNB", "USDT")])
+def test_fetch_account_snapshot_parses_configured_pair_assets(base, quote):
+    snapshot = fetch_account_snapshot(_account_client(_account_payload(base, quote)), base, quote)
+
+    assert snapshot.base_asset == base
+    assert snapshot.quote_asset == quote
+    assert snapshot.base_free == Decimal("1.25")
+    assert snapshot.quote_locked == Decimal("20")
+
+
+def test_account_snapshot_totals_include_free_and_locked_balances():
+    snapshot = fetch_account_snapshot(_account_client(_account_payload()), "BTC", "USDT")
+
+    assert snapshot.base_total == Decimal("1.50")
+    assert snapshot.quote_total == Decimal("120")
+
+
+@pytest.mark.parametrize(("balances", "asset"), [
+    ([{"asset": "USDT", "free": "1", "locked": "0"}], "BTC"),
+    ([{"asset": "BTC", "free": "1", "locked": "0"}], "USDT"),
+])
+def test_fetch_account_snapshot_rejects_missing_required_asset(balances, asset):
+    with pytest.raises(AccountValidationError, match=asset):
+        fetch_account_snapshot(_account_client({"balances": balances}), "BTC", "USDT")
+
+
+@pytest.mark.parametrize("base_free", ["not-a-number", "-0.01"])
+def test_fetch_account_snapshot_rejects_malformed_or_negative_balance(base_free):
+    with pytest.raises(AccountValidationError, match="balance"):
+        fetch_account_snapshot(
+            _account_client(_account_payload(base_free=base_free)), "BTC", "USDT"
+        )
+
+
+def test_account_api_failure_is_distinct_and_fails_closed():
+    with pytest.raises(AccountRequestError, match="account information request failed"):
+        fetch_account_snapshot(_account_client(error=OSError("offline")), "BTC", "USDT")
+
+    assert not account_state_gate(False).allowed
+
+
+def test_spot_equity_marks_base_inventory_with_ticker_price():
+    snapshot = fetch_account_snapshot(_account_client(_account_payload()), "BTC", "USDT")
+
+    assert calculate_spot_equity(snapshot, Decimal("200")) == Decimal("420")
+
+
+@pytest.mark.parametrize("reference", [Decimal("0"), Decimal("-1")])
+def test_account_risk_rejects_zero_or_negative_reference_equity(reference):
+    snapshot = fetch_account_snapshot(_account_client(_account_payload()), "BTC", "USDT")
+
+    with pytest.raises(AccountValidationError, match="Reference equity must be positive"):
+        build_account_risk_state(snapshot, Decimal("200"), reference)
+
+
+def test_account_risk_uses_first_observed_equity_not_fake_history_and_calculates_drawdown():
+    snapshot = fetch_account_snapshot(_account_client(_account_payload()), "BTC", "USDT")
+
+    first = build_account_risk_state(snapshot, Decimal("200"))
+    later = build_account_risk_state(snapshot, Decimal("180"), first.reference_equity)
+
+    assert first.current_equity == first.reference_equity == Decimal("420")
+    assert first.drawdown_pct == Decimal("0")
+    assert later.current_equity == Decimal("390")
+    assert later.drawdown_pct == Decimal("30") / Decimal("420")
+    assert later.base_inventory == Decimal("1.50")
+    assert later.inventory_pct == Decimal("270") / Decimal("390")
+
+
+def test_unknown_open_orders_fails_closed():
+    assert not open_orders_available_gate(False).allowed

@@ -26,11 +26,51 @@ class MarketDataError(RuntimeError):
     """Raised when Binance market data cannot be safely used."""
 
 
+class AccountDataError(MarketDataError):
+    """Raised when read-only Binance account data cannot be safely used."""
+
+
+class AccountRequestError(AccountDataError):
+    """Raised when Binance rejects or fails an account-information request."""
+
+
+class AccountValidationError(AccountDataError):
+    """Raised when Binance account information is malformed or unsafe."""
+
+
 @dataclass(frozen=True)
 class TickerSnapshot:
     symbol: str
     price: Decimal
     fetched_at: datetime
+
+
+@dataclass(frozen=True)
+class AccountSnapshot:
+    base_asset: str
+    base_free: Decimal
+    base_locked: Decimal
+    quote_asset: str
+    quote_free: Decimal
+    quote_locked: Decimal
+    fetched_at: datetime
+
+    @property
+    def base_total(self) -> Decimal:
+        return self.base_free + self.base_locked
+
+    @property
+    def quote_total(self) -> Decimal:
+        return self.quote_free + self.quote_locked
+
+
+@dataclass(frozen=True)
+class AccountRiskState:
+    current_equity: Decimal
+    reference_equity: Decimal
+    drawdown_pct: Decimal
+    base_inventory: Decimal
+    inventory_pct: Decimal
 
 @dataclass(frozen=True)
 class MarketSnapshot:
@@ -141,6 +181,114 @@ def is_ticker_fresh(snapshot: TickerSnapshot, max_age_seconds=MAX_TICKER_AGE_SEC
 
     age_seconds = Decimal(str((datetime.now(timezone.utc) - fetched_at).total_seconds()))
     return Decimal("0") <= age_seconds <= max_age
+
+
+def _account_decimal(value: Any, asset: str, field: str) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise AccountValidationError(f"Missing {field} balance for {asset}")
+    try:
+        balance = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise AccountValidationError(
+            f"Invalid {field} balance for {asset}: {value!r}"
+        ) from exc
+    if not balance.is_finite() or balance < 0:
+        raise AccountValidationError(
+            f"Invalid {field} balance for {asset}: {value!r}"
+        )
+    return balance
+
+
+def _account_asset_balance(balances: list[Any], asset: str) -> tuple[Decimal, Decimal]:
+    matches = [
+        balance for balance in balances
+        if isinstance(balance, dict) and str(balance.get("asset", "")).upper() == asset
+    ]
+    if len(matches) != 1:
+        raise AccountValidationError(f"Required account balance missing or ambiguous for {asset}")
+    balance = matches[0]
+    return (
+        _account_decimal(balance.get("free"), asset, "free"),
+        _account_decimal(balance.get("locked"), asset, "locked"),
+    )
+
+
+def fetch_account_snapshot(client, base_asset: str, quote_asset: str) -> AccountSnapshot:
+    """Fetch required Spot balances through Binance's read-only account endpoint."""
+    base = str(base_asset).upper()
+    quote = str(quote_asset).upper()
+    if not base or not quote or base == quote:
+        raise AccountValidationError("Base and quote assets must be distinct, non-empty symbols")
+    try:
+        response = client.rest_api.get_account(omit_zero_balances=False)
+        payload = _model_to_plain(response.data())
+    except Exception as exc:
+        raise AccountRequestError(
+            f"Binance account information request failed for {base}/{quote}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("balances"), list):
+        raise AccountValidationError(
+            f"Malformed Binance account response for {base}/{quote}: missing balances"
+        )
+    base_free, base_locked = _account_asset_balance(payload["balances"], base)
+    quote_free, quote_locked = _account_asset_balance(payload["balances"], quote)
+    return AccountSnapshot(
+        base_asset=base,
+        base_free=base_free,
+        base_locked=base_locked,
+        quote_asset=quote,
+        quote_free=quote_free,
+        quote_locked=quote_locked,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
+def calculate_spot_equity(snapshot: AccountSnapshot, current_ticker_price: Decimal) -> Decimal:
+    """Mark the two-asset Spot account in its quote asset using a fresh ticker."""
+    if not isinstance(snapshot, AccountSnapshot):
+        raise AccountValidationError("A validated AccountSnapshot is required for equity")
+    try:
+        price = Decimal(str(current_ticker_price))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise AccountValidationError("Ticker price is invalid for equity calculation") from exc
+    if not price.is_finite() or price <= 0:
+        raise AccountValidationError("Ticker price must be positive for equity calculation")
+    return snapshot.quote_total + snapshot.base_total * price
+
+
+def build_account_risk_state(
+    snapshot: AccountSnapshot,
+    current_ticker_price: Decimal,
+    reference_equity: Decimal | None = None,
+) -> AccountRiskState:
+    """Build observation-only account risk state for the current process session.
+
+    With no persisted trading ledger, a missing reference is deliberately set to
+    this process's first valid observed equity; it is never treated as history.
+    """
+    current_equity = calculate_spot_equity(snapshot, current_ticker_price)
+    raw_reference = current_equity if reference_equity is None else reference_equity
+    try:
+        reference = Decimal(str(raw_reference))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise AccountValidationError("Reference equity is invalid") from exc
+    if not reference.is_finite() or reference <= 0:
+        raise AccountValidationError("Reference equity must be positive")
+    if current_equity < 0:
+        raise AccountValidationError("Current equity cannot be negative")
+
+    base_inventory = snapshot.base_total
+    inventory_quote = base_inventory * Decimal(str(current_ticker_price))
+    inventory_pct = inventory_quote / current_equity if current_equity > 0 else Decimal("0")
+    drawdown_pct = max(Decimal("0"), (reference - current_equity) / reference)
+    return AccountRiskState(
+        current_equity=current_equity,
+        reference_equity=reference,
+        drawdown_pct=drawdown_pct,
+        base_inventory=base_inventory,
+        inventory_pct=inventory_pct,
+    )
 
 def fetch_klines(client, symbol, interval="15m", limit=200, drop_incomplete=True):
     if interval not in INTERVAL_MAP:

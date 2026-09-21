@@ -34,6 +34,9 @@ def market_gate(last_row: Any, cfg: dict):
 def equity_dd_kill(drawdown_pct, max_dd_pct):
     return RiskDecision(False, ("EQUITY_DRAWDOWN_KILL",)) if D(drawdown_pct) >= D(max_dd_pct) else RiskDecision(True)
 
+def account_state_gate(available):
+    return RiskDecision(True) if available else RiskDecision(False, ("ACCOUNT_DATA_UNAVAILABLE",))
+
 def strict_order_price_gate(lower, upper, price):
     lo, hi, px = map(D, (lower, upper, price))
     if px < lo:
@@ -59,6 +62,9 @@ def inventory_gate(inventory_pct, max_inventory_pct):
 
 def open_orders_gate(open_orders, max_open_orders):
     return RiskDecision(False, ("MAX_OPEN_ORDERS_REACHED",)) if int(open_orders) >= int(max_open_orders) else RiskDecision(True)
+
+def open_orders_available_gate(available):
+    return RiskDecision(True) if available else RiskDecision(False, ("OPEN_ORDERS_UNKNOWN",))
 
 def cooldown_gate(active):
     return RiskDecision(False, ("COOLDOWN_ACTIVE",)) if active else RiskDecision(True)

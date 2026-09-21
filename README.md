@@ -61,6 +61,15 @@ Artinya:
 
 **JANGAN nyalain live trading.**
 
+### Account-risk state (Phase 2B)
+
+Bot membaca saldo Spot base/quote secara read-only dan menilai equity dengan
+harga ticker terbaru. Referensi equity adalah equity valid pertama dalam proses
+yang sedang berjalan; nilainya tidak dipersistenkan dan bukan riwayat account.
+Karena itu drawdown hanya observasional untuk satu process session, bukan
+drawdown historis. Open-order reconciliation belum diimplementasikan, sehingga
+status open order dianggap **UNKNOWN** dan risk gate memblokir order plan.
+
 Bahkan kalau lu merasa:
 
 > "Tenang bro, gue tau risikonya."
