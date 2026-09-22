@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -11,6 +12,13 @@ from dotenv import load_dotenv
 from config_loader import ConfigError, load_config
 from fee_model import effective_fees
 from grid_engine import build_geometric_grid, validate_grid_profit
+from grid_planner import (
+    ActivePlan,
+    AdaptiveGridPlan,
+    PlanBlockReason,
+    PlanDecision,
+    evaluate_adaptive_grid_plan,
+)
 from indicators import enrich, latest_valid_row
 from market_data import (
     AccountDataError,
@@ -51,7 +59,7 @@ from risk_engine import (
     inventory_gate, market_gate, open_orders_gate, profit_gate,
     open_orders_available_gate, range_break_kill, strict_order_price_gate,
 )
-from storage import init_db, record_risk_event, set_state
+from storage import get_state, init_db, record_risk_event, set_state
 from symbol_rules import parse_symbol_info, validate_quantized_order_plan
 
 # Intentionally process-local: no historical equity is inferred or persisted.
@@ -87,7 +95,7 @@ def _paper_order_intents(plan, symbol, order_type, prefix):
     return intents
 
 def _submit_paper_orders(engine, plan, symbol, risk_decision, lower_price,
-                          order_type, prefix, dry_run):
+                          order_type, prefix, dry_run, submit_new=True):
     if not dry_run or not risk_decision.allowed or not plan.allowed:
         return []
 
@@ -96,6 +104,9 @@ def _submit_paper_orders(engine, plan, symbol, risk_decision, lower_price,
         existing = engine.get(intent.client_order_id)
         if existing is not None:
             orders.append(existing)
+            continue
+        if not submit_new:
+            # Phase 5A: current plan stays untouched — no new orders, no cancellation.
             continue
         orders.append(
             engine.submit(intent, risk_decision, lower_price, plan.effective_upper)
@@ -263,6 +274,86 @@ def main():
                 extra_diagnostics={"error": str(exc)},
             )
 
+    # Phase 5A: adaptive grid planner — read-only candidate-plan decision layer.
+    # Consumes Phase 4 market intelligence; never places or cancels orders.
+    adaptive_plan: AdaptiveGridPlan | None = None
+    active_plan: ActivePlan | None = None
+    allow_new_orders = True
+    if "adaptive_planner" in cfg and market_intelligence_decision is not None:
+        eval_index = int(get_state(db_path, "adaptive_eval_index") or "0") + 1
+        set_state(db_path, "adaptive_eval_index", str(eval_index))
+
+        raw_active = get_state(db_path, "last_active_plan")
+        if raw_active:
+            try:
+                active_data = json.loads(raw_active)
+                active_plan = ActivePlan(
+                    plan_id=active_data["plan_id"],
+                    candidate_lower=Decimal(str(active_data["candidate_lower"])),
+                    candidate_upper=Decimal(str(active_data["candidate_upper"])),
+                    grid_step=Decimal(str(active_data["grid_step"])),
+                    grid_count=int(active_data["grid_count"]),
+                    regime=MarketRegime(active_data["regime"]),
+                    range_quality_score=Decimal(str(active_data["range_quality_score"])),
+                    candle_index=int(active_data.get("candle_index", 0)),
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                active_plan = None
+
+        base_available = Decimal(str(cfg["paper"]["initial_base_balance"]))
+        try:
+            adaptive_plan = evaluate_adaptive_grid_plan(
+                pair=symbol,
+                regime=market_intelligence_decision.regime,
+                range_quality_score=market_intelligence_decision.range_quality_score,
+                current_price=current_price,
+                configured_lower=lower,
+                configured_upper=upper,
+                available_base_inventory=base_available,
+                cfg=cfg,
+                active_plan=active_plan,
+                current_candle_index=eval_index,
+            )
+        except Exception as exc:
+            logger.error("ADAPTIVE PLANNER BLOCK: %s", exc)
+            adaptive_plan = AdaptiveGridPlan(
+                plan_id="plan_error",
+                pair=symbol,
+                regime=market_intelligence_decision.regime,
+                range_quality_score=market_intelligence_decision.range_quality_score,
+                candidate_lower=lower,
+                candidate_upper=upper,
+                grid_type="GEOMETRIC",
+                grid_step=Decimal(str(cfg["grid"]["step_pct"])),
+                grid_count=0,
+                levels=(),
+                total_quote_budget=Decimal(str(cfg["execution"]["total_quote_budget"])),
+                buy_quote_budget=Decimal("0"),
+                required_base_inventory=Decimal("0"),
+                available_base_inventory=base_available,
+                inventory_sufficient=False,
+                estimated_net_profit_per_grid=Decimal("0"),
+                decision=PlanDecision.GRID_BLOCKED,
+                reasons=(PlanBlockReason.INVALID_MARKET_DATA,),
+            )
+
+        if adaptive_plan.decision == PlanDecision.GRID_ALLOWED:
+            allow_new_orders = True
+            set_state(db_path, "last_active_plan", {
+                "plan_id": adaptive_plan.plan_id,
+                "candidate_lower": str(adaptive_plan.candidate_lower),
+                "candidate_upper": str(adaptive_plan.candidate_upper),
+                "grid_step": str(adaptive_plan.grid_step),
+                "grid_count": adaptive_plan.grid_count,
+                "regime": adaptive_plan.regime.value,
+                "range_quality_score": str(adaptive_plan.range_quality_score),
+                "candle_index": eval_index,
+            })
+        else:
+            # KEEP_CURRENT_PLAN / RECONFIGURATION_REQUIRED / GRID_BLOCKED:
+            # current plan stays in place; no new orders are placed.
+            allow_new_orders = False
+
     levels=[]; effective_upper=upper; validation=None; plan_validation=None; grid_allowed=False; grid_reason="NOT_BUILT"
     if lower > 0 and upper > lower:
         try:
@@ -336,6 +427,9 @@ def main():
     if market_intelligence_decision is not None and not market_intelligence_decision.allowed:
         reasons_str = "|".join(r.value for r in market_intelligence_decision.reasons)
         combined=combine(combined,type(combined)(False,(f"MARKET_INTELLIGENCE:GRID_BLOCKED:{reasons_str}",)))
+    if adaptive_plan is not None and adaptive_plan.decision == PlanDecision.GRID_BLOCKED:
+        reasons_str = "|".join(r.value for r in adaptive_plan.reasons)
+        combined=combine(combined,type(combined)(False,(f"ADAPTIVE_PLANNER:GRID_BLOCKED:{reasons_str}",)))
 
     record_risk_event(db_path,combined.allowed,combined.reason,{
         "symbol":symbol,"price":str(current_price),
@@ -357,6 +451,8 @@ def main():
         "open_orders_count":len(open_orders) if open_orders is not None else None,
         "open_orders_status":"VERIFIED" if open_orders is not None else "UNAVAILABLE",
         "open_orders_error":open_orders_error,
+        "adaptive_plan_decision": adaptive_plan.decision.value if adaptive_plan is not None else None,
+        "adaptive_plan_reasons": [r.value for r in adaptive_plan.reasons] if adaptive_plan is not None else None,
     })
 
     set_state(db_path,"last_symbol",symbol)
@@ -371,6 +467,19 @@ def main():
             "regime": market_intelligence_decision.regime.value,
             "range_quality_score": str(market_intelligence_decision.range_quality_score),
             "diagnostics": market_intelligence_decision.diagnostics,
+        })
+    if adaptive_plan is not None:
+        set_state(db_path,"last_adaptive_plan",{
+            "plan_id": adaptive_plan.plan_id,
+            "decision": adaptive_plan.decision.value,
+            "reasons": [r.value for r in adaptive_plan.reasons],
+            "regime": adaptive_plan.regime.value,
+            "range_quality_score": str(adaptive_plan.range_quality_score),
+            "candidate_lower": str(adaptive_plan.candidate_lower),
+            "candidate_upper": str(adaptive_plan.candidate_upper),
+            "grid_step": str(adaptive_plan.grid_step),
+            "grid_count": adaptive_plan.grid_count,
+            "estimated_net_profit_per_grid": str(adaptive_plan.estimated_net_profit_per_grid),
         })
     if account_risk:
         set_state(db_path,"last_account_risk",{
@@ -403,6 +512,12 @@ def main():
                 float(min_net)*100,
                 profit_class(min_net,cfg["grid"]["hard_min_net_pct"],cfg["grid"]["preferred_net_max_pct"]),
                 grid_reason,combined.reason)
+    if adaptive_plan is not None:
+        logger.info("Adaptive planner decision=%s reasons=%s grid_count=%d net_pct=%.4f%%",
+                    adaptive_plan.decision.value,
+                    [r.value for r in adaptive_plan.reasons],
+                    adaptive_plan.grid_count,
+                    float(adaptive_plan.estimated_net_profit_per_grid)*100)
     logger.info("Symbol rules tick=%s step=%s minQty=%s minNotional=%s",
                 rules.tick_size,rules.step_size,rules.min_qty,rules.min_notional)
     if account_risk:
@@ -442,6 +557,7 @@ def main():
             order_type,
             "AG",
             cfg["environment"]["dry_run"],
+            submit_new=allow_new_orders,
         )
     state_counts = {}
     for order in paper_orders:
@@ -466,6 +582,11 @@ def main():
         print(f"  Grid allowed  : {'YES' if market_intelligence_decision.allowed else 'NO'}")
         if not market_intelligence_decision.allowed:
             print(f"  Block reasons : {[r.value for r in market_intelligence_decision.reasons]}")
+    if adaptive_plan is not None:
+        print(f"  Adaptive plan : {adaptive_plan.decision.value}")
+        print(f"  Plan grid     : cells={adaptive_plan.grid_count} range={adaptive_plan.candidate_lower} -> {adaptive_plan.candidate_upper}")
+        if adaptive_plan.reasons:
+            print(f"  Plan block    : {[r.value for r in adaptive_plan.reasons]}")
     print(f"  Price         : {current_price}")
     print(f"  Range         : {lower} -> {effective_upper}")
     print(f"  Grid cells    : {cells}")

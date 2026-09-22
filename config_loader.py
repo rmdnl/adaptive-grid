@@ -125,6 +125,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if "market_intelligence" in cfg:
         _validate_market_intelligence(cfg)
 
+    if "adaptive_planner" in cfg:
+        _validate_adaptive_planner(cfg)
+
 def _require_positive_int(section: str, key: str, value: Any, minimum: int = 1) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"market_intelligence.{section}.{key} must be an integer")
@@ -228,3 +231,49 @@ def _validate_market_intelligence(cfg: dict[str, Any]) -> None:
         weights.append(weight)
     if sum(weights) != _d("1"):
         raise ConfigError("market_intelligence.quality weights must sum exactly to 1")
+
+
+def _validate_adaptive_planner(cfg: dict[str, Any]) -> None:
+    """Validate the Phase 5A adaptive-planner configuration.
+
+    Missing or malformed values fail closed instead of silently using defaults.
+    """
+    ap = cfg.get("adaptive_planner")
+    if not isinstance(ap, dict):
+        raise ConfigError("adaptive_planner section is required")
+
+    _require_positive_int("adaptive_planner", "cooldown_candles",
+                          ap.get("cooldown_candles"), 1)
+
+    hyst = ap.get("hysteresis")
+    if not isinstance(hyst, dict):
+        raise ConfigError("adaptive_planner.hysteresis section is required")
+
+    range_change_pct = _d(hyst.get("range_change_pct"))
+    if not range_change_pct.is_finite() or range_change_pct <= 0:
+        raise ConfigError("adaptive_planner.hysteresis.range_change_pct must be > 0")
+
+    step_change_pct = _d(hyst.get("step_change_pct"))
+    if not step_change_pct.is_finite() or step_change_pct <= 0:
+        raise ConfigError("adaptive_planner.hysteresis.step_change_pct must be > 0")
+
+    try:
+        grid_count_change = int(hyst.get("grid_count_change"))
+    except (TypeError, ValueError):
+        raise ConfigError(
+            "adaptive_planner.hysteresis.grid_count_change must be an integer >= 0"
+        )
+    if grid_count_change < 0:
+        raise ConfigError("adaptive_planner.hysteresis.grid_count_change must be >= 0")
+
+    quality_degradation = _d(hyst.get("quality_degradation"))
+    if not quality_degradation.is_finite() or quality_degradation < 0:
+        raise ConfigError(
+            "adaptive_planner.hysteresis.quality_degradation must be >= 0"
+        )
+
+    regime_change = hyst.get("regime_change")
+    if not isinstance(regime_change, bool):
+        raise ConfigError(
+            "adaptive_planner.hysteresis.regime_change must be boolean"
+        )
