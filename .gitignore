@@ -13,3 +13,6 @@ logs/*.jsonl
 *.bak
 .pytest-tmp*/
 *.sqlite3
+
+# CodeBuddy download artifacts — not part of the project
+.codebuddy/skills/Downloads/
