@@ -46,6 +46,13 @@ fees:
   taker_fee_fallback: 0.001
   slippage_roundtrip_pct: 0.0005
 
+paper:
+  initial_base_balance: 2
+  initial_quote_balance: 1000
+  maker_fee: 0.001
+  taker_fee: 0.001
+  fee_asset: USDT
+
 risk:
   max_equity_drawdown_pct: 0.02
   range_break_buffer_pct: 0.01

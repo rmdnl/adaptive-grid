@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from market_data import (
     is_ticker_fresh,
     make_client,
 )
+from paper_accounting import PaperAccountingEngine
+from order_engine import OrderIntent, PaperOrderEngine, make_client_order_id
 from profit_model import profit_class
 from range_engine import auto_range
 from risk_engine import (
@@ -47,6 +50,42 @@ def _logger(path):
     fh=logging.FileHandler(path, encoding="utf-8"); fh.setFormatter(formatter); logger.addHandler(fh)
     return logger
 
+def _paper_order_intents(plan, symbol, order_type, prefix):
+    created_at = datetime.now(timezone.utc)
+    intents = []
+    for cell in plan.cells:
+        if not cell.allowed:
+            continue
+        for side, price in (("BUY", cell.buy_price), ("SELL", cell.sell_price)):
+            intents.append(OrderIntent(
+                client_order_id=make_client_order_id(prefix, symbol, cell.index, side),
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                price=price,
+                quantity=cell.quantity,
+                time_in_force="GTC",
+                grid_index=cell.index,
+                created_at=created_at,
+            ))
+    return intents
+
+def _submit_paper_orders(engine, plan, symbol, risk_decision, lower_price,
+                          order_type, prefix, dry_run):
+    if not dry_run or not risk_decision.allowed or not plan.allowed:
+        return []
+
+    orders = []
+    for intent in _paper_order_intents(plan, symbol, order_type, prefix):
+        existing = engine.get(intent.client_order_id)
+        if existing is not None:
+            orders.append(existing)
+            continue
+        orders.append(
+            engine.submit(intent, risk_decision, lower_price, plan.effective_upper)
+        )
+    return orders
+
 def main():
     global _SESSION_REFERENCE_EQUITY
     load_dotenv()
@@ -55,6 +94,8 @@ def main():
     except ConfigError as exc:
         print(f"CONFIG BLOCK: {exc}")
         return 2
+    if not cfg["environment"]["dry_run"]:
+        raise RuntimeError("DRY_RUN must remain enabled; live execution is disabled")
 
     db_path=cfg["logging"]["sqlite_path"]; init_db(db_path)
     logger=_logger(cfg["logging"]["log_path"])
@@ -265,10 +306,47 @@ def main():
     else:
         logger.info("Open orders verified: count=%d",len(open_orders))
 
+    paper_orders = []
+    if combined.allowed and plan_validation is not None:
+        accounting = PaperAccountingEngine(
+            rules.base_asset,
+            rules.quote_asset,
+            Decimal(str(cfg["paper"]["initial_base_balance"])),
+            Decimal(str(cfg["paper"]["initial_quote_balance"])),
+            Decimal(str(cfg["paper"]["maker_fee"])),
+            Decimal(str(cfg["paper"]["taker_fee"])),
+            str(cfg["paper"]["fee_asset"]),
+        )
+        engine = PaperOrderEngine(db_path, accounting=accounting)
+        order_type = (
+            "LIMIT_MAKER"
+            if cfg["execution"]["prefer_limit_maker"]
+            else "LIMIT"
+        )
+        paper_orders = _submit_paper_orders(
+            engine,
+            plan_validation,
+            symbol,
+            combined,
+            lower,
+            order_type,
+            "AG",
+            cfg["environment"]["dry_run"],
+        )
+    state_counts = {}
+    for order in paper_orders:
+        state = order.state.value
+        state_counts[state] = state_counts.get(state, 0) + 1
+    set_state(db_path,"last_paper_orders",{
+        "count":len(paper_orders),
+        "states":state_counts,
+    })
+
     if not combined.allowed:
         logger.warning("ORDER PLAN BLOCKED: %s",combined.reason)
     else:
-        logger.info("ORDER PLAN PASS: dry-run only, no order is submitted.")
+        logger.info("ORDER PLAN PASS: paper orders submitted=%d states=%s",
+                    len(paper_orders), state_counts)
 
     print("\nResult:")
     print(f"  Risk decision : {'PASS' if combined.allowed else 'BLOCK'}")

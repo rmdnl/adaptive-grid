@@ -90,6 +90,32 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if _d(execution.get("order_quote_size")) <= 0:
         raise ConfigError("execution.order_quote_size must be > 0")
 
+    paper = cfg.get("paper", {})
+    for required_key in (
+        "initial_base_balance",
+        "initial_quote_balance",
+        "maker_fee",
+        "taker_fee",
+        "fee_asset",
+    ):
+        if required_key not in paper:
+            raise ConfigError(f"paper.{required_key} is required")
+    initial_base = _d(paper.get("initial_base_balance"))
+    initial_quote = _d(paper.get("initial_quote_balance"))
+    if initial_base < 0:
+        raise ConfigError("paper.initial_base_balance cannot be negative")
+    if initial_quote < 0:
+        raise ConfigError("paper.initial_quote_balance cannot be negative")
+    maker_fee = _d(paper.get("maker_fee"))
+    taker_fee = _d(paper.get("taker_fee"))
+    if maker_fee < 0:
+        raise ConfigError("paper.maker_fee cannot be negative")
+    if taker_fee < 0:
+        raise ConfigError("paper.taker_fee cannot be negative")
+    fee_asset = str(paper.get("fee_asset", "")).upper().strip()
+    if not fee_asset:
+        raise ConfigError("paper.fee_asset is required")
+
     if not dry_run:
         raise ConfigError(
             "This replacement is deliberately dry-run only. "

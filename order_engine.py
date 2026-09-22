@@ -8,10 +8,24 @@ import re
 from typing import Callable
 
 from risk_engine import RiskDecision
-from storage import get_order, init_db, save_order
+from paper_accounting import PaperAccountingEngine
+from recovery import RecoveryResult, RecoveryUnhealthyError, recover_paper_state
+from storage import (
+    FillIdentityMismatch,
+    get_fill,
+    get_order,
+    init_db,
+    save_order,
+    save_order_submission,
+    save_paper_fill,
+    ensure_paper_account_state,
+    get_paper_account_state,
+    get_paper_reservation,
+)
 
 
 _CLIENT_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,36}$")
+_FILL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SUPPORTED_ORDER_TYPES = frozenset({"LIMIT", "LIMIT_MAKER"})
 
 
@@ -37,6 +51,18 @@ class OrderPriceOutOfRange(ValueError):
 
 class OrderIdentityMismatch(OrderIntentValidationError):
     """Raised when an intent ID does not encode its configured grid identity."""
+
+
+class PaperFillValidationError(ValueError):
+    """Raised when a paper-fill request is malformed."""
+
+
+class PaperFillStateError(PaperFillValidationError):
+    """Raised when an order state cannot accept a paper fill."""
+
+
+class PaperFillSymbolMismatch(PaperFillValidationError):
+    """Raised when a paper-fill symbol does not match its order."""
 
 
 class OrderState(str, Enum):
@@ -128,6 +154,33 @@ class PaperOrder:
     intent: OrderIntent
     state: OrderState
     updated_at: datetime
+    executed_qty: Decimal = Decimal("0")
+
+    @property
+    def remaining_qty(self) -> Decimal:
+        return self.intent.quantity - self.executed_qty
+
+
+@dataclass(frozen=True)
+class PaperFill:
+    fill_id: str
+    client_order_id: str
+    symbol: str
+    side: str
+    price: Decimal
+    quantity: Decimal
+    executed_qty: Decimal
+    remaining_qty: Decimal
+    state: OrderState
+    filled_at: datetime
+
+
+@dataclass(frozen=True)
+class PaperFillResult:
+    order: PaperOrder
+    fill: PaperFill | None
+    applied: bool
+    idempotent: bool = False
 
 
 def transition_order(order: PaperOrder, target: OrderState, updated_at: datetime) -> PaperOrder:
@@ -140,6 +193,17 @@ def transition_order(order: PaperOrder, target: OrderState, updated_at: datetime
     return replace(order, state=target, updated_at=updated_at)
 
 
+class PaperStateUnhealthyError(RuntimeError):
+    """Raised when paper state reconciliation fails and execution is gated."""
+
+    def __init__(self, result: RecoveryResult):
+        self.result = result
+        messages = "; ".join(str(e) for e in result.errors)
+        super().__init__(
+            f"Paper state is unhealthy; execution gated: {messages}"
+        )
+
+
 class PaperOrderEngine:
     """Deterministic local-only execution state machine; it has no Binance client."""
 
@@ -148,6 +212,8 @@ class PaperOrderEngine:
         db_path: str,
         clock: Callable[[], datetime] | None = None,
         client_order_prefix: str = "AG",
+        accounting: PaperAccountingEngine | None = None,
+        reconcile_on_init: bool = True,
     ):
         self.db_path = db_path
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -158,7 +224,38 @@ class PaperOrderEngine:
                 "client_order_prefix must be ASCII alphanumeric"
             )
         self.client_order_prefix = client_order_prefix
+        self.accounting = accounting
         init_db(db_path)
+        self._recovery_result: RecoveryResult | None = None
+        if self.accounting is not None:
+            ensure_paper_account_state(db_path, self.accounting.initial_state())
+            # Recovery/reconciliation is part of the paper-accounting layer,
+            # which seeds and owns ``paper_account_state``.  Automatic
+            # reconciliation and its fail-closed gate only apply then;
+            # accounting-less engines keep running the deterministic order and
+            # fill state machine without a reconciliation gate.
+            if reconcile_on_init:
+                self.reconcile()
+
+    def reconcile(self) -> RecoveryResult:
+        """Run a read-only recovery and reconciliation, caching the result.
+
+        When the result is unhealthy, ``submit``, ``apply_fill``, and
+        ``transition`` will raise ``PaperStateUnhealthyError``.
+        """
+        self._recovery_result = recover_paper_state(self.db_path)
+        return self._recovery_result
+
+    @property
+    def recovery_result(self) -> RecoveryResult | None:
+        """The most recent reconciliation result, or ``None`` if not yet run."""
+        return self._recovery_result
+
+    def _ensure_healthy(self) -> None:
+        """Gate: raise if the last reconciliation was unhealthy."""
+        result = self._recovery_result
+        if result is not None and not result.healthy:
+            raise PaperStateUnhealthyError(result)
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -176,7 +273,12 @@ class PaperOrderEngine:
             quantity=Decimal(row["quantity"]), time_in_force=row["time_in_force"],
             grid_index=int(row["grid_index"]), created_at=datetime.fromisoformat(row["created_at"]),
         )
-        return PaperOrder(intent, OrderState(row["status"]), datetime.fromisoformat(row["updated_at"]))
+        return PaperOrder(
+            intent,
+            OrderState(row["status"]),
+            datetime.fromisoformat(row["updated_at"]),
+            Decimal(row["executed_qty"]),
+        )
 
     def submit(
         self,
@@ -185,6 +287,7 @@ class PaperOrderEngine:
         lower_price: Decimal,
         effective_upper: Decimal,
     ) -> PaperOrder:
+        self._ensure_healthy()
         if not isinstance(intent, OrderIntent):
             raise OrderIntentValidationError("A valid OrderIntent is required")
         expected_client_order_id = make_client_order_id(
@@ -210,18 +313,241 @@ class PaperOrderEngine:
             raise DuplicateOrder(
                 f"Duplicate client_order_id {intent.client_order_id} in local state {existing.state.value}"
             )
-        order = PaperOrder(intent, OrderState.PLANNED, self._now())
-        save_order(self.db_path, order)
-        order = transition_order(order, OrderState.SUBMITTED, self._now())
-        save_order(self.db_path, order)
-        order = transition_order(order, OrderState.OPEN, self._now())
-        save_order(self.db_path, order)
-        return order
+        planned = PaperOrder(intent, OrderState.PLANNED, self._now())
+        submitted = transition_order(planned, OrderState.SUBMITTED, self._now())
+        opened = transition_order(submitted, OrderState.OPEN, self._now())
+        accounting_update = None
+        if self.accounting is not None:
+            state = get_paper_account_state(self.db_path)
+            if state is None:
+                raise RuntimeError("Paper account state is missing")
+            state_obj = PaperOrderEngine._state_from_dict(state)
+            accounting_update = self.accounting.prepare_reservation(
+                state_obj, opened, self._now()
+            )
+        save_order_submission(
+            self.db_path, planned, submitted, opened, accounting_update
+        )
+        return opened
+
+    def apply_fill(
+        self,
+        client_order_id: str,
+        fill_id: str,
+        symbol: str,
+        market_price: Decimal,
+        quantity: Decimal,
+        filled_at: datetime | None = None,
+        fee_rate: Decimal | None = None,
+        fee_asset: str | None = None,
+    ) -> PaperFillResult:
+        self._ensure_healthy()
+        if not isinstance(fill_id, str) or not _FILL_ID_RE.fullmatch(fill_id):
+            raise PaperFillValidationError("fill_id must be non-empty and paper-safe")
+
+        order = self.get(client_order_id)
+        if order is None:
+            raise KeyError(f"Unknown paper order: {client_order_id}")
+        if symbol != order.intent.symbol:
+            raise PaperFillSymbolMismatch(
+                f"Fill symbol {symbol!r} does not match order symbol {order.intent.symbol!r}"
+            )
+
+        try:
+            price = _decimal(market_price, "market_price")
+            fill_quantity = _decimal(quantity, "fill_quantity")
+        except OrderIntentValidationError as exc:
+            raise PaperFillValidationError(str(exc)) from exc
+        if filled_at is None:
+            filled_at = self._now()
+        elif not isinstance(filled_at, datetime) or filled_at.tzinfo is None:
+            raise PaperFillValidationError("filled_at must be timezone-aware")
+
+        existing_fill = get_fill(self.db_path, fill_id)
+        if existing_fill is not None:
+            same_event = (
+                existing_fill["order_id"] == client_order_id
+                and existing_fill["symbol"] == symbol
+                and existing_fill["side"] == order.intent.side
+                and Decimal(existing_fill["price"]) == price
+                and Decimal(existing_fill["quantity"]) == fill_quantity
+            )
+            if not same_event:
+                raise FillIdentityMismatch(
+                    f"Fill identity {fill_id!r} was already used with different semantics"
+                )
+            existing_fill_obj = PaperFill(
+                fill_id=existing_fill["trade_id"],
+                client_order_id=existing_fill["order_id"],
+                symbol=existing_fill["symbol"],
+                side=existing_fill["side"],
+                price=Decimal(existing_fill["price"]),
+                quantity=Decimal(existing_fill["quantity"]),
+                executed_qty=Decimal(existing_fill["executed_qty"]),
+                remaining_qty=Decimal(existing_fill["remaining_qty"]),
+                state=OrderState(existing_fill["resulting_state"]),
+                filled_at=datetime.fromisoformat(existing_fill["event_time"]),
+            )
+            return PaperFillResult(
+                order=order,
+                fill=existing_fill_obj,
+                applied=False,
+                idempotent=True,
+            )
+
+        if order.state not in {OrderState.OPEN, OrderState.PARTIALLY_FILLED}:
+            raise PaperFillStateError(
+                f"Order state {order.state.value} cannot accept a paper fill"
+            )
+
+        side = order.intent.side
+        if (side == "BUY" and price > order.intent.price) or (
+            side == "SELL" and price < order.intent.price
+        ):
+            return PaperFillResult(order=order, fill=None, applied=False)
+
+        if fill_quantity > order.remaining_qty:
+            raise PaperFillValidationError(
+                f"Fill quantity {fill_quantity} exceeds remaining quantity {order.remaining_qty}"
+            )
+
+        executed_qty = order.executed_qty + fill_quantity
+        remaining_qty = order.intent.quantity - executed_qty
+        target_state = (
+            OrderState.FILLED if remaining_qty == 0 else OrderState.PARTIALLY_FILLED
+        )
+        filled_order = replace(
+            order,
+            state=target_state,
+            updated_at=filled_at,
+            executed_qty=executed_qty,
+        )
+        fill = PaperFill(
+            fill_id=fill_id,
+            client_order_id=client_order_id,
+            symbol=symbol,
+            side=side,
+            price=price,
+            quantity=fill_quantity,
+            executed_qty=executed_qty,
+            remaining_qty=remaining_qty,
+            state=target_state,
+            filled_at=filled_at,
+        )
+
+        accounting_update = None
+        if self.accounting is not None:
+            state = get_paper_account_state(self.db_path)
+            reservation = get_paper_reservation(
+                self.db_path, client_order_id
+            )
+            if state is None or reservation is None:
+                raise RuntimeError("Paper accounting state or reservation is missing")
+            state_obj = PaperOrderEngine._state_from_dict(state)
+            reservation_obj = PaperOrderEngine._reservation_from_dict(reservation)
+            accounting_update = self.accounting.prepare_fill_accounting(
+                state_obj,
+                reservation_obj,
+                order,
+                filled_order,
+                fill,
+                fee_rate=fee_rate,
+                fee_asset=fee_asset,
+            )
+        applied = save_paper_fill(
+            self.db_path, order, filled_order, fill, accounting_update
+        )
+        if not applied:
+            existing = get_fill(self.db_path, fill_id)
+            if existing is None:
+                raise FillIdentityMismatch(
+                    f"Fill identity {fill_id!r} exists but its event cannot be read"
+                )
+            existing_fill = PaperFill(
+                fill_id=existing["trade_id"],
+                client_order_id=existing["order_id"],
+                symbol=existing["symbol"],
+                side=existing["side"],
+                price=Decimal(existing["price"]),
+                quantity=Decimal(existing["quantity"]),
+                executed_qty=Decimal(existing["executed_qty"]),
+                remaining_qty=Decimal(existing["remaining_qty"]),
+                state=OrderState(existing["resulting_state"]),
+                filled_at=datetime.fromisoformat(existing["event_time"]),
+            )
+            return PaperFillResult(
+                order=self.get(client_order_id) or filled_order,
+                fill=existing_fill,
+                applied=False,
+                idempotent=True,
+            )
+
+        return PaperFillResult(
+            order=filled_order,
+            fill=fill,
+            applied=True,
+        )
+
+    @staticmethod
+    def _state_from_dict(state):
+        from paper_accounting import PaperAccountState
+
+        return PaperAccountState(
+            base_asset=state["base_asset"],
+            quote_asset=state["quote_asset"],
+            base_free=state["base_free"],
+            base_reserved=state["base_reserved"],
+            quote_free=state["quote_free"],
+            quote_reserved=state["quote_reserved"],
+            average_cost=state["average_cost"],
+            realized_pnl=state["realized_pnl"],
+            total_fees=state["total_fees"],
+            updated_at=state["updated_at"],
+        )
+
+    @staticmethod
+    def _reservation_from_dict(reservation):
+        from paper_accounting import PaperReservation
+
+        return PaperReservation(
+            client_order_id=reservation["client_order_id"],
+            side=reservation["side"],
+            asset=reservation["asset"],
+            original_amount=reservation["original_amount"],
+            remaining_amount=reservation["remaining_amount"],
+            created_at=reservation["created_at"],
+            updated_at=reservation["updated_at"],
+        )
 
     def transition(self, client_order_id: str, target: OrderState) -> PaperOrder:
+        self._ensure_healthy()
         order = self.get(client_order_id)
         if order is None:
             raise KeyError(f"Unknown paper order: {client_order_id}")
         updated = transition_order(order, target, self._now())
-        save_order(self.db_path, updated)
+        accounting_update = None
+        if self.accounting is not None and target in {
+            OrderState.CANCELED,
+            OrderState.REJECTED,
+        }:
+            reservation = get_paper_reservation(self.db_path, client_order_id)
+            if reservation is not None:
+                state = get_paper_account_state(self.db_path)
+                if state is None:
+                    raise RuntimeError("Paper account state is missing")
+                state_obj = PaperOrderEngine._state_from_dict(state)
+                reservation_obj = PaperOrderEngine._reservation_from_dict(reservation)
+                accounting_update = self.accounting.prepare_release(
+                    state_obj,
+                    reservation_obj,
+                    updated,
+                    target,
+                    self._now(),
+                )
+        save_order(
+            self.db_path,
+            updated,
+            accounting_update,
+            expected_order=order,
+        )
         return updated

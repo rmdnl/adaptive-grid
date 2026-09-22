@@ -3,6 +3,7 @@ from decimal import Decimal
 import re
 import sqlite3
 
+import storage
 import pytest
 
 from order_engine import (
@@ -20,7 +21,13 @@ from order_engine import (
     transition_order,
 )
 from risk_engine import RiskDecision, equity_dd_kill, open_orders_gate, profit_gate, strict_order_price_gate
-from storage import OrderPersistenceError, get_order, init_db, save_order
+from storage import (
+    OrderPersistenceError,
+    OrderSubmissionError,
+    get_order,
+    init_db,
+    save_order,
+)
 
 
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
@@ -176,6 +183,49 @@ def test_paper_submission_transitions_to_open_without_binance_client(tmp_path):
     assert order.state is OrderState.OPEN
     assert order.state is not OrderState.FILLED
     assert engine.get(order.intent.client_order_id) == order
+
+
+@pytest.mark.parametrize("failure_index", [1, 2, 3])
+def test_failed_submission_rolls_back_and_retry_preserves_deterministic_id(
+    tmp_path, monkeypatch, failure_index
+):
+    engine = _engine(tmp_path)
+    intent = _intent()
+    original_persist = storage._persist_order
+    calls = 0
+
+    def fail_at_persistence_step(connection, order):
+        nonlocal calls
+        calls += 1
+        if calls == failure_index:
+            raise RuntimeError(f"simulated persistence failure at step {failure_index}")
+        return original_persist(connection, order)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(storage, "_persist_order", fail_at_persistence_step)
+        with pytest.raises(OrderSubmissionError, match="Paper-order submission failed"):
+            engine.submit(intent, RiskDecision(True), Decimal("90"), Decimal("110"))
+
+    assert engine.get(intent.client_order_id) is None
+
+    retried = engine.submit(intent, RiskDecision(True), Decimal("90"), Decimal("110"))
+    assert retried.state is OrderState.OPEN
+    assert retried.intent.client_order_id == intent.client_order_id
+    assert engine.get(intent.client_order_id) == retried
+
+
+@pytest.mark.parametrize("terminal", [
+    OrderState.FILLED,
+    OrderState.CANCELED,
+    OrderState.REJECTED,
+])
+def test_terminal_order_identity_remains_protected_from_recreation(tmp_path, terminal):
+    engine = _engine(tmp_path)
+    existing = PaperOrder(_intent(), terminal, NOW)
+    save_order(engine.db_path, existing)
+
+    with pytest.raises(DuplicateOrder, match=terminal.value):
+        engine.submit(_intent(), RiskDecision(True), Decimal("90"), Decimal("110"))
 
 
 @pytest.mark.parametrize("risk", [
