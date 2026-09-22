@@ -106,6 +106,33 @@ class MarketSnapshot:
     symbol: str
     candles: pd.DataFrame
 
+
+@dataclass(frozen=True)
+class MarketQuote:
+    """A validated, read-only best bid/ask snapshot for one Spot symbol."""
+
+    symbol: str
+    bid_price: Decimal
+    bid_qty: Decimal
+    ask_price: Decimal
+    ask_qty: Decimal
+    fetched_at: datetime
+
+    @property
+    def spread(self) -> Decimal:
+        return self.ask_price - self.bid_price
+
+    @property
+    def mid_price(self) -> Decimal:
+        return (self.bid_price + self.ask_price) / Decimal("2")
+
+    @property
+    def spread_pct(self) -> Decimal:
+        mid = self.mid_price
+        if mid <= 0:
+            raise MarketDataError("Quote mid price must be positive for spread")
+        return self.spread / mid
+
 def _base_path(mode):
     if mode == "testnet":
         return "https://testnet.binance.vision/api"
@@ -209,6 +236,101 @@ def is_ticker_fresh(snapshot: TickerSnapshot, max_age_seconds=MAX_TICKER_AGE_SEC
         return False
 
     age_seconds = Decimal(str((datetime.now(timezone.utc) - fetched_at).total_seconds()))
+    return Decimal("0") <= age_seconds <= max_age
+
+
+def _quote_decimal(value: Any, symbol: str, field: str) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise MarketDataError(
+            f"Missing {field} in Binance book ticker for {symbol}"
+        )
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise MarketDataError(
+            f"Invalid {field} in Binance book ticker for {symbol}: {value!r}"
+        ) from exc
+    if not decimal_value.is_finite() or decimal_value <= 0:
+        raise MarketDataError(
+            f"Invalid {field} in Binance book ticker for {symbol}: {value!r}"
+        )
+    return decimal_value
+
+
+def fetch_book_ticker(client, symbol) -> MarketQuote:
+    """Fetch the read-only best bid/ask via Binance's public bookTicker endpoint.
+
+    This is a MARKET_DATA (public) endpoint: it places no orders and mutates no
+    state. Every field is validated and the function fails closed on malformed,
+    non-positive or crossed (ask < bid) quotes.
+    """
+    normalized_symbol = str(symbol).upper()
+    if not normalized_symbol:
+        raise MarketDataError("Book ticker symbol must be non-empty")
+    try:
+        response = client.rest_api.ticker_book_ticker(symbol=normalized_symbol)
+        payload = _model_to_plain(response.data())
+    except Exception as exc:
+        raise MarketDataError(
+            f"Binance book ticker request failed for {normalized_symbol}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise MarketDataError(
+            f"Malformed Binance book ticker response for {normalized_symbol}: expected object"
+        )
+
+    returned_symbol = payload.get("symbol")
+    if returned_symbol is not None and str(returned_symbol).upper() != normalized_symbol:
+        raise MarketDataError(
+            f"Malformed Binance book ticker response for {normalized_symbol}: "
+            f"received symbol {returned_symbol!r}"
+        )
+
+    bid_price = _quote_decimal(payload.get("bidPrice"), normalized_symbol, "bidPrice")
+    bid_qty = _quote_decimal(payload.get("bidQty"), normalized_symbol, "bidQty")
+    ask_price = _quote_decimal(payload.get("askPrice"), normalized_symbol, "askPrice")
+    ask_qty = _quote_decimal(payload.get("askQty"), normalized_symbol, "askQty")
+    if ask_price < bid_price:
+        raise MarketDataError(
+            f"Crossed book for {normalized_symbol}: ask {ask_price} < bid {bid_price}"
+        )
+
+    return MarketQuote(
+        symbol=normalized_symbol,
+        bid_price=bid_price,
+        bid_qty=bid_qty,
+        ask_price=ask_price,
+        ask_qty=ask_qty,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
+def is_quote_fresh(
+    quote: MarketQuote,
+    max_age_seconds: int = MAX_TICKER_AGE_SECONDS,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether a locally timestamped quote is still safe to use.
+
+    ``now`` may be supplied for deterministic testing; production callers omit
+    it and the local UTC clock is used, mirroring ``is_ticker_fresh``.
+    """
+    try:
+        max_age = Decimal(str(max_age_seconds))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("max_age_seconds must be a non-negative number") from exc
+    if not max_age.is_finite() or max_age < 0:
+        raise ValueError("max_age_seconds must be a non-negative number")
+
+    fetched_at = getattr(quote, "fetched_at", None)
+    if not isinstance(fetched_at, datetime) or fetched_at.tzinfo is None:
+        return False
+    if fetched_at.utcoffset() != timezone.utc.utcoffset(fetched_at):
+        return False
+
+    reference = now if now is not None else datetime.now(timezone.utc)
+    age_seconds = Decimal(str((reference - fetched_at).total_seconds()))
     return Decimal("0") <= age_seconds <= max_age
 
 

@@ -19,14 +19,30 @@ from market_data import (
     build_account_risk_state,
     fetch_account_commission,
     fetch_account_snapshot,
+    fetch_book_ticker,
     fetch_klines,
     fetch_open_orders,
     fetch_symbol_info,
     fetch_ticker_price,
+    is_quote_fresh,
     is_ticker_fresh,
     make_client,
 )
+from grid_eligibility import (
+    BlockingReason,
+    GridEligibilityDecision,
+    GridEligibilityStatus,
+    evaluate_grid_eligibility,
+)
+from market_features import (
+    CandleValidationError,
+    InsufficientDataError,
+    MarketFeatures,
+    calculate_market_features,
+)
+from market_regime import MarketRegime, classify_market_regime
 from paper_accounting import PaperAccountingEngine
+from range_quality import calculate_range_quality
 from order_engine import OrderIntent, PaperOrderEngine, make_client_order_id
 from profit_model import profit_class
 from range_engine import auto_range
@@ -117,6 +133,21 @@ def main():
         ticker_error=str(exc)
         logger.error("TICKER DATA BLOCK: %s",ticker_error)
 
+    book_quote=None; book_quote_error=None
+    if "market_intelligence" in cfg:
+        try:
+            book_quote=fetch_book_ticker(client,symbol)
+            max_quote_age=int(
+                cfg["market_intelligence"].get("liquidity",{}).get(
+                    "max_quote_ticker_age_seconds", 10
+                )
+            )
+            if not is_quote_fresh(book_quote, max_quote_age):
+                raise MarketDataError(f"Book ticker quote is stale for {symbol}")
+        except Exception as exc:
+            book_quote_error=str(exc)
+            logger.error("BOOK TICKER DATA BLOCK: %s",book_quote_error)
+
     account_snapshot=None; account_risk=None; account_error=None
     try:
         account_snapshot=fetch_account_snapshot(client,rules.base_asset,rules.quote_asset)
@@ -168,6 +199,69 @@ def main():
         range_approved, position_in_range = candidate.approved, candidate.position_in_range
 
     current_price=ticker.price
+
+    market_intelligence_decision: GridEligibilityDecision | None = None
+    if "market_intelligence" in cfg:
+        try:
+            features = calculate_market_features(
+                df=df,
+                quote=book_quote,
+                lower_price=lower,
+                upper_price=upper,
+                symbol=symbol,
+                config=cfg,
+            )
+            regime, regime_reason = classify_market_regime(features, cfg)
+            quality_res = calculate_range_quality(features, cfg)
+            market_intelligence_decision = evaluate_grid_eligibility(
+                features=features,
+                regime=regime,
+                range_quality=quality_res,
+                current_price=current_price,
+                lower_price=lower,
+                upper_price=upper,
+                config=cfg,
+                extra_diagnostics={"regime_reason": regime_reason},
+            )
+        except CandleValidationError as exc:
+            is_insufficient = isinstance(exc, InsufficientDataError)
+            regime, regime_reason = classify_market_regime(
+                None,
+                cfg,
+                is_insufficient_data=is_insufficient,
+                is_invalid_data=not is_insufficient,
+                error_message=str(exc),
+            )
+            market_intelligence_decision = evaluate_grid_eligibility(
+                features=None,
+                regime=regime,
+                range_quality=None,
+                current_price=current_price,
+                lower_price=lower,
+                upper_price=upper,
+                config=cfg,
+                is_insufficient_data=is_insufficient,
+                is_invalid_data=not is_insufficient,
+                extra_diagnostics={"error": str(exc), "regime_reason": regime_reason},
+            )
+        except Exception as exc:
+            regime, regime_reason = classify_market_regime(
+                None,
+                cfg,
+                is_invalid_data=True,
+                error_message=str(exc),
+            )
+            market_intelligence_decision = evaluate_grid_eligibility(
+                features=None,
+                regime=regime,
+                range_quality=None,
+                current_price=current_price,
+                lower_price=lower,
+                upper_price=upper,
+                config=cfg,
+                is_invalid_data=True,
+                extra_diagnostics={"error": str(exc)},
+            )
 
     levels=[]; effective_upper=upper; validation=None; plan_validation=None; grid_allowed=False; grid_reason="NOT_BUILT"
     if lower > 0 and upper > lower:
@@ -239,11 +333,18 @@ def main():
         combined=combine(combined,type(combined)(False,(f"RANGE:{range_reason}",)))
     if not grid_allowed:
         combined=combine(combined,type(combined)(False,(f"GRID:{grid_reason}",)))
+    if market_intelligence_decision is not None and not market_intelligence_decision.allowed:
+        reasons_str = "|".join(r.value for r in market_intelligence_decision.reasons)
+        combined=combine(combined,type(combined)(False,(f"MARKET_INTELLIGENCE:GRID_BLOCKED:{reasons_str}",)))
 
     record_risk_event(db_path,combined.allowed,combined.reason,{
         "symbol":symbol,"price":str(current_price),
         "range":[str(lower),str(effective_upper)],
         "range_quality":range_quality,
+        "market_regime": market_intelligence_decision.regime.value if market_intelligence_decision else None,
+        "market_intelligence_status": market_intelligence_decision.status.value if market_intelligence_decision else None,
+        "market_intelligence_reasons": [r.value for r in market_intelligence_decision.reasons] if market_intelligence_decision else None,
+        "range_quality_score": str(market_intelligence_decision.range_quality_score) if market_intelligence_decision else None,
         "grid_levels":len(levels),
         "min_net_pct":str(plan_validation.min_net_pct if plan_validation else Decimal("0")),
         "grid_reason":grid_reason,
@@ -262,6 +363,15 @@ def main():
     set_state(db_path,"last_price",str(current_price))
     set_state(db_path,"last_range",{"lower":str(lower),"upper":str(effective_upper)})
     set_state(db_path,"last_risk_decision",{"allowed":combined.allowed,"reason":combined.reason})
+    if market_intelligence_decision is not None:
+        set_state(db_path,"last_market_intelligence",{
+            "status": market_intelligence_decision.status.value,
+            "allowed": market_intelligence_decision.allowed,
+            "reasons": [r.value for r in market_intelligence_decision.reasons],
+            "regime": market_intelligence_decision.regime.value,
+            "range_quality_score": str(market_intelligence_decision.range_quality_score),
+            "diagnostics": market_intelligence_decision.diagnostics,
+        })
     if account_risk:
         set_state(db_path,"last_account_risk",{
             "current_equity":str(account_risk.current_equity),
@@ -351,6 +461,11 @@ def main():
     print("\nResult:")
     print(f"  Risk decision : {'PASS' if combined.allowed else 'BLOCK'}")
     print(f"  Reason        : {combined.reason}")
+    if market_intelligence_decision is not None:
+        print(f"  Market regime : {market_intelligence_decision.regime.value}")
+        print(f"  Grid allowed  : {'YES' if market_intelligence_decision.allowed else 'NO'}")
+        if not market_intelligence_decision.allowed:
+            print(f"  Block reasons : {[r.value for r in market_intelligence_decision.reasons]}")
     print(f"  Price         : {current_price}")
     print(f"  Range         : {lower} -> {effective_upper}")
     print(f"  Grid cells    : {cells}")

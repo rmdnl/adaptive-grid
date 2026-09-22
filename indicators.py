@@ -42,7 +42,7 @@ def rsi(df, length=14):
     out.loc[both_zero] = 50.0
     return out
 
-def adx(df, length=14):
+def adx_components(df, length=14):
     _require_columns(df, ("high", "low", "close"))
     up = df["high"].diff()
     down = -df["low"].diff()
@@ -54,17 +54,38 @@ def adx(df, length=14):
     minus_di = 100 * wilder_rma(minus_dm, length) / atr_value.replace(0, np.nan)
     denom = (plus_di + minus_di).replace(0, np.nan)
     dx = 100 * (plus_di - minus_di).abs() / denom
-    return wilder_rma(dx, length)
+    adx_series = wilder_rma(dx, length)
+    return adx_series, plus_di, minus_di
 
-def bb_width(df, length=20, mult=2.0):
+def adx(df, length=14):
+    return adx_components(df, length)[0]
+
+def bollinger_bands(df, length=20, mult=2.0):
     _require_columns(df, ("close",))
+    if length <= 0:
+        raise ValueError("length must be > 0")
+    if mult <= 0:
+        raise ValueError("mult must be > 0")
     mid = df["close"].rolling(length).mean()
     std = df["close"].rolling(length).std(ddof=0)
-    return ((mid + mult*std) - (mid - mult*std)) / mid.replace(0, np.nan)
+    upper = mid + mult * std
+    lower = mid - mult * std
+    width = upper - lower
+    width_pct = width / mid.replace(0, np.nan)
+    return mid, upper, lower, width, width_pct
+
+def bb_width(df, length=20, mult=2.0):
+    return bollinger_bands(df, length=length, mult=mult)[4]
+
+def volume_baseline(df, length=20):
+    _require_columns(df, ("volume",))
+    if length <= 0:
+        raise ValueError("length must be > 0")
+    return df["volume"].shift(1).rolling(length).mean()
 
 def volume_ratio(df, length=20):
     _require_columns(df, ("volume",))
-    baseline = df["volume"].shift(1).rolling(length).mean()
+    baseline = volume_baseline(df, length)
     return df["volume"] / baseline.replace(0, np.nan)
 
 def enrich(df):

@@ -121,3 +121,110 @@ def validate_config(cfg: dict[str, Any]) -> None:
             "This replacement is deliberately dry-run only. "
             "Keep environment.dry_run=true until a separately audited order engine exists."
         )
+
+    if "market_intelligence" in cfg:
+        _validate_market_intelligence(cfg)
+
+def _require_positive_int(section: str, key: str, value: Any, minimum: int = 1) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"market_intelligence.{section}.{key} must be an integer")
+    if value < minimum:
+        raise ConfigError(f"market_intelligence.{section}.{key} must be >= {minimum}")
+    return value
+
+def _validate_market_intelligence(cfg: dict[str, Any]) -> None:
+    """Validate the Phase 4 read-only market-intelligence configuration.
+
+    Every threshold is explicit, named and validated. Missing or malformed
+    values fail closed instead of silently substituting defaults.
+    """
+    mi = cfg.get("market_intelligence")
+    if not isinstance(mi, dict):
+        raise ConfigError("market_intelligence section is required")
+
+    timeframe = mi.get("timeframe")
+    if timeframe != cfg.get("timeframe"):
+        raise ConfigError(
+            "market_intelligence.timeframe must match the locked 15m timeframe"
+        )
+
+    for key, minimum in (
+        ("min_candles", 2),
+        ("max_candle_age_seconds", 1),
+        ("atr_period", 1),
+        ("adx_period", 1),
+        ("bb_length", 2),
+        ("volume_baseline_period", 1),
+        ("range_stability_period", 2),
+    ):
+        _require_positive_int("_root", key, mi.get(key), minimum)
+
+    if len({mi["atr_period"], mi["adx_period"], mi["bb_length"]}) < 1:
+        raise ConfigError("market_intelligence indicator periods must be positive")
+    bb_len = mi["bb_length"]
+    if mi["adx_period"] * 2 > mi["min_candles"]:
+        raise ConfigError("market_intelligence.min_candles is too small for the ADX period")
+    if bb_len > mi["min_candles"]:
+        raise ConfigError("market_intelligence.min_candles is too small for the Bollinger length")
+
+    bb_mult = _d(mi.get("bb_std_mult"))
+    if not bb_mult.is_finite() or bb_mult <= 0:
+        raise ConfigError("market_intelligence.bb_std_mult must be > 0")
+
+    regime = mi.get("regime")
+    if not isinstance(regime, dict):
+        raise ConfigError("market_intelligence.regime section is required")
+    adx_trend_min = _d(regime.get("adx_trend_min"))
+    if not adx_trend_min.is_finite() or not (_d("0") <= adx_trend_min <= _d("100")):
+        raise ConfigError("market_intelligence.regime.adx_trend_min must be within 0..100")
+    atr_expansion = _d(regime.get("atr_expansion_ratio"))
+    if not atr_expansion.is_finite() or atr_expansion <= 0:
+        raise ConfigError("market_intelligence.regime.atr_expansion_ratio must be > 0")
+    inclusion = _d(regime.get("price_range_inclusion_min"))
+    if not inclusion.is_finite() or not (_d("0") <= inclusion <= _d("1")):
+        raise ConfigError(
+            "market_intelligence.regime.price_range_inclusion_min must be within 0..1"
+        )
+    efficiency = _d(regime.get("directional_efficiency_max"))
+    if not efficiency.is_finite() or not (_d("0") <= efficiency <= _d("1")):
+        raise ConfigError(
+            "market_intelligence.regime.directional_efficiency_max must be within 0..1"
+        )
+
+    liquidity = mi.get("liquidity")
+    if not isinstance(liquidity, dict):
+        raise ConfigError("market_intelligence.liquidity section is required")
+    max_spread = _d(liquidity.get("max_spread_pct"))
+    if not max_spread.is_finite() or max_spread <= 0:
+        raise ConfigError("market_intelligence.liquidity.max_spread_pct must be > 0")
+    _require_positive_int(
+        "liquidity", "max_quote_ticker_age_seconds",
+        liquidity.get("max_quote_ticker_age_seconds"), 1,
+    )
+
+    quality = mi.get("quality")
+    if not isinstance(quality, dict):
+        raise ConfigError("market_intelligence.quality section is required")
+    min_score = _d(quality.get("min_range_quality_score"))
+    if not min_score.is_finite() or not (_d("0") <= min_score <= _d("100")):
+        raise ConfigError(
+            "market_intelligence.quality.min_range_quality_score must be within 0..100"
+        )
+    weight_keys = (
+        "weight_trend_stability",
+        "weight_volatility_suitability",
+        "weight_bb_width_suitability",
+        "weight_volume_stability",
+        "weight_spread_suitability",
+        "weight_range_containment",
+    )
+    weights = []
+    for key in weight_keys:
+        if key not in quality:
+            raise ConfigError(f"market_intelligence.quality.{key} is required")
+        weight = _d(quality.get(key))
+        if not weight.is_finite() or weight < 0:
+            raise ConfigError(f"market_intelligence.quality.{key} must be >= 0")
+        weights.append(weight)
+    if sum(weights) != _d("1"):
+        raise ConfigError("market_intelligence.quality weights must sum exactly to 1")

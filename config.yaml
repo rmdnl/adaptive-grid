@@ -33,6 +33,36 @@ market_filter:
   bb_width_max: 0.06
   volume_spike_max: 2.5
 
+# Phase 4: read-only market regime + liquidity intelligence.
+# This block only filters whether the existing fixed-range grid may run. It
+# never widens/shrinks the configured range and never predicts price.
+market_intelligence:
+  timeframe: 15m
+  min_candles: 60
+  max_candle_age_seconds: 5400
+  atr_period: 14
+  adx_period: 14
+  bb_length: 20
+  bb_std_mult: 2.0
+  volume_baseline_period: 20
+  range_stability_period: 20
+  regime:
+    adx_trend_min: 25
+    atr_expansion_ratio: 1.5
+    price_range_inclusion_min: 0.90
+    directional_efficiency_max: 0.60
+  liquidity:
+    max_spread_pct: 0.003
+    max_quote_ticker_age_seconds: 10
+  quality:
+    min_range_quality_score: 60
+    weight_trend_stability: 0.25
+    weight_volatility_suitability: 0.20
+    weight_bb_width_suitability: 0.15
+    weight_volume_stability: 0.10
+    weight_spread_suitability: 0.10
+    weight_range_containment: 0.20
+
 execution:
   prefer_limit_maker: true
   stale_order_minutes: 30
