@@ -504,7 +504,7 @@ pytest -q
 Target:
 
 ```text
-29 passed
+822 passed
 ```
 
 Kalau test gagal:
@@ -590,6 +590,50 @@ Kadang posisi terbaik adalah:
 
 ---
 
+# 🧭 Phase 6A: Binance Spot Testnet Read-Only Adapter
+
+**Purpose:** Connect the existing paper/risk architecture to Binance Spot Testnet for READ-ONLY market/account/order-state verification.
+
+**This is NOT live trading.**
+
+## Setup
+
+1. Create Binance Spot Testnet API credentials (separate from production).
+2. Put them in local `.env`.
+3. Confirm testnet environment (`BINANCE_ENV=testnet`).
+4. Run the readonly connectivity check.
+5. Run unit tests.
+
+## Safety guarantees
+
+- **Testnet only.** Production URLs are rejected at construction time.
+- **Read-only.** No order placement, cancellation, modification, batch orders, or OCO.
+- **Fail-closed.** If environment is missing, not exactly `testnet`, base URL is production, or safety controls (`DRY_RUN=true`, `ALLOW_LIVE_EXECUTION=false`) are violated, the adapter raises a configuration error immediately.
+- **Credentials externalized.** API keys come from environment variables only. Never hardcoded. Never logged. Never printed.
+- **Decimal financial values.** Prices, quantities, balances, and fees are always `Decimal`.
+- **API failure = fail-closed.** No fake success, no fallback to cached/candle prices.
+
+## Commands
+
+```bash
+python scripts/testnet_readonly_check.py
+```
+
+```bash
+pytest tests/test_binance_testnet.py -q
+```
+
+## Explicit disclaimers
+
+- Testnet credentials are separate from production credentials. **Do not reuse production secrets.**
+- API key must not have withdrawal permission.
+- **Phase 6A does not submit orders.**
+- **Phase 6A does not cancel orders.**
+- **Phase 6A does not touch futures or margin.**
+- **Phase 6A is not live trading.**
+
+---
+
 # 🗂️ Struktur project
 
 ```text
@@ -598,6 +642,7 @@ adaptive-grid/
 ├── config.yaml
 ├── config_loader.py
 ├── market_data.py
+├── binance_testnet.py
 ├── indicators.py
 ├── range_engine.py
 ├── grid_engine.py
@@ -610,6 +655,8 @@ adaptive-grid/
 ├── .env.example
 ├── .gitignore
 ├── sample_output.txt
+├── scripts/
+│   └── testnet_readonly_check.py
 └── tests/
     ├── test_config.py
     ├── test_grid.py
@@ -619,7 +666,8 @@ adaptive-grid/
     ├── test_risk.py
     ├── test_storage.py
     ├── test_symbol_rules.py
-    └── test_fee.py
+    ├── test_fee.py
+    └── test_binance_testnet.py
 ```
 
 Yang tidak perlu masuk Git:

@@ -106,3 +106,13 @@ logging:
   sqlite_path: ./data/grid_bot.sqlite3
   log_path: ./logs/grid_bot.log
   csv_path: ./logs/trades.csv
+
+# Phase 6A: Binance Spot Testnet read-only adapter.
+# Credentials come from environment variables (BINANCE_API_KEY, BINANCE_API_SECRET).
+# This block only configures transport/safety — never credentials.
+binance:
+  environment: testnet
+  base_url: https://testnet.binance.vision
+  timeout_ms: 5000
+  retries: 3
+  backoff_ms: 1000

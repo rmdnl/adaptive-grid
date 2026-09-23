@@ -128,6 +128,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if "adaptive_planner" in cfg:
         _validate_adaptive_planner(cfg)
 
+    if "binance" in cfg:
+        _validate_binance(cfg)
+
 def _require_positive_int(section: str, key: str, value: Any, minimum: int = 1) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"market_intelligence.{section}.{key} must be an integer")
@@ -277,3 +280,41 @@ def _validate_adaptive_planner(cfg: dict[str, Any]) -> None:
         raise ConfigError(
             "adaptive_planner.hysteresis.regime_change must be boolean"
         )
+
+
+def _validate_binance(cfg: dict[str, Any]) -> None:
+    """Validate the Phase 6A Binance Spot Testnet adapter configuration.
+
+    Ensures fail-closed safety: environment must be 'testnet', transports
+    must be bounded, and all values must be well-typed.
+    """
+    bn = cfg.get("binance")
+    if not isinstance(bn, dict):
+        raise ConfigError("binance section is required")
+
+    env = bn.get("environment")
+    if env != "testnet":
+        raise ConfigError(
+            f"binance.environment must be 'testnet' (got {env!r}). "
+            "This adapter is fail-closed: production trading is not permitted."
+        )
+
+    base_url = str(bn.get("base_url", "")).strip()
+    if not base_url:
+        raise ConfigError("binance.base_url is required")
+    if "testnet.binance.vision" not in base_url:
+        raise ConfigError(
+            "binance.base_url must point to the Binance Spot Testnet endpoint. "
+            "Production endpoints are not permitted in this release."
+        )
+
+    for key, minimum in (
+        ("timeout_ms", 1),
+        ("retries", 0),
+        ("backoff_ms", 0),
+    ):
+        _require_positive_int("binance", key, bn.get(key), minimum)
+
+    timeout = int(bn.get("timeout_ms", 0))
+    if timeout > 30000:
+        raise ConfigError("binance.timeout_ms must not exceed 30000 (30s) to avoid runaway requests")
