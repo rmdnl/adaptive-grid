@@ -517,7 +517,7 @@ pytest -q
 Target:
 
 ```text
-822 passed
+1031 passed
 ```
 
 Kalau test gagal:
