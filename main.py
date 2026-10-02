@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -56,14 +56,19 @@ from profit_model import profit_class
 from range_engine import auto_range
 from risk_engine import (
     account_state_gate, combine, cooldown_gate, daily_profit_lock, equity_dd_kill,
-    inventory_gate, market_gate, open_orders_gate, profit_gate,
+    equity_reference_gate, inventory_gate, market_gate, open_orders_gate, profit_gate,
     open_orders_available_gate, range_break_kill, strict_order_price_gate,
 )
 from storage import get_state, init_db, record_risk_event, set_state
 from symbol_rules import parse_symbol_info, validate_quantized_order_plan
 
-# Intentionally process-local: no historical equity is inferred or persisted.
-_SESSION_REFERENCE_EQUITY: Decimal | None = None
+# PATCH 1 (F-H1): the reference/peak equity is PERSISTED in the existing
+# bot_state KV store (key "paper_reference_equity", via set_state/get_state)
+# and reloaded on process restart.  A process-local global reference was used
+# before, which reset the baseline to the current equity on every invocation
+# and made the drawdown kill switch non-functional.  The persisted peak is
+# the single source of truth; the paper accounting state (paper_account_state)
+# remains the only ledger of balances.
 
 # FIX 4B: clock seam for the deterministic paper cycle.  Production uses the
 # wall clock; tests may inject a clock aligned to their fixture candle data so
@@ -78,6 +83,40 @@ def _logger(path):
     sh=logging.StreamHandler(); sh.setFormatter(formatter); logger.addHandler(sh)
     fh=logging.FileHandler(path, encoding="utf-8"); fh.setFormatter(formatter); logger.addHandler(fh)
     return logger
+
+def load_peak_equity(db_path) -> Decimal | None:
+    """Load the persisted peak equity (PATCH 1, F-H1).
+
+    The peak equity is the durable reference for the drawdown kill switch,
+    stored as a single high-water-mark scalar in the existing ``bot_state``
+    KV store (key ``"paper_reference_equity"``).  Returns ``None`` when no
+    valid observation exists or the persisted state is corrupt/invalid, so
+    callers fail closed rather than silently substituting the current equity.
+    """
+    raw = get_state(db_path, "paper_reference_equity")
+    if raw is None:
+        return None
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError, TypeError):
+        return None  # corrupt persisted state: fail closed
+    if not value.is_finite() or value <= 0:
+        return None
+    return value
+
+def record_peak_equity(db_path, equity) -> None:
+    """Persist a new peak equity observation (PATCH 1, F-H1).
+
+    A higher equity raises the persisted peak; a lower equity is not stored
+    (drawdown is computed against the persisted peak, never reset down).
+    Uses the existing bot_state KV store; no second source of truth.
+    """
+    value = Decimal(str(equity))
+    if not value.is_finite() or value <= 0:
+        return
+    peak = load_peak_equity(db_path)
+    if peak is None or value > peak:
+        set_state(db_path, "paper_reference_equity", str(value))
 
 def _run_paper_cycle(db_path, cfg, symbol, rules, current_price, kline_df,
                      lower, upper, risk_decision, regime, range_quality_score,
@@ -193,7 +232,6 @@ def _lifecycle_active_plan(db_path):
     )
 
 def main():
-    global _SESSION_REFERENCE_EQUITY
     load_dotenv()
     try:
         cfg=load_config()
@@ -258,16 +296,34 @@ def main():
     # A ticker failure still stops this run: there is no safe price fallback.
     if ticker is None:
         raise RuntimeError(f"Ticker data unavailable: {ticker_error}")
+    # PATCH 1 (F-H1): the reference/peak equity is PERSISTED (bot_state key
+    # "paper_reference_equity") so the drawdown kill switch survives a process
+    # restart.  An ABSENT reference bootstraps from the first valid observed
+    # equity (and is recorded); a PRESENT-but-invalid reference fails closed
+    # (EQUITY_REFERENCE_INVALID) instead of being silently reset to the
+    # current equity.  Computed unconditionally: the reference gate applies to
+    # every run, not only when account data is available.
+    raw_reference = get_state(db_path, "paper_reference_equity")
+    reference_equity = load_peak_equity(db_path)
     if account_snapshot is not None:
         try:
-            account_risk=build_account_risk_state(
-                account_snapshot,ticker.price,_SESSION_REFERENCE_EQUITY,
+            account_risk = build_account_risk_state(
+                account_snapshot,
+                ticker.price,
+                reference_equity,  # None when absent: bootstraps to first observed equity
             )
-            if _SESSION_REFERENCE_EQUITY is None:
-                _SESSION_REFERENCE_EQUITY=account_risk.reference_equity
         except AccountDataError as exc:
-            account_error=str(exc)
-            logger.error("ACCOUNT RISK BLOCK: %s",account_error)
+            account_error = str(exc)
+            logger.error("ACCOUNT RISK BLOCK: %s", account_error)
+    if account_risk:
+        # Record the high-water mark only when the persisted reference is
+        # ABSENT (bootstrap) or VALID (raise).  When a reference is
+        # present-but-corrupt (raw set, parsed None) we do NOT write: the
+        # value is left in place for the operator and the reference gate
+        # above already fails the run closed — a silent "repair" would
+        # defeat the kill-switch invariant.
+        if raw_reference is None or reference_equity is not None:
+            record_peak_equity(db_path, account_risk.current_equity)
 
     commission_payload, fee_source_raw=fetch_account_commission(client,symbol)
     fees=effective_fees(
@@ -478,6 +534,10 @@ def main():
         range_break_kill(lower,effective_upper,current_price,cfg["risk"]["range_break_buffer_pct"]),
         cooldown_gate(False),
         daily_profit_lock(Decimal("0"),cfg["risk"]["daily_profit_lock_pct"]),
+        # PATCH 1 (F-H1): fail-closed gate on the persisted reference equity.
+        # ABSENT reference passes (bootstrapped below); PRESENT-but-corrupt
+        # reference blocks all new submissions.
+        equity_reference_gate(raw_reference,reference_equity),
     ]
     if account_risk:
         decisions.extend((

@@ -195,7 +195,8 @@ def _install_stubs(monkeypatch, tmp_path, intelligence_decision=None):
     )
     monkeypatch.setattr(main, "fetch_open_orders", lambda client, symbol: [])
     monkeypatch.setattr(main, "fetch_account_commission", lambda client, symbol: (None, "FALLBACK"))
-    monkeypatch.setattr(main, "_SESSION_REFERENCE_EQUITY", None)
+    # PATCH 1 (F-H1): session-local reference equity is now the persisted
+    # paper_reference_equity key in the fresh per-test DB — nothing to reset.
 
     if intelligence_decision is not None:
         monkeypatch.setattr(main, "evaluate_grid_eligibility", lambda *args, **kwargs: intelligence_decision)
@@ -468,7 +469,8 @@ def test_main_planner_skipped_without_config(monkeypatch, tmp_path):
                                          Decimal("1000"), Decimal("0"), datetime.now(timezone.utc)))
     monkeypatch.setattr(main, "fetch_open_orders", lambda c, s: [])
     monkeypatch.setattr(main, "fetch_account_commission", lambda c, s: (None, "FALLBACK"))
-    monkeypatch.setattr(main, "_SESSION_REFERENCE_EQUITY", None)
+    # PATCH 1 (F-H1): session-local reference equity is now the persisted
+    # paper_reference_equity key in the fresh per-test DB — nothing to reset.
     monkeypatch.setattr(main, "evaluate_grid_eligibility",
         lambda *a, **kw: _allowed_intelligence())
 

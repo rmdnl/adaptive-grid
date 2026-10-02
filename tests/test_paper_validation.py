@@ -44,6 +44,12 @@ from paper_validation import (
 from recovery import recover_paper_state, RecoveryErrorCode
 from storage import connect
 
+from pathlib import Path
+
+# Repository root (tests/ -> project root); machine-independent path base for
+# the static source-scan tests below.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 # =============================================================================
 # MODULE SMOKE TESTS
@@ -1533,10 +1539,10 @@ def test_scenario_ap_no_live_binance_endpoint():
     ]
     
     production_files = [
-        "c:/Projects/adaptive-grid/paper_orchestrator.py",
-        "c:/Projects/adaptive-grid/paper_accounting.py",
-        "c:/Projects/adaptive-grid/paper_validation.py",
-        "c:/Projects/adaptive-grid/order_engine.py",
+        str(_REPO_ROOT / "paper_orchestrator.py"),
+        str(_REPO_ROOT / "paper_accounting.py"),
+        str(_REPO_ROOT / "paper_validation.py"),
+        str(_REPO_ROOT / "order_engine.py"),
     ]
     
     violations = []
@@ -1560,7 +1566,7 @@ def test_scenario_aq_no_direct_accounting_mutation():
     All balance changes must go through dataclass.replace() or engine methods,
     never direct field assignment.
     """
-    filepath = "c:/Projects/adaptive-grid/paper_accounting.py"
+    filepath = str(_REPO_ROOT / "paper_accounting.py")
 
     assert os.path.exists(filepath), f"Missing {filepath}"
     with open(filepath, "r", encoding="utf-8") as f:
@@ -1607,7 +1613,7 @@ def test_scenario_ar_no_direct_reservation_mutation():
     All state transitions in PaperAccountingEngine must produce new immutable
     objects via dataclass.replace(), never mutate existing reservations.
     """
-    filepath = "c:/Projects/adaptive-grid/paper_accounting.py"
+    filepath = str(_REPO_ROOT / "paper_accounting.py")
 
     assert os.path.exists(filepath), f"Missing {filepath}"
     with open(filepath, "r", encoding="utf-8") as f:
@@ -2318,7 +2324,7 @@ def test_scenario_as_no_strategy_parameter_mutation():
     All data model classes must be frozen. No direct cfg[key]= or config[key]=
     assignments. Module docstring explicitly states it is a pure decision layer.
     """
-    filepath = "c:/Projects/adaptive-grid/grid_planner.py"
+    filepath = str(_REPO_ROOT / "grid_planner.py")
 
     assert os.path.exists(filepath), f"Missing {filepath}"
     with open(filepath, "r", encoding="utf-8") as f:

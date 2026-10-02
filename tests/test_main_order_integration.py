@@ -178,7 +178,9 @@ def _install_main_stubs(monkeypatch, tmp_path, dry_run=True, open_orders=(), ris
             "market_gate",
             lambda last, cfg: RiskDecision(False, ("MARKET_FILTER_BLOCK:ADX",)),
         )
-    monkeypatch.setattr(main, "_SESSION_REFERENCE_EQUITY", None)
+    # PATCH 1 (F-H1): the session-local reference equity was replaced by the
+    # persisted ``paper_reference_equity`` bot_state key.  Each test uses a
+    # fresh tmp_path DB, so there is no reference to reset here.
 
 
 def _order_rows(db_path):

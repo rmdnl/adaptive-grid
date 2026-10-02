@@ -61,14 +61,27 @@ Artinya:
 
 **JANGAN nyalain live trading.**
 
-### Account-risk state (Phase 2B)
+### Account-risk state (Phase 2B + PATCH 1 F-H1)
 
 Bot membaca saldo Spot base/quote secara read-only dan menilai equity dengan
-harga ticker terbaru. Referensi equity adalah equity valid pertama dalam proses
-yang sedang berjalan; nilainya tidak dipersistenkan dan bukan riwayat account.
-Karena itu drawdown hanya observasional untuk satu process session, bukan
-drawdown historis. Open-order reconciliation belum diimplementasikan, sehingga
-status open order dianggap **UNKNOWN** dan risk gate memblokir order plan.
+harga ticker terbaru. Referensi equity (peak / high-water mark) sekarang
+**dipersistenkan** di SQLite `bot_state` (key `paper_reference_equity`), jadi
+drawdown kill switch tetap berfungsi setelah restart process. Nilai peak
+naik mengikuti equity, tidak pernah turun; drawdown dihitung terhadap peak
+yang dipersistenkan, bukan terhadap equity saat ini.
+
+Perilaku fail-closed:
+
+- Jika referensi **belum ada** (awal), di-bootstrap dari equity valid pertama
+  lalu dipersistenkan.
+- Jika referensi **ada tapi rusak** (nilai invalid/corrupt di disk), run
+  diblok dengan alasan `EQUITY_REFERENCE_INVALID` — nilai tidak diperbaiki
+  diam-diam.
+- Drawdown >= `max_equity_drawdown_pct` (default 2%) memblokir submission
+  baru via `EQUITY_DRAWDOWN_KILL`.
+
+Open-order reconciliation belum diimplementasikan, sehingga status open order
+dianggap **UNKNOWN** dan risk gate memblokir order plan.
 
 Bahkan kalau lu merasa:
 

@@ -34,6 +34,22 @@ def market_gate(last_row: Any, cfg: dict):
 def equity_dd_kill(drawdown_pct, max_dd_pct):
     return RiskDecision(False, ("EQUITY_DRAWDOWN_KILL",)) if D(drawdown_pct) >= D(max_dd_pct) else RiskDecision(True)
 
+def equity_reference_gate(raw_reference, parsed_reference):
+    """Fail-closed gate on the persisted reference/peak equity (PATCH 1 / F-H1).
+
+    ``raw_reference`` is the raw stored value (None when the key is absent) and
+    ``parsed_reference`` is the parsed Decimal (None when absent or unparseable).
+    An ABSENT reference is not a block — the caller bootstraps it from the first
+    observed equity.  A PRESENT-but-unparsable reference is corrupt state and
+    blocks new submissions rather than silently being reset to the current
+    equity, so the kill switch cannot be defeated by a bad value on disk.
+    """
+    if raw_reference is None:
+        return RiskDecision(True)
+    if parsed_reference is None:
+        return RiskDecision(False, ("EQUITY_REFERENCE_INVALID",))
+    return RiskDecision(True)
+
 def account_state_gate(available):
     return RiskDecision(True) if available else RiskDecision(False, ("ACCOUNT_DATA_UNAVAILABLE",))
 
