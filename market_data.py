@@ -623,6 +623,11 @@ def build_account_risk_state(
     this process's first valid observed equity; it is never treated as history.
     """
     current_equity = calculate_spot_equity(snapshot, current_ticker_price)
+    # Defense-in-depth: even though calculate_spot_equity validates the ticker
+    # price and fetch_account_snapshot validates balances, a NaN/Infinity
+    # current_equity would silently bypass the `< 0` check below (NaN < 0 is
+    # False in Decimal arithmetic) and produce NaN drawdown/inventory
+    # percentages that could bypass kill gates.  Fail closed.
     raw_reference = current_equity if reference_equity is None else reference_equity
     try:
         reference = Decimal(str(raw_reference))
@@ -630,6 +635,8 @@ def build_account_risk_state(
         raise AccountValidationError("Reference equity is invalid") from exc
     if not reference.is_finite() or reference <= 0:
         raise AccountValidationError("Reference equity must be positive")
+    if not current_equity.is_finite():
+        raise AccountValidationError("Current equity is not finite")
     if current_equity < 0:
         raise AccountValidationError("Current equity cannot be negative")
 

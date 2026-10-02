@@ -8,8 +8,15 @@ def test_profit_gate_blocks():
     assert profit_gate(0.003,0.003).allowed
 
 def test_dd_kill_exact_threshold_blocks():
+    # Exactly at 2% threshold (>= is the comparator) → BLOCKED.
     assert not equity_dd_kill(0.02,0.02).allowed
+    # Just below 2% → allowed (market recovered, not at the kill boundary).
     assert equity_dd_kill(0.0199,0.02).allowed
+    # Just above 2% → BLOCKED (the kill must catch breaches immediately).
+    assert not equity_dd_kill(0.0201,0.02).allowed
+    # Just barely above the exact threshold (Decimal boundary) → BLOCKED.
+    from decimal import Decimal
+    assert not equity_dd_kill(Decimal("0.0200000001"), Decimal("0.02")).allowed
 
 def test_strict_order_range_blocks_outside():
     assert not strict_order_price_gate(100,110,99.5).allowed

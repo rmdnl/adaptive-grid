@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import market_data
 from market_data import (
     AccountRequestError,
     AccountValidationError,
@@ -235,3 +236,33 @@ def test_account_risk_uses_first_observed_equity_not_fake_history_and_calculates
 
 def test_unavailable_open_orders_fails_closed():
     assert open_orders_available_gate(False).reason == "OPEN_ORDERS_UNAVAILABLE"
+
+
+# --- Adversarial safety: invalid/NaN/Infinity equity fails closed ---
+def test_account_risk_rejects_nan_equity():
+    """A NaN current equity must fail closed, not silently pass through to
+    NaN drawdown/inventory percentages that could bypass kill gates.
+
+    The NaN < 0 check returns False in Decimal arithmetic, so without the
+    explicit is_finite() check, NaN equity would slip through.
+    """
+    snapshot = fetch_account_snapshot(_account_client(_account_payload()), "BTC", "USDT")
+    original = market_data.calculate_spot_equity
+    market_data.calculate_spot_equity = lambda s, p: Decimal("NaN")
+    try:
+        with pytest.raises(AccountValidationError, match="not finite|must be positive"):
+            build_account_risk_state(snapshot, Decimal("200"), Decimal("200"))
+    finally:
+        market_data.calculate_spot_equity = original
+
+
+def test_account_risk_rejects_infinite_equity():
+    """An Infinity current equity must fail closed (not finite)."""
+    snapshot = fetch_account_snapshot(_account_client(_account_payload()), "BTC", "USDT")
+    original = market_data.calculate_spot_equity
+    market_data.calculate_spot_equity = lambda s, p: Decimal("Infinity")
+    try:
+        with pytest.raises(AccountValidationError, match="not finite|must be positive"):
+            build_account_risk_state(snapshot, Decimal("200"), Decimal("200"))
+    finally:
+        market_data.calculate_spot_equity = original
