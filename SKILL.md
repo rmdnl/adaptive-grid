@@ -158,6 +158,24 @@ Design for:
 
 Reconciliation must be deterministic and repeatable. Never create duplicate orders because local state is stale.
 
+## Operational resilience (Roadmap G)
+
+Observability and shutdown are read-only; they never feed back into order
+placement or risk decisions.
+
+* Structured health/status reporting: deterministic, machine-parseable, no
+  wall-clock fields, no secrets.  A report reflects persisted state, not
+  in-memory assumptions.
+* Graceful shutdown: a shutdown request only flips a flag at a safe boundary;
+  it never mutates state mid-transaction.  The run loop decides where to stop.
+* Restart recovery: verify the persisted state (kill latch, prior run marker,
+  reconciliation health) before planning any new orders.  A fresh/empty DB is
+  safe; a corrupt DB with activity is refused fail-closed.
+* Distinguish a clean first run (no paper activity) from corruption (prior
+  activity that no longer reconciles).  Never let an empty-DB "unhealthy"
+  result block a legitimate start, and never let a genuinely corrupt state
+  pass silently.
+
 ## Configuration
 
 Fail closed. Validate:

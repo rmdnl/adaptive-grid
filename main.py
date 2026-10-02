@@ -68,6 +68,8 @@ from storage import (
     record_reference_equity_audit,
     set_state,
 )
+from shutdown import ShutdownCoordinator
+from runstate import persist_run_state, verify_restart_safety
 from symbol_rules import parse_symbol_info, validate_quantized_order_plan
 
 # PATCH 1 (F-H1): the reference/peak equity is PERSISTED in the existing
@@ -355,6 +357,28 @@ def main():
 
     db_path=cfg["logging"]["sqlite_path"]; init_db(db_path)
     logger=_logger(cfg["logging"]["log_path"])
+    log_path=cfg["logging"]["log_path"]
+
+    # Roadmap G: a deterministic run id (no wall clock, so two identical
+    # runs produce byte-identical state) and a graceful-shutdown seam.  The
+    # coordinator only flips flags; the run loop checks it at safe
+    # boundaries and persists a structured run-state marker on completion.
+    run_id=f"run-{int(get_state(db_path,'adaptive_eval_index') or 0)}"
+    shutdown=ShutdownCoordinator()
+
+    # Roadmap G: restart-safety verification.  Reads the persisted kill
+    # latch, the previous run marker, and paper-state reconciliation, and
+    # decides the safe restart action.  REFUSE (corrupt state WITH
+    # activity) stops the run fail-closed before any market data is
+    # fetched.  KILL_BRANCH hands off to the F-H2 cancel/reconcile path.
+    restart=verify_restart_safety(db_path)
+    if restart["restart_action"]=="REFUSE":
+        record_risk_event(db_path,False,"RESTART_RECONCILIATION_REFUSED",
+            {"recovery_errors":restart["recovery_errors"]})
+        print("RESTART BLOCK: paper-state reconciliation failed for prior "
+              "activity; refusing to plan new orders. "
+              "Fix or manually reconcile, then re-run.")
+        return 1
 
     mode=cfg["environment"]["mode"]; symbol=cfg["symbol"]
     client=make_client(mode, os.getenv("BINANCE_API_KEY",""), os.getenv("BINANCE_API_SECRET",""))
@@ -869,11 +893,21 @@ def main():
             "(trigger=%s cancel_status=%s)",
             kill_now.get("trigger"), kill_now.get("cancel_status"),
         )
+    # Roadmap G: graceful-shutdown safe boundary.  A pending shutdown request
+    # stops the run BEFORE the paper cycle begins, so no partial work is left
+    # mid-cycle.  The cycle transaction itself is atomic; this check simply
+    # skips the entire cycle when the operator has asked to stop.
+    if shutdown.is_requested:
+        logger.warning(
+            "SHUTDOWN REQUESTED: skipping paper cycle "
+            "(%s)", shutdown.describe(),
+        )
     if (
         combined.allowed
         and plan_validation is not None
         and allow_new_orders
         and not kill_now_active
+        and not shutdown.is_requested
     ):
         cycle_candle_index = int(get_state(db_path, "paper_cycle_index") or "0") + 1
         set_state(db_path, "paper_cycle_index", str(cycle_candle_index))
@@ -975,6 +1009,36 @@ def main():
     else:
         print(f"  Open orders   : VERIFIED ({len(open_orders)})")
     print("  Execution     : DRY RUN, no order placement")
+
+    # Roadmap G: persist a structured, deterministic run-state marker and a
+    # machine-readable health JSON line so the next restart can verify a
+    # clean hand-off and operators can monitor without parsing logs.  Both
+    # are pure observations of the run's outcome; neither affects trading.
+    _completed = not shutdown.is_requested
+    _open_order_count = len(open_orders) if open_orders is not None else 0
+    _pending_cancels = int(
+        (get_kill_state(db_path) or {}).get("open_order_count") or 0
+    ) if kill_now_active else 0
+    persist_run_state(
+        db_path,
+        run_id=run_id,
+        completed=_completed,
+        risk_allowed=combined.allowed,
+        kill_active=kill_now_active,
+        pending_cancels=_pending_cancels,
+        open_orders=_open_order_count,
+    )
+    shutdown.complete()
+    try:
+        from health import collect_health_report, write_health_jsonl
+        write_health_jsonl(log_path, collect_health_report(db_path, cfg).as_dict())
+    except Exception as exc:
+        # Health reporting is observability, never a trading gate: a failure
+        # here must not abort an otherwise-safe run, but it IS logged.
+        logger.warning("HEALTH REPORT UNAVAILABLE: %s", exc)
+
+    if not _completed:
+        print(f"  Shutdown      : {shutdown.describe()}")
     return 0
 
 if __name__=="__main__":

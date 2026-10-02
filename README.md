@@ -120,12 +120,42 @@ python scripts/reset_reference_equity.py --db <path> \
 python scripts/release_kill_state.py --db <path> \
     --reason "<kenapa>" [--actor <siapa>] \
     [--reconcile AG-BNBUSDT-G00001-00000-B ...]
+
+# Laporan status read-only (health/kill/reconciliation/run-state).
+# Exit 0=HEALTHY, 1=DEGRADED/KILLED/UNHEALTHY, 2=UNSAFE_CONFIG.
+# --json untuk payload mesin; --log <path> juga append ke <path>.jsonl.
+python scripts/status_report.py --db <path> [--json] [--log <path>]
 ```
 
 Audit: `reference_equity_audits` dan `kill_state_audits` menyimpan timestamp,
 nilai sebelum/sesudah, alasan, dan actor. Perintah tidak melemahkan kill
 switch 2% — setelah release, run berikutnya tetap harus PASS gate risk penuh
 sebelum order baru boleh ditempatkan.
+
+#### Observability & operational resilience (Roadmap G)
+
+Lapisan observability read-only, tidak pernah menyentuh logic trading:
+
+- **Structured health report** — `health.collect_health_report` merangkum
+  config safety flags, kill latch, reconciliation health, referensi equity,
+  jumlah order lokal, pending cancel, keputusan risk terakhir, dan cycle
+  terakhir. Payload JSON deterministik (`sort_keys`, tanpa timestamp
+  wall-clock), jadi dua state identik menghasilkan byte identik.
+- **Status operator command** — `scripts/status_report.py` menampilkan
+  rangkuman + exit code sesuai status operasional, dan mengappend JSONL
+  machine-readable ke `<log>.jsonl` (file log manusia tetap bersih).
+- **Graceful shutdown** — `shutdown.ShutdownCoordinator` hanya flip flag;
+  handler sinyal TIDAK pernah menyentuh state. Run-loop cek coordinator di
+  batas aman (sebelum paper cycle) sehingga tidak ada kerja separuh. Request
+  kedua mempercepat (`forced`); `complete()` terminal.
+- **Restart-recovery hardening** — `runstate.verify_restart_safety`
+  memverifikasi tiap startup: DB fresh (tanpa activity) = RESUME; ada
+  marker COMPLETED = RESUME; marker INTERRUPTED + ada activity =
+  RECONCILE_THEN_RESUME; kill latch aktif = KILL_BRANCH; reconciliation
+  gagal dengan activity = REFUSE (fail-closed, run tidak planning).
+- **Run-state marker** — tiap run persist `last_run_state` (fase, risk
+  decision, kill state, jumlah order/pending) supaya restart berikutnya
+  bisa verifikasi hand-off yang bersih.
 
 Bahkan kalau lu merasa:
 
