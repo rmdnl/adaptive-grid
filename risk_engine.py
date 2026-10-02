@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 @dataclass(frozen=True)
@@ -72,6 +72,74 @@ def range_break_kill(lower, upper, price, buffer_pct):
 def range_gate(lower, upper, price, buffer_pct):
     # Backward-compatible alias for the old buffer gate.
     return range_break_kill(lower, upper, price, buffer_pct)
+
+def _finite_positive_decimal(value) -> Decimal | None:
+    """Parse ``value`` to a finite positive Decimal; ``None`` when invalid.
+
+    Rejects None, non-numeric values, NaN, infinity, zero, and negatives.
+    This is the fail-closed input check shared by the 15m lower-boundary
+    kill gate.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = D(value)
+    except (InvalidOperation, ValueError, TypeError, ArithmeticError):
+        return None
+    if not parsed.is_finite() or parsed <= 0:
+        return None
+    return parsed
+
+def _stop_pct_valid(value) -> Decimal | None:
+    """Parse a stop-if-below-lower percentage to a finite Decimal in (0, 1).
+
+    ``0`` disables the stop entirely (dangerous) and ``>= 1`` makes the
+    threshold non-positive (nonsensical); both are rejected so the gate
+    fails closed instead of weakening itself.
+    """
+    parsed = _finite_positive_decimal(value)
+    if parsed is None or parsed >= 1:
+        return None
+    return parsed
+
+def lower_boundary_15m_kill(closed_candle_close, lower_price, stop_if_below_lower_pct):
+    """Dedicated 15-minute candle-close lower-boundary kill.
+
+    Independent of the current-price range-break protection
+    (:func:`range_break_kill`), this gate kills when the latest CLOSED 15m
+    candle close trades at or below a stop band beneath the lower price:
+
+        threshold = LOWER_PRICE * (1 - STOP_IF_BELOW_LOWER_PERCENT)
+        kill        = closed_close <= threshold
+
+    All arithmetic is Decimal.  The caller must supply the close of the
+    latest CLOSED 15m candle (never the currently forming candle and never
+    a ticker price).
+
+    Fail-closed outcomes (each vetoes new orders):
+      * ``LOWER_BOUNDARY_STOP_CONFIG_INVALID`` — the stop percentage or the
+        lower price is missing, non-finite, non-numeric, or out of the
+        valid (0, 1) / (0, +inf) range;
+      * ``LOWER_BOUNDARY_STOP_DATA_UNAVAILABLE`` — the closed-candle close
+        is missing, non-finite, non-numeric, or non-positive;
+      * ``LOWER_BOUNDARY_STOP_15M`` — the closed close is at/below the
+        threshold.
+
+    A valid close strictly above the threshold returns ``PASS`` (allowed),
+    including the exact boundary behavior ``close == threshold -> KILL``
+    and ``close > threshold -> PASS``.
+    """
+    stop = _stop_pct_valid(stop_if_below_lower_pct)
+    lower = _finite_positive_decimal(lower_price)
+    if stop is None or lower is None:
+        return RiskDecision(False, ("LOWER_BOUNDARY_STOP_CONFIG_INVALID",))
+    close = _finite_positive_decimal(closed_candle_close)
+    if close is None:
+        return RiskDecision(False, ("LOWER_BOUNDARY_STOP_DATA_UNAVAILABLE",))
+    threshold = lower * (D("1") - stop)
+    if close <= threshold:
+        return RiskDecision(False, ("LOWER_BOUNDARY_STOP_15M",))
+    return RiskDecision(True)
 
 def inventory_gate(inventory_pct, max_inventory_pct):
     return RiskDecision(False, ("MAX_INVENTORY_EXCEEDED",)) if D(inventory_pct) > D(max_inventory_pct) else RiskDecision(True)

@@ -5,6 +5,30 @@ in DRY_RUN / paper mode. Live trading is not implemented and must not be
 enabled without explicit authorization. All changes below preserve that
 invariant.
 
+## Release line: v3.2.2 (dedicated 15m candle-close lower-boundary kill)
+
+### Milestone: 15m lower-boundary candle-close kill (this commit)
+- `risk_engine.lower_boundary_15m_kill` — dedicated fail-closed Decimal
+  gate: kill when the latest CLOSED 15m candle close is
+  `<= LOWER_PRICE * (1 - stop_if_below_lower_pct)`.  Distinct outcomes:
+  `LOWER_BOUNDARY_STOP_CONFIG_INVALID`,
+  `LOWER_BOUNDARY_STOP_DATA_UNAVAILABLE`, `LOWER_BOUNDARY_STOP_15M`.
+  Independent of the unchanged current-price `range_break_kill`.
+- `main.py` — reads the close from the fetched closed-kline DataFrame
+  (`df["close"].iloc[-1]`; ticker is never a substitute), evaluates the
+  gate inside the combined risk decision, and adds
+  `LOWER_BOUNDARY_STOP_15M` to the kill-trigger set (latch + cancel-on-
+  kill + restart survival).  Invalid config/data vetoes the run without
+  latching the kill state.
+- `config.yaml` / `config_loader.py` — `risk.stop_if_below_lower_pct` is
+  now required (default `0.02` in the shipped config) and validated as a
+  finite Decimal strictly in (0,1); no hidden fallback.  All test-fixture
+  configs updated explicitly.
+- Tests: `tests/test_15m_lower_boundary_kill.py` (22) — spec A–L plus
+  config-validation and production-wiring guard tests.
+- Docs: AGENTS.md invariant, LIMITATIONS.md audit rows, README safeguard
+  section, FINAL_INTEGRATION_AUDIT.md marked historical.
+
 ## Release line: v3.2.1 (safety foundation + deterministic paper core)
 
 ### Milestone: Roadmap G — operational resilience (commit `ef2d3a9`)

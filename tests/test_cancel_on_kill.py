@@ -90,6 +90,7 @@ def _config(tmp_path):
             "range_break_buffer_pct": Decimal("0.01"),
             "daily_profit_lock_pct": Decimal("0.01"),
             "cooldown_minutes": 30,
+            "stop_if_below_lower_pct": Decimal("0.02"),
         },
         "logging": {
             "sqlite_path": str(tmp_path / DB),

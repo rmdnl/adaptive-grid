@@ -56,7 +56,8 @@ from profit_model import profit_class
 from range_engine import auto_range
 from risk_engine import (
     account_state_gate, combine, cooldown_gate, daily_profit_lock, equity_dd_kill,
-    equity_reference_gate, inventory_gate, market_gate, open_orders_gate, profit_gate,
+    equity_reference_gate, inventory_gate, lower_boundary_15m_kill,
+    market_gate, open_orders_gate, profit_gate,
     open_orders_available_gate, range_break_kill, strict_order_price_gate,
 )
 from storage import (
@@ -134,6 +135,36 @@ def _activate_kill_state(db_path, cfg, rules, trigger, note="", actor="risk_engi
     # latch PENDING_RECONCILIATION; the latch stays active in both cases.
     controller.latch_kill_state(trigger, report, actor="risk_engine", note=note)
     return report
+
+def _latest_closed_candle_close(kline_df) -> Decimal | None:
+    """Close of the latest CLOSED 15m candle, or None when unavailable.
+
+    ``kline_df`` is the kline DataFrame produced by ``fetch_klines(...,
+    drop_incomplete=True)``: every row is a closed candle and the last row
+    is the most recent closed 15m candle.  The currently forming candle has
+    already been dropped by the fetch, and the ticker is NOT a substitute
+    (a live price can close the candle at a very different value).
+
+    Fail-closed: any missing frame, empty frame, missing/NaN/non-finite/
+    non-positive close yields ``None`` so the lower-boundary kill gate
+    vetoes new orders instead of passing on bad data.
+    """
+    if kline_df is None or not hasattr(kline_df, "empty") or kline_df.empty:
+        return None
+    if "close" not in getattr(kline_df, "columns", []):
+        return None
+    try:
+        raw = kline_df["close"].iloc[-1]
+        value = Decimal(str(raw))
+    except (IndexError, KeyError, AttributeError, TypeError,
+            ValueError, ArithmeticError):
+        return None
+    try:
+        if not value.is_finite() or value <= 0:
+            return None
+    except (AttributeError, ValueError):
+        return None
+    return value
 
 def _logger(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -414,6 +445,11 @@ def main():
 
     df=fetch_klines(client,symbol,cfg["timeframe"],cfg["range"]["lookback"],drop_incomplete=True)
     enriched=enrich(df); last=latest_valid_row(enriched)
+    # 15m lower-boundary stop input: the close of the latest CLOSED 15m
+    # candle (df is fetched with drop_incomplete=True, so the last row is
+    # closed).  Computed ONCE here and fed to the risk gate; the ticker is
+    # deliberately not used as a substitute.  None => fail-closed veto.
+    last_closed_close = _latest_closed_candle_close(df)
     ticker=None; ticker_error=None
     try:
         ticker=fetch_ticker_price(client,symbol)
@@ -694,6 +730,16 @@ def main():
         market_gate(last,cfg["market_filter"]),
         strict_order_price_gate(lower,effective_upper,current_price),
         range_break_kill(lower,effective_upper,current_price,cfg["risk"]["range_break_buffer_pct"]),
+        # 15m lower-boundary stop (dedicated, independent of the current-price
+        # range-break kill above): the latest CLOSED 15m candle close at/below
+        # LOWER_PRICE * (1 - stop_if_below_lower_pct) vetoes new orders and
+        # latches the kill state.  Fail-closed on missing/invalid config or
+        # candle data — never a silent PASS.
+        lower_boundary_15m_kill(
+            last_closed_close,
+            lower,
+            cfg["risk"]["stop_if_below_lower_pct"],
+        ),
         cooldown_gate(False),
         daily_profit_lock(Decimal("0"),cfg["risk"]["daily_profit_lock_pct"]),
         # PATCH 1 (F-H1): fail-closed gate on the persisted reference equity.
@@ -728,20 +774,29 @@ def main():
         reasons_str = " | ".join(r.value for r in adaptive_plan.reasons)
         combined=combine(combined,type(combined)(False,(f"ADAPTIVE_PLANNER:GRID_BLOCKED:{reasons_str}",)))
 
-    # F-H2: kill-trigger detection.  The kill conditions are the equity-drawdown
-    # kill (>= 2% drawdown) and the range-break kill (price beyond the
-    # range-break buffer).  When either fires, the kill state is LATCHED
+    # F-H2 + 15m lower-boundary stop: kill-trigger detection.  The kill
+    # conditions are the equity-drawdown kill (>= 2% drawdown), the
+    # current-price range-break kill, and the dedicated 15m candle-close
+    # lower-boundary stop.  When either fires, the kill state is LATCHED
     # (persisted, survives restart) and open orders are canceled via the
     # fail-closed controller.  A failed/unknown cancel keeps the latch active
     # with cancel_status=PENDING_RECONCILIATION; no new orders are placed in
     # this run and none can be placed on any restart until an operator
     # explicitly releases the latch through the release command.
+    #
+    # The CONFIG_INVALID / DATA_UNAVAILABLE lower-boundary reasons are
+    # fail-closed vetoes (the gate's output is recorded in the risk event
+    # context) but they are NOT kill triggers: a transient data or config
+    # problem must not latch the kill state — it blocks new orders for this
+    # run only.  Only a confirmed LOWER_BOUNDARY_STOP_15M close breaches the
+    # boundary hard enough to warrant the latch + cancel path.
     kill_triggers = [
         r for r in combined.reasons
         if r in {
             "EQUITY_DRAWDOWN_KILL",
             "RANGE_BREAK_BELOW_BUFFER",
             "RANGE_BREAK_ABOVE_BUFFER",
+            "LOWER_BOUNDARY_STOP_15M",
         }
     ]
     kill_state_active_at_run_end = False

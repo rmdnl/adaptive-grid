@@ -18,7 +18,12 @@ Optimize for correctness, deterministic behavior, tests, maintainability, and ca
 - Never place orders outside LOWER_PRICE / UPPER_PRICE.
 - Range-break kill logic must remain fail-closed.
 - Equity drawdown kill switch remains 2%.
-- 15m lower-boundary stop logic must remain intact.
+- 15m lower-boundary stop logic must remain intact: the dedicated
+  `risk_engine.lower_boundary_15m_kill` gate kills when the latest CLOSED
+  15m candle close <= LOWER_PRICE * (1 - stop_if_below_lower_pct)
+  (config `risk.stop_if_below_lower_pct`, default 0.02, required &
+  validated).  It is independent of the current-price range-break kill and
+  must stay fail-closed on missing/invalid candle data.
 - Risk Engine has veto authority over order placement.
 - Never commit, print, hardcode, or expose secrets.
 - Never require withdrawal permissions.

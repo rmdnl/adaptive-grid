@@ -1,5 +1,14 @@
 # FINAL INTEGRATION AUDIT — ROBOT GRID SPOT CRYPTO
 
+> **HISTORICAL DOCUMENT.** This audit reflects the state at Phase 1–6A +
+> Patch 1, 2A, 2B, 2C, 2D, 3.  It predates the later autonomous milestones
+> (F-H1, F-H2, Roadmap G/E, and the dedicated 15m candle-close lower-boundary
+> kill).  Where its claims are out of date — in particular §9, which listed
+> "lower-bound stop" as covered by the generic risk gates while the dedicated
+> 15m candle-close kill `lower_boundary_15m_kill` was NOT yet implemented —
+> the current state is documented in `LIMITATIONS.md` and
+> `AUTONOMOUS_RUN_REPORT.md`.  Do not read this file as the current audit.
+>
 **Date:** 2026-09-30
 **Mode:** Audit-first (no code modified, no commit, no push)
 **Scope:** Phase 1–6A + Patch 1, 2A, 2B, 2C, 2D, 3

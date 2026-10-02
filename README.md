@@ -377,7 +377,50 @@ Risk engine tidak akan bilang:
 
 Dia bukan teman tongkrongan. 😭
 
-### 4. Market filter
+### 4. Stop batas bawah candle 15m (lower-boundary kill)
+
+Default:
+
+```yaml
+stop_if_below_lower_pct: 0.02
+```
+
+Ini pengaman **berbeda** dari range-break buffer di atas. Yang dicek bukan
+harga ticker, melainkan **close candle 15m yang sudah closed**:
+
+```text
+threshold = LOWER_PRICE × (1 - 0.02)
+close_15m  <= threshold  →  KILL
+```
+
+Contoh: LOWER_PRICE = 94 → threshold = 92.12.
+Kalau candle 15m terakhir close di 92.00 atau di bawahnya,
+meskipun ticker masih di dalam range:
+
+```text
+KILL: LOWER_BOUNDARY_STOP_15M
+   ↓
+kill state di-latch (persist, tahan restart)
+   ↓
+cancel open orders (fail-closed, UNKNOWN/FAILED = tetap aktif)
+   ↓
+TIDAK ada order baru, TIDAK ada order pengganti
+```
+
+Aturan:
+
+- Hanya pakai candle **closed** (candle yang masih berjalan di-drop;
+  ticker tidak boleh menggantikan close candle).
+- Fail-closed: data candle hilang/rusak/NaN → veto (`DATA_UNAVAILABLE`),
+  config invalid → veto (`CONFIG_INVALID`), tidak pernah PASS diam-diam.
+  Kedua veto itu memblokir order untuk run itu saja (tidak mengunci kill
+  state); hanya close yang terkonfirmasi di bawah threshold yang mengunci.
+- `stop_if_below_lower_pct` **wajib** ada di config (divalidasi: Decimal
+  finite di (0,1)). Tidak ada fallback tersembunyi.
+- Range-break kill (butir 2) tidak diubah; kedua pengaman berjalan
+  terpisah.
+
+### 5. Market filter
 
 Bot mengecek:
 

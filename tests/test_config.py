@@ -58,6 +58,7 @@ def _base_config():
             "range_break_buffer_pct": Decimal("0.01"),
             "daily_profit_lock_pct": Decimal("0.01"),
             "cooldown_minutes": 30,
+            "stop_if_below_lower_pct": Decimal("0.02"),
         },
         "logging": {
             "sqlite_path": "grid.sqlite3",

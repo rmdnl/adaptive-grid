@@ -253,6 +253,49 @@ a human-authorization decision, not an autonomous coding task.
 - `d7005fa` feat: Roadmap E deterministic exchange-event applier + REST seam
 - (this milestone) `docs: Roadmap H final audit + changelog + limitations report`
 
+## Milestone 5 — 15m candle-close lower-boundary kill (dedicated gate)
+
+Fixes the verified audit gap: the repository had `range_break_kill`
+(current ticker price ± buffer) but NOT a dedicated 15-minute candle-close
+lower-boundary stop. This milestone implements it as a separate, fail-closed
+Risk Engine gate wired into the production `main()` risk decision.
+
+- `risk_engine.lower_boundary_15m_kill(closed_candle_close, lower_price,
+  stop_if_below_lower_pct)` — Decimal gate:
+  `threshold = LOWER_PRICE * (1 - stop_pct)`; kill iff
+  `closed_close <= threshold`.  Fail-closed outcomes:
+  `LOWER_BOUNDARY_STOP_CONFIG_INVALID` (bad stop_pct / lower price),
+  `LOWER_BOUNDARY_STOP_DATA_UNAVAILABLE` (missing/invalid/NaN/Inf close),
+  `LOWER_BOUNDARY_STOP_15M` (trigger).  Never substitutes the ticker.
+- `main._latest_closed_candle_close(df)` — reads `df["close"].iloc[-1]`
+  from the closed-candle DataFrame (`fetch_klines(drop_incomplete=True)`);
+  any missing/empty/NaN/non-finite/non-positive frame yields `None`
+  (fail-closed veto, never a silent PASS).
+- `main()` — the gate is in the base risk `decisions` list; its
+  `LOWER_BOUNDARY_STOP_15M` reason is a kill trigger (latches the kill
+  state + cancel-on-kill; survives restart).  `CONFIG_INVALID` /
+  `DATA_UNAVAILABLE` veto new orders for the run but do NOT latch the
+  kill state (a transient data problem must not persist a kill).
+- Config: `risk.stop_if_below_lower_pct` is now REQUIRED and validated in
+  `config_loader.validate_config` (finite Decimal strictly in (0,1)); no
+  hidden fallback default.  `config.yaml` carries the default `0.02`.
+  All 8 test-fixture config builders updated explicitly.
+- Existing `range_break_buffer_pct` / `range_break_kill` are unchanged and
+  remain a separate, independent protection.
+- `tests/test_15m_lower_boundary_kill.py` (22 tests) covers spec items
+  A–L: exact/below/above threshold, ticker-independent, malformed/missing/
+  NaN/Inf close, restart persistence, new-order prevention, cancel-on-kill
+  invocation, failed-cancel keeps kill active, idempotent re-evaluation,
+  and unchanged `range_break_kill` behavior.  A production-wiring guard
+  test prevents regression to a dead helper.
+- Docs: `AGENTS.md` invariant expanded; `LIMITATIONS.md` audit row and
+  invariant corrected (no longer claims the stop was already sufficient);
+  `FINAL_INTEGRATION_AUDIT.md` marked HISTORICAL; this report updated.
+
+Test result: full `pytest -q` -> **1115 passed, 0 failed** (was 1093).
+Targeted: `tests/test_15m_lower_boundary_kill.py` 22/22 pass; related
+risk/cancel/recovery/config suites (169) pass.
+
 ## Remaining tasks (next safe milestones, not yet started)
 
 NONE remaining on the safe roadmap. Roadmap H (final audit) is complete this
@@ -281,8 +324,9 @@ scope for autonomous work.
   cannot be VERIFIED.
 - The kill-state release command is paper-only and refuses to run when the
   config is not explicitly dry-run with live execution disabled.
-- The 15m lower-boundary stop and range-break kill remain fail-closed; the
-  persisted peak is used only for the 2% equity drawdown gate.
+- The 15m lower-boundary stop (dedicated `lower_boundary_15m_kill` candle-close
+  gate, implemented in this milestone) and the range-break kill remain
+  fail-closed; the persisted peak is used only for the 2% equity drawdown gate.
 - Grid invariants unchanged: 0.30% hard min net, 0.60% gross step, 2%
   drawdown kill, strict range protection, risk-engine veto over every order.
 

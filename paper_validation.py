@@ -56,6 +56,7 @@ class ValidationConfig:
     max_equity_drawdown_pct: Decimal = Decimal("0.02")
     range_break_buffer_pct: Decimal = Decimal("0.01")
     daily_profit_lock_pct: Decimal = Decimal("0.01")
+    stop_if_below_lower_pct: Decimal = Decimal("0.02")
     cooldown_minutes: int = 30
     max_candle_age_seconds: int = 5400
     max_quote_age_seconds: int = 10
@@ -128,6 +129,7 @@ class ValidationConfig:
                     "max_equity_drawdown_pct": float(self.max_equity_drawdown_pct),
                     "range_break_buffer_pct": float(self.range_break_buffer_pct),
                     "daily_profit_lock_pct": float(self.daily_profit_lock_pct),
+                    "stop_if_below_lower_pct": float(self.stop_if_below_lower_pct),
                     "cooldown_minutes": self.cooldown_minutes,
                 },
             })

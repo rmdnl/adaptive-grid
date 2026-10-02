@@ -4,7 +4,7 @@
 
 | Check | Result |
 |-------|--------|
-| Full test suite (`pytest -q`) | **1093 passed, 0 failed** |
+| Full test suite (`pytest -q`) | **1115 passed, 0 failed** (incl. 22 dedicated 15m lower-boundary-kill tests) |
 | Hardcoded secrets in tracked files | none |
 | `.env` tracked | no |
 | `.venv` / DB / logs / caches tracked | no |
@@ -13,7 +13,7 @@
 | `allow_live_execution` default | `false` |
 | Grid invariants (0.30% min net / 0.60% step / 2% drawdown kill) | enforced in `config_loader.py` + `grid_engine.py` + `risk_engine.py` |
 | Range-break kill (fail-closed) | present (`risk_engine.range_break_kill`, `main.py`) |
-| 15m lower-boundary stop | present (`grid_engine.range_break` / `strict_order_price_gate`) |
+| 15m candle-close lower-boundary kill | present (`risk_engine.lower_boundary_15m_kill`, wired into `main()` risk decision + kill latch; config `risk.stop_if_below_lower_pct = 0.02` required & validated) |
 | Kill-state prevents new orders + survives restart | present (`cancel_controller` + `main()` restart gate) |
 | Withdrawal permission | never required |
 | Futures / margin / leverage / shorting / martingale | not present |
@@ -32,6 +32,20 @@
 - Range-break kill is fail-closed.
 - Equity drawdown kill switch remains 2%.
 - 15m lower-boundary stop is intact.
+- 15m candle-close lower-boundary kill (dedicated, implemented):
+  `risk_engine.lower_boundary_15m_kill` — kills when the latest CLOSED 15m
+  candle close satisfies `close <= LOWER_PRICE * (1 - stop_if_below_lower_pct)`
+  (Decimal arithmetic; default `stop_if_below_lower_pct = 0.02`, i.e. a 2%
+  stop band below the lower price).  Uses closed candles only (the currently
+  forming candle is dropped by `fetch_klines(drop_incomplete=True)`; the
+  ticker is never a substitute).  Fail-closed: `LOWER_BOUNDARY_STOP_CONFIG_INVALID`
+  and `LOWER_BOUNDARY_STOP_DATA_UNAVAILABLE` both veto new orders;
+  `LOWER_BOUNDARY_STOP_15M` additionally latches the persisted kill state and
+  invokes the cancel-on-kill controller.  Independent of — and in addition
+  to — the current-price range-break kill (`range_break_buffer_pct`
+  unchanged).  The config field `risk.stop_if_below_lower_pct` is required by
+  `config_loader.validate_config` (finite Decimal strictly in (0,1)); there
+  is no hidden fallback default.  See `tests/test_15m_lower_boundary_kill.py`.
 - Risk Engine has veto authority over every order.
 - Kill state prevents new orders and survives restart.
 - No secrets committed, printed, or hardcoded; no withdrawal permission.

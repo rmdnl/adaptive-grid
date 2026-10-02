@@ -101,6 +101,10 @@ risk:
   range_break_buffer_pct: 0.01
   daily_profit_lock_pct: 0.01
   cooldown_minutes: 30
+  # Dedicated 15m candle-close lower-boundary stop (independent of the
+  # current-price range-break buffer above).  Kills when the latest CLOSED
+  # 15m candle close <= LOWER_PRICE * (1 - stop_if_below_lower_pct).
+  stop_if_below_lower_pct: 0.02
 
 logging:
   sqlite_path: ./data/grid_bot.sqlite3

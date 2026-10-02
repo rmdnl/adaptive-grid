@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +83,27 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ConfigError("risk.max_equity_drawdown_pct must be > 0")
     if _d(risk.get("range_break_buffer_pct")) < 0:
         raise ConfigError("risk.range_break_buffer_pct cannot be negative")
+    # 15m candle-close lower-boundary stop (dedicated, fail-closed).  Must be
+    # explicitly present and in (0, 1): 0 disables the stop, >= 1 makes the
+    # threshold non-positive.  Missing/invalid values are refused so the
+    # production run cannot fall back to a hidden default.
+    if "stop_if_below_lower_pct" not in risk:
+        raise ConfigError(
+            "risk.stop_if_below_lower_pct is required "
+            "(15m lower-boundary candle-close stop)"
+        )
+    try:
+        stop_pct = Decimal(str(risk["stop_if_below_lower_pct"]))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ConfigError(
+            "risk.stop_if_below_lower_pct must be a finite decimal strictly "
+            "between 0 and 1 (default 0.02)"
+        ) from exc
+    if not stop_pct.is_finite() or not (Decimal("0") < stop_pct < Decimal("1")):
+        raise ConfigError(
+            "risk.stop_if_below_lower_pct must be a finite decimal strictly "
+            "between 0 and 1 (default 0.02)"
+        )
 
     execution = cfg.get("execution", {})
     if int(execution.get("max_open_orders", 0)) < 1:

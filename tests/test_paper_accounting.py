@@ -117,7 +117,7 @@ def test_valid_paper_configuration():
         "range": {"mode": "auto", "lower_price": 0, "upper_price": 0},
         "fees": {"maker_fee_fallback": 0.001, "taker_fee_fallback": 0.001, "slippage_roundtrip_pct": 0.0005},
         "paper": {"initial_base_balance": 2, "initial_quote_balance": 1000, "maker_fee": 0.001, "taker_fee": 0.001, "fee_asset": "USDT"},
-        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01},
+        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02},
         "execution": {"max_open_orders": 40, "order_quote_size": 25},
     }
 
@@ -132,7 +132,7 @@ def test_missing_paper_configuration_fails_closed():
         "grid": {"step_pct": 0.006, "hard_min_net_pct": 0.003, "preferred_net_max_pct": 0.004, "min_cells": 6, "max_levels": 40},
         "range": {"mode": "auto", "lower_price": 0, "upper_price": 0},
         "fees": {"maker_fee_fallback": 0.001, "taker_fee_fallback": 0.001, "slippage_roundtrip_pct": 0.0005},
-        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01},
+        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02},
         "execution": {"max_open_orders": 40, "order_quote_size": 25},
     }
 
@@ -150,7 +150,7 @@ def test_invalid_paper_balance_fails_closed(field):
         "range": {"mode": "auto", "lower_price": 0, "upper_price": 0},
         "fees": {"maker_fee_fallback": 0.001, "taker_fee_fallback": 0.001, "slippage_roundtrip_pct": 0.0005},
         "paper": {"initial_base_balance": 2, "initial_quote_balance": 1000, "maker_fee": 0.001, "taker_fee": 0.001, "fee_asset": "USDT"},
-        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01},
+        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02},
         "execution": {"max_open_orders": 40, "order_quote_size": 25},
     }
     cfg["paper"][field] = -1
