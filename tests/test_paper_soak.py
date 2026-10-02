@@ -480,12 +480,27 @@ def test_soak_AK_long_run_and_determinism_replay(tmp_path):
         (covers all regime segments and the first kill activation)
       - Sampled invariant checks every 100 cycles after that (keeps runtime
         manageable across 10,000 cycles while still proving conservation)
+
+    Kill-latch model:
+      The paper orchestrator's run_cycle() does NOT write the kill_state table —
+      that is main.py's responsibility (via CancelController.pre_latch /
+      latch_kill_state).  This harness models main.py's logic: when the price
+      breaches the range-break buffer, the harness explicitly latches the kill
+      state (as main.py would) before passing risk_allowed=False to subsequent
+      cycles.  This mirrors the actual production control-flow while keeping the
+      test free of network dependencies.
     """
     # ---- Two independent runs with seed 42 ----
     snapshots = []
     sequence = _long_run_sequence(seed=42, target_cycles=MAIN_SOAK_CYCLES)
     assert len(sequence) == MAIN_SOAK_CYCLES, (
         f"Expected {MAIN_SOAK_CYCLES} cycle sequence, got {len(sequence)}"
+    )
+
+    # 0-based index of the first range-break price in the cyclic sequence.
+    range_break_start = next(
+        i for i, (label, _p) in enumerate(sequence)
+        if label == "range_break"
     )
 
     for run_idx in range(2):
@@ -498,12 +513,31 @@ def test_soak_AK_long_run_and_determinism_replay(tmp_path):
 
         candle_index = 1
         total_cycles = 0
+        # kill_active: harness tracks whether main.py would have latched the kill.
         kill_active = False
+        run_submitted = 0
+        run_fills = 0
+        # post_kill_submitted: orders submitted AFTER kill is active — must be 0.
+        post_kill_submitted = 0
+        kill_latch_cycle = None   # 1-based cycle when we wrote the kill latch
 
         for (seg_label, price) in sequence:
-            # Once a kill fires, all subsequent cycles are blocked.
-            # The soak keeps the kill active (no release) to exercise
-            # post-kill state-machine behavior across many cycles.
+            # Model main.py's range-break kill detection:
+            # a price breaching lower*(1-buffer_pct) must trigger the kill latch.
+            # The harness writes the latch explicitly (as main.py does via
+            # CancelController) BEFORE evaluating the cycle so that the
+            # risk_allowed flag is correct on the cycle that triggered the kill.
+            if not kill_active and seg_label == "range_break":
+                # range_break segment prices are all < LOWER_P * 0.99.
+                # main.py would call pre_latch then latch_kill_state here.
+                set_kill_state(
+                    order_db, active=True,
+                    trigger="RANGE_BREAK_BELOW_BUFFER",
+                    cancel_status="NO_OPEN_ORDERS",
+                )
+                kill_active = True
+                kill_latch_cycle = total_cycles + 1  # 1-based
+
             risk_allowed = not kill_active
             risk_reasons = (
                 ("KILL_STATE_ACTIVE:TEST",) if not risk_allowed else ()
@@ -518,6 +552,12 @@ def test_soak_AK_long_run_and_determinism_replay(tmp_path):
             )
             result = session.run_cycle(ci)
             total_cycles += 1
+            run_submitted += result.orders_submitted
+            run_fills += result.fills_applied
+
+            # Invariant: kill active => no new orders can be submitted.
+            if kill_active:
+                post_kill_submitted += result.orders_submitted
 
             # Invariant checks:
             #   every cycle for the first 500 cycles (full coverage of all
@@ -529,12 +569,6 @@ def test_soak_AK_long_run_and_determinism_replay(tmp_path):
                     f"run{run_idx}/seg={seg_label}/c={candle_index}",
                 )
 
-            # Track kill activation
-            if total_cycles <= 500 or total_cycles % 100 == 0:
-                ks = get_kill_state(order_db)
-                if ks is not None and ks["active"]:
-                    kill_active = True
-
             candle_index += 1
 
         # Minimum coverage (Round 4 target: 10,000 cycles; override via env)
@@ -544,6 +578,39 @@ def test_soak_AK_long_run_and_determinism_replay(tmp_path):
 
         snap = _snapshot(order_db)
         snapshots.append(snap)
+
+        # --- Round 5 soak-harness quality assertions -------------------
+        # A1. Meaningful activity: orders must be created and fills applied
+        #     before the kill fires.  A soak that submitted nothing never
+        #     exercised the order path.
+        assert run_submitted > 0, (
+            f"run{run_idx}: zero orders submitted across {total_cycles} "
+            "cycles — the soak is not exercising order creation"
+        )
+        assert run_fills > 0, (
+            f"run{run_idx}: zero fills applied across {total_cycles} "
+            "cycles — the soak is not exercising the fill path"
+        )
+        # A2. Kill latch: when the range-break segment is reachable in the
+        #     cyclic sequence the harness must have latched the kill state.
+        if MAIN_SOAK_CYCLES > range_break_start:
+            assert kill_active, (
+                f"run{run_idx}: range-break segment starts at sequence cycle "
+                f"{range_break_start + 1} but the kill latch was never set"
+            )
+            ks = get_kill_state(order_db)
+            assert ks is not None and ks["active"], (
+                f"run{run_idx}: kill_state DB row missing or inactive after "
+                "explicit set_kill_state call"
+            )
+            assert ks["trigger"] == "RANGE_BREAK_BELOW_BUFFER", (
+                f"run{run_idx}: unexpected kill trigger {ks['trigger']!r}"
+            )
+            # A3. No new economic orders after kill is latched.
+            assert post_kill_submitted == 0, (
+                f"run{run_idx}: {post_kill_submitted} orders submitted after "
+                "kill latch was active — kill-active cycles must be blocked"
+            )
 
     # K: semantic equality across two identical runs
     snap0, snap1 = snapshots
