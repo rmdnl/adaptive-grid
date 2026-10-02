@@ -59,7 +59,15 @@ from risk_engine import (
     equity_reference_gate, inventory_gate, market_gate, open_orders_gate, profit_gate,
     open_orders_available_gate, range_break_kill, strict_order_price_gate,
 )
-from storage import get_state, init_db, record_risk_event, set_state
+from storage import (
+    clear_state,
+    get_kill_state,
+    get_state,
+    init_db,
+    record_risk_event,
+    record_reference_equity_audit,
+    set_state,
+)
 from symbol_rules import parse_symbol_info, validate_quantized_order_plan
 
 # PATCH 1 (F-H1): the reference/peak equity is PERSISTED in the existing
@@ -74,6 +82,56 @@ from symbol_rules import parse_symbol_info, validate_quantized_order_plan
 # wall clock; tests may inject a clock aligned to their fixture candle data so
 # the orchestrator's market-freshness gate passes deterministically.
 _PAPER_CYCLE_CLOCK = None
+
+# F-H2: canceler seam for the cancel-on-kill pass.  ``None`` selects the
+# deterministic paper canceler (the local state transition IS the
+# cancellation in dry-run mode, so every attempt is CONFIRMED).  Tests may
+# inject a canceler that returns CancelOutcome values to exercise the
+# UNKNOWN / FAILED / ALREADY_CANCELED paths.  Never a third source of truth:
+# the cancel result is always reconciled against local order + reservation
+# state and persisted to cancel_records.
+_KILL_CANCELER = None
+
+def _build_kill_controller(db_path, cfg, rules, clock=None):
+    """Construct the fail-closed cancel-on-kill controller.
+
+    Reads the injected ``_KILL_CANCELER`` seam so tests can drive the
+    UNKNOWN / FAILED / ALREADY_CANCELED paths deterministically.
+    """
+    from cancel_controller import CancelController
+    controller = CancelController(
+        db_path,
+        cfg,
+        rules,
+        clock=clock,
+        canceler=_KILL_CANCELER,
+    )
+    return controller
+
+def _activate_kill_state(db_path, cfg, rules, trigger, note="", actor="risk_engine"):
+    """F-H2: latch the persisted kill state and cancel open orders.
+
+    * Latches ``kill_state`` (persisted, survives restart) as part of the
+      cancel pass, so a crash mid-pass still leaves the kill latched and a
+      restart re-enters the kill branch.
+    * Runs one cancel pass over every open local order.  A failed or unknown
+      cancel does NOT clear the latch: the state stays active with
+      ``cancel_status=PENDING_RECONCILIATION`` and a fresh attempt is made
+      on the next run.  Only an explicitly reconciled pass permits an
+      operator release.
+    * Never places replacement orders and never weakens the risk gate.
+    """
+    controller = _build_kill_controller(db_path, cfg, rules)
+    # Latch FIRST (crash-safe): the persisted kill state exists even if the
+    # cancel pass or the process dies partway through.  A restart re-enters
+    # the kill branch regardless of where the previous run died.
+    controller.pre_latch(trigger, actor="risk_engine", note=note)
+    report = controller.cancel_open_orders(actor=actor, trigger_note=trigger)
+    # latch_kill_state is the single writer of the kill_state progress fields
+    # and appends the ACTIVATE/RETRY audit row.  A pending pass marks the
+    # latch PENDING_RECONCILIATION; the latch stays active in both cases.
+    controller.latch_kill_state(trigger, report, actor="risk_engine", note=note)
+    return report
 
 def _logger(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +175,60 @@ def record_peak_equity(db_path, equity) -> None:
     peak = load_peak_equity(db_path)
     if peak is None or value > peak:
         set_state(db_path, "paper_reference_equity", str(value))
+
+def reset_reference_equity(db_path, new_value, reason, actor, clear=False):
+    """Explicit, operator-triggered reset of the persisted reference equity.
+
+    This is the ONLY way to change the reference apart from the automatic
+    high-water-mark raise in :func:`record_peak_equity`.  The reset is never
+    automatic: it requires a non-empty ``reason`` and ``actor``, and it writes
+    a durable audit row (timestamp, previous value, new value, reason, actor)
+    in ``storage.record_reference_equity_audit`` so the change is always
+    attributable.
+
+    ``new_value`` must be a finite positive Decimal; pass ``None`` to clear
+    the reference entirely (the next run re-bootstraps from the first valid
+    observed equity).  ``clear=True`` removes the key; a value replaces it.
+
+    Returns the previous reference (``None`` when absent).  The automatic
+    high-water-mark behaviour is not weakened: only a higher equity raises
+    the peak; this function is the sole mechanism to lower/clear it and it
+    is deliberately operator-gated.
+    """
+    if not reason or not str(reason).strip():
+        raise ValueError("reset_reference_equity requires a non-empty reason")
+    if not actor or not str(actor).strip():
+        raise ValueError("reset_reference_equity requires a non-empty actor")
+
+    previous = load_peak_equity(db_path)
+    previous_raw = get_state(db_path, "paper_reference_equity")
+
+    if new_value is None:
+        # Clear the key so the next run bootstraps fresh.
+        clear_state(db_path, "paper_reference_equity")
+        new_value_str = "CLEARED"
+    else:
+        parsed = Decimal(str(new_value))
+        if not parsed.is_finite() or parsed <= 0:
+            raise ValueError(
+                "new_value must be a finite positive Decimal"
+            )
+        new_value_str = str(parsed)
+        set_state(db_path, "paper_reference_equity", new_value_str)
+        if clear:
+            # An explicit operator instruction to forget prior state; still
+            # audited so the intent is on record.
+            clear_state(db_path, "paper_reference_equity")
+            new_value_str = "CLEARED"
+
+    record_reference_equity_audit(
+        db_path,
+        previous_value=previous_raw,
+        new_value=new_value_str,
+        reason=str(reason).strip(),
+        actor=str(actor).strip(),
+    )
+    return previous
 
 def _run_paper_cycle(db_path, cfg, symbol, rules, current_price, kline_df,
                      lower, upper, risk_decision, regime, range_quality_score,
@@ -249,6 +361,32 @@ def main():
 
     symbol_info=fetch_symbol_info(client,symbol)
     rules=parse_symbol_info(symbol_info)
+
+    # F-H2: restart safety — a persisted kill state MUST be honored on every
+    # process start.  Re-attempt open-order cancellation/reconciliation,
+    # confirm the latch is still active, log the event, and stop the run.
+    # No new orders are ever placed while the kill state is active, and a
+    # restart can never silently resume trading.
+    kill_prior = get_kill_state(db_path)
+    if kill_prior is not None and kill_prior.get("active"):
+        report = _activate_kill_state(
+            db_path, cfg, rules,
+            kill_prior.get("trigger") or "KILL_STATE_RESTART_RECOVERY",
+            note="restart recovery",
+        )
+        record_risk_event(db_path, False, "KILL_STATE_ACTIVE", {
+            "trigger": kill_prior.get("trigger"),
+            "activated_at": kill_prior.get("activated_at"),
+            "cancel_status": report.overall_status,
+            "pending_orders": report.pending,
+            "note": "restart recovery: kill state remains active",
+        })
+        print("\nResult:")
+        print("  Kill state    : ACTIVE (restart recovery)")
+        print(f"  Trigger       : {kill_prior.get('trigger')}")
+        print(f"  Cancel status : {report.overall_status} pending={report.pending}")
+        print("  Execution     : DRY RUN, no order placement (kill state active)")
+        return 0
 
     df=fetch_klines(client,symbol,cfg["timeframe"],cfg["range"]["lookback"],drop_incomplete=True)
     enriched=enrich(df); last=latest_valid_row(enriched)
@@ -563,8 +701,46 @@ def main():
         reasons_str = "|".join(r.value for r in market_intelligence_decision.reasons)
         combined=combine(combined,type(combined)(False,(f"MARKET_INTELLIGENCE:GRID_BLOCKED:{reasons_str}",)))
     if adaptive_plan is not None and adaptive_plan.decision == PlanDecision.GRID_BLOCKED:
-        reasons_str = "|".join(r.value for r in adaptive_plan.reasons)
+        reasons_str = " | ".join(r.value for r in adaptive_plan.reasons)
         combined=combine(combined,type(combined)(False,(f"ADAPTIVE_PLANNER:GRID_BLOCKED:{reasons_str}",)))
+
+    # F-H2: kill-trigger detection.  The kill conditions are the equity-drawdown
+    # kill (>= 2% drawdown) and the range-break kill (price beyond the
+    # range-break buffer).  When either fires, the kill state is LATCHED
+    # (persisted, survives restart) and open orders are canceled via the
+    # fail-closed controller.  A failed/unknown cancel keeps the latch active
+    # with cancel_status=PENDING_RECONCILIATION; no new orders are placed in
+    # this run and none can be placed on any restart until an operator
+    # explicitly releases the latch through the release command.
+    kill_triggers = [
+        r for r in combined.reasons
+        if r in {
+            "EQUITY_DRAWDOWN_KILL",
+            "RANGE_BREAK_BELOW_BUFFER",
+            "RANGE_BREAK_ABOVE_BUFFER",
+        }
+    ]
+    kill_state_active_at_run_end = False
+    if kill_triggers:
+        report = _activate_kill_state(
+            db_path, cfg, rules,
+            " | ".join(kill_triggers),
+            note=f"price={current_price} range={lower}->{effective_upper}",
+        )
+        # Re-read the latch so the run's output reflects the authoritative
+        # persisted state (including PENDING_RECONCILIATION when a cancel
+        # could not be confirmed).
+        kill_now = get_kill_state(db_path)
+        kill_state_active_at_run_end = bool(kill_now and kill_now.get("active"))
+        record_risk_event(db_path, False, "KILL_TRIGGER", {
+            "triggers": kill_triggers,
+            "cancel_status": report.overall_status,
+            "cancelled": report.cancelled,
+            "unknown": report.unknown,
+            "failed": report.failed,
+            "pending_orders": report.pending,
+            "kill_active": kill_state_active_at_run_end,
+        })
 
     record_risk_event(db_path,combined.allowed,combined.reason,{
         "symbol":symbol,"price":str(current_price),
@@ -679,10 +855,25 @@ def main():
     # untouched — the original ``submit_new`` semantics).  This keeps the
     # orchestrator's lifecycle DB in sync with main's decision and skips the
     # submission cycle on keep/reconfig so no new orders are placed.
+    #
+    # F-H2: a persisted, active kill state is an ABSOLUTE veto on new order
+    # placement, independent of ``combined.allowed``.  After a kill trigger
+    # this run, the latch stays active until an operator explicitly releases
+    # it; this guard re-reads the authoritative latch so a later refactor
+    # cannot place orders (or replacement orders) while the kill is active.
+    kill_now = get_kill_state(db_path)
+    kill_now_active = bool(kill_now and kill_now.get("active"))
+    if kill_now_active:
+        logger.warning(
+            "KILL STATE ACTIVE: new order placement blocked "
+            "(trigger=%s cancel_status=%s)",
+            kill_now.get("trigger"), kill_now.get("cancel_status"),
+        )
     if (
         combined.allowed
         and plan_validation is not None
         and allow_new_orders
+        and not kill_now_active
     ):
         cycle_candle_index = int(get_state(db_path, "paper_cycle_index") or "0") + 1
         set_state(db_path, "paper_cycle_index", str(cycle_candle_index))
@@ -755,6 +946,9 @@ def main():
     print("\nResult:")
     print(f"  Risk decision : {'PASS' if combined.allowed else 'BLOCK'}")
     print(f"  Reason        : {combined.reason}")
+    if kill_state_active_at_run_end or kill_now_active:
+        _ks = get_kill_state(db_path)
+        print(f"  Kill state    : ACTIVE (trigger={_ks.get('trigger')} cancel_status={_ks.get('cancel_status')})")
     if market_intelligence_decision is not None:
         print(f"  Market regime : {market_intelligence_decision.regime.value}")
         print(f"  Grid allowed  : {'YES' if market_intelligence_decision.allowed else 'NO'}")

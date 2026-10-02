@@ -61,7 +61,7 @@ Artinya:
 
 **JANGAN nyalain live trading.**
 
-### Account-risk state (Phase 2B + PATCH 1 F-H1)
+### Account-risk state (Phase 2B + PATCH 1 F-H1 + F-H2)
 
 Bot membaca saldo Spot base/quote secara read-only dan menilai equity dengan
 harga ticker terbaru. Referensi equity (peak / high-water mark) sekarang
@@ -80,8 +80,52 @@ Perilaku fail-closed:
 - Drawdown >= `max_equity_drawdown_pct` (default 2%) memblokir submission
   baru via `EQUITY_DRAWDOWN_KILL`.
 
-Open-order reconciliation belum diimplementasikan, sehingga status open order
-dianggap **UNKNOWN** dan risk gate memblokir order plan.
+#### Kill state & cancel-on-kill (F-H2)
+
+Ketika kill trigger menyala (drawdown kill / range-break kill):
+
+1. **Kill state di-latch** ke SQLite persisten (`kill_state`) **sebelum**
+   pembatalan, jadi crash di tengah path tetap menyisakan latch aktif.
+2. Semua open order **dicoba dibatalkan** oleh `CancelController`.
+   - Hasil `CONFIRMED` / `ALREADY_CANCELED` → order lokal jadi `CANCELED`,
+     reservasi sisa dilepas.
+   - Hasil `UNKNOWN` / `FAILED` → **tidak** dianggap sukses: order tetap
+     lokal, reservasi dipertahankan, dan kill state tetap aktif dengan
+     `cancel_status=PENDING_RECONCILIATION`.
+3. **Tidak ada order pengganti** yang ditempatkan, dan **tidak ada order baru**
+   selama kill state aktif (gate di `main()` re-membaca latch sebagai veto
+   mutlak).
+4. Latch **bertahan melewati restart**: proses baru masuk ulang ke cabang
+   kill, mencoba cancel/reconcile lagi, dan stop.
+5. Hanya operator yang bisa melepas latch, lewat perintah eksplisit di bawah.
+
+Open-order reconciliation exchange-side belum ada; `open_orders_available_gate`
+memblokir plan kalau state open order tidak VERIFIED.
+
+#### Perintah operator (paper/dry-run only)
+
+Keduanya menolak jalan kalau config bukan `dry_run=true` **dan**
+`allow_live_execution=false`, dan keduanya menulis audit log persisten.
+
+```bash
+# Reset referensi drawdown (eksplisit, tidak pernah otomatis).
+# --value <n> set referensi ke n; --clear lupakan (run berikutnya
+# re-bootstrap dari equity pertama yang valid).
+python scripts/reset_reference_equity.py --db <path> \
+    (--value 2000 | --clear) --reason "<kenapa>" [--actor <siapa>]
+
+# Lepaskan kill state. Release TOLAK kalau masih ada open order yang belum
+# direconcile; gunakan --reconcile <client_order_id> untuk menegaskan
+# tiap order sudah benar-benar batal di exchange.
+python scripts/release_kill_state.py --db <path> \
+    --reason "<kenapa>" [--actor <siapa>] \
+    [--reconcile AG-BNBUSDT-G00001-00000-B ...]
+```
+
+Audit: `reference_equity_audits` dan `kill_state_audits` menyimpan timestamp,
+nilai sebelum/sesudah, alasan, dan actor. Perintah tidak melemahkan kill
+switch 2% — setelah release, run berikutnya tetap harus PASS gate risk penuh
+sebelum order baru boleh ditempatkan.
 
 Bahkan kalau lu merasa:
 

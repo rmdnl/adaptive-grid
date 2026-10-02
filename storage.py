@@ -166,6 +166,43 @@ def init_db(path):
           id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, allowed INTEGER NOT NULL,
           reason TEXT NOT NULL, context_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS reference_equity_audits (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          previous_value TEXT,
+          new_value TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          actor TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS kill_state (
+          key TEXT PRIMARY KEY CHECK (key = 'kill_state'),
+          active INTEGER NOT NULL DEFAULT 0,
+          trigger_reason TEXT NOT NULL,
+          activated_at TEXT,
+          open_order_count INTEGER,
+          cancel_status TEXT,
+          note TEXT
+        );
+        CREATE TABLE IF NOT EXISTS kill_state_audits (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          action TEXT NOT NULL,
+          previous_active INTEGER NOT NULL,
+          new_active INTEGER NOT NULL,
+          trigger_reason TEXT,
+          reason TEXT NOT NULL,
+          actor TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cancel_records (
+          client_order_id TEXT PRIMARY KEY,
+          exchange_order_id TEXT,
+          last_outcome TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_attempt_ts TEXT NOT NULL,
+          reconciled INTEGER NOT NULL DEFAULT 0,
+          reconciled_ts TEXT,
+          note TEXT
+        );
         PRAGMA user_version = 321;
         """)
         # Phase 3A migration: older Phase 1/2 databases retain their existing
@@ -227,6 +264,20 @@ def get_state(path,key):
         return None if row is None else str(row["value"])
     finally: con.close()
 
+def clear_state(path,key):
+    """Delete one bot_state key so that subsequent reads see it as ABSENT.
+
+    Distinct from ``set_state`` (which stores a value): a cleared key returns
+    ``None`` from ``get_state``.  Used to intentionally forget a reference so
+    the next run re-bootstraps cleanly, rather than leaving an empty/corrupt
+    string that fail-closed gates would treat as invalid state.
+    """
+    con=connect(path)
+    try:
+        con.execute("DELETE FROM bot_state WHERE key=?",(key,))
+        con.commit()
+    finally: con.close()
+
 def record_risk_event(path,allowed,reason,context):
     con=connect(path)
     try:
@@ -235,6 +286,177 @@ def record_risk_event(path,allowed,reason,context):
             (utc_now(),int(allowed),reason,json.dumps(context,default=str))
         ); con.commit()
     finally: con.close()
+
+def record_reference_equity_audit(path, previous_value, new_value, reason, actor, ts=None):
+    """Append one explicit reference-equity reset to the durable audit log.
+
+    Every call is a deliberate operator action; the row is written in the same
+    transaction that performs the state change so a reset and its audit record
+    cannot diverge.  ``previous_value`` is ``None`` when the key was absent.
+    """
+    con=connect(path)
+    try:
+        con.execute(
+            "INSERT INTO reference_equity_audits("
+            "ts,previous_value,new_value,reason,actor) VALUES (?,?,?,?,?)",
+            (
+                ts or utc_now(),
+                None if previous_value is None else str(previous_value),
+                str(new_value),
+                reason,
+                actor,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def get_kill_state(path):
+    """Return the persisted kill-switch state dict, or ``None`` when absent.
+
+    The single source of truth that a restart must respect: when ``active``
+    is true the bot refuses to place new orders and, on each run, re-attempts
+    open-order cancellation and reconciliation.  A row is created lazily by
+    ``set_kill_state``; its absence means no kill has ever been latched.
+    """
+    con=connect(path)
+    try:
+        row=con.execute(
+            "SELECT active,trigger_reason,activated_at,open_order_count,cancel_status,note "
+            "FROM kill_state WHERE key='kill_state'"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "active": bool(row["active"]),
+            "trigger": row["trigger_reason"],
+            "activated_at": row["activated_at"],
+            "open_order_count": row["open_order_count"],
+            "cancel_status": row["cancel_status"],
+            "note": row["note"],
+        }
+    finally:
+        con.close()
+
+def set_kill_state(path, active, trigger=None, open_order_count=None,
+                   cancel_status=None, note=None, ts=None):
+    """Upsert the persisted kill-switch latch.
+
+    ``active=True`` (latch) requires a non-empty ``trigger`` so the audit row
+    always records WHY the bot stopped.  ``active=False`` (release) preserves
+    the latched trigger/activated_at so the history stays readable, and the
+    release itself is only ever issued by the explicit operator command.
+    """
+    con=connect(path)
+    try:
+        if active and not trigger:
+            raise ValueError("latching the kill state requires a non-empty trigger")
+        # Preserve latch metadata on release so the audit trail is complete.
+        row = con.execute(
+            "SELECT trigger_reason, activated_at FROM kill_state WHERE key='kill_state'"
+        ).fetchone()
+        preserve_trigger = row["trigger_reason"] if (row is not None and row["trigger_reason"]) else (trigger or "")
+        preserve_activated = row["activated_at"] if (row is not None) else None
+        keep_activated = preserve_activated if not active else (ts or preserve_activated)
+        keep_trigger = trigger if active else preserve_trigger
+        con.execute(
+            "INSERT INTO kill_state("
+            "key,active,trigger_reason,activated_at,open_order_count,cancel_status,note"
+            ") VALUES ('kill_state',?,?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "active=excluded.active,trigger_reason=excluded.trigger_reason,"
+            "activated_at=excluded.activated_at,"
+            "open_order_count=excluded.open_order_count,"
+            "cancel_status=excluded.cancel_status,note=excluded.note",
+            (
+                int(bool(active)),
+                keep_trigger,
+                keep_activated,
+                open_order_count,
+                cancel_status,
+                note,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def record_kill_state_audit(path, action, previous_active, new_active,
+                            trigger=None, reason="", actor="", ts=None):
+    """Append one kill-state transition to the durable audit log."""
+    con=connect(path)
+    try:
+        con.execute(
+            "INSERT INTO kill_state_audits("
+            "ts,action,previous_active,new_active,trigger_reason,reason,actor"
+            ") VALUES (?,?,?,?,?,?,?)",
+            (
+                ts or utc_now(),
+                action,
+                int(bool(previous_active)),
+                int(bool(new_active)),
+                trigger,
+                reason,
+                actor,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def get_cancel_record(path, client_order_id):
+    """Return one persisted cancel-record, or ``None`` when no attempt exists."""
+    con=connect(path)
+    try:
+        row=con.execute(
+            "SELECT client_order_id,exchange_order_id,last_outcome,attempts,"
+            "last_attempt_ts,reconciled,reconciled_ts,note "
+            "FROM cancel_records WHERE client_order_id=?",
+            (client_order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+    finally:
+        con.close()
+
+def upsert_cancel_record(path, client_order_id, last_outcome, attempts,
+                         reconciled=False, exchange_order_id=None, note=None, ts=None):
+    """Record one cancel attempt's outcome for an order.
+
+    Deterministic and retry-safe: the same (client_order_id, outcome) can be
+    recorded repeatedly; ``attempts`` is the authoritative cumulative counter
+    and the record is upserted, never appended, so idempotency is preserved.
+    """
+    con=connect(path)
+    try:
+        con.execute(
+            "INSERT INTO cancel_records("
+            "client_order_id,exchange_order_id,last_outcome,attempts,"
+            "last_attempt_ts,reconciled,note) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(client_order_id) DO UPDATE SET "
+            "exchange_order_id=COALESCE(excluded.exchange_order_id,"
+            "cancel_records.exchange_order_id),"
+            "last_outcome=excluded.last_outcome,"
+            "attempts=excluded.attempts,"
+            "last_attempt_ts=excluded.last_attempt_ts,"
+            "reconciled=excluded.reconciled,"
+            "reconciled_ts=CASE WHEN excluded.reconciled THEN excluded.last_attempt_ts "
+            "ELSE cancel_records.reconciled_ts END,"
+            "note=excluded.note",
+            (
+                client_order_id,
+                exchange_order_id,
+                str(last_outcome),
+                int(attempts),
+                ts or utc_now(),
+                int(bool(reconciled)),
+                note,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 class OrderPersistenceError(ValueError):
     """Raised when a persisted order's immutable identity would be changed."""
