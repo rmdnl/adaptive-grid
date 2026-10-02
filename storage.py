@@ -203,6 +203,22 @@ def init_db(path):
           reconciled_ts TEXT,
           note TEXT
         );
+        CREATE TABLE IF NOT EXISTS exchange_events (
+          event_id TEXT PRIMARY KEY,
+          event_type TEXT NOT NULL,
+          client_order_id TEXT NOT NULL,
+          exchange_order_id TEXT,
+          payload_json TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          applied INTEGER NOT NULL DEFAULT 1,
+          ignored_reason TEXT,
+          received_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS exchange_sequence (
+          scope TEXT PRIMARY KEY,
+          last_seq INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
         PRAGMA user_version = 321;
         """)
         # Phase 3A migration: older Phase 1/2 databases retain their existing
@@ -457,6 +473,133 @@ def upsert_cancel_record(path, client_order_id, last_outcome, attempts,
         con.commit()
     finally:
         con.close()
+
+def record_exchange_event(path, event_id, event_type, client_order_id,
+                          payload, seq, applied=True, ignored_reason=None,
+                          exchange_order_id=None, ts=None):
+    """Persist one exchange event exactly once (idempotent on event_id).
+
+    ``applied`` distinguishes an event that mutated local state from one that
+    was seen but skipped (duplicate, out-of-order gap, unknown order).
+    ``ignored_reason`` is recorded when ``applied`` is False so the operator
+    can see WHY an event was dropped, not just that it was.
+    """
+    con=connect(path)
+    try:
+        con.execute(
+            "INSERT INTO exchange_events("
+            "event_id,event_type,client_order_id,exchange_order_id,"
+            "payload_json,seq,applied,ignored_reason,received_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(event_id) DO UPDATE SET "
+            "applied=excluded.applied, ignored_reason=excluded.ignored_reason",
+            (
+                event_id, event_type, client_order_id, exchange_order_id,
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
+                int(seq), int(bool(applied)), ignored_reason,
+                ts or utc_now(),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def get_exchange_event(path, event_id):
+    """Return one persisted exchange event, or ``None`` when absent."""
+    con=connect(path)
+    try:
+        row=con.execute(
+            "SELECT event_id,event_type,client_order_id,exchange_order_id,"
+            "payload_json,seq,applied,ignored_reason,received_at "
+            "FROM exchange_events WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        out=dict(row)
+        out["payload"]=json.loads(row["payload_json"])
+        return out
+    finally:
+        con.close()
+
+def get_exchange_sequence(path, scope):
+    """Return the last applied sequence number for a stream scope, or 0."""
+    con=connect(path)
+    try:
+        row=con.execute(
+            "SELECT last_seq FROM exchange_sequence WHERE scope=?", (scope,)
+        ).fetchone()
+        return int(row["last_seq"]) if row is not None else 0
+    finally:
+        con.close()
+
+def has_exchange_sequence(path, scope):
+    """True when a sequence baseline row exists for a scope.
+
+    Distinguishes a stream that has been established (a baseline seq was
+    recorded) from a brand-new scope that has seen no events.  The applier
+    uses this to accept the *first* event as the stream baseline regardless of
+    its seq value; afterwards events must be contiguous.
+    """
+    con=connect(path)
+    try:
+        row=con.execute(
+            "SELECT 1 FROM exchange_sequence WHERE scope=?", (scope,)
+        ).fetchone()
+        return row is not None
+    finally:
+        con.close()
+
+def advance_exchange_sequence(path, scope, seq, ts=None):
+    """Record that all events up to ``seq`` have been applied for a scope.
+
+    ``seq`` is a monotonic high-water mark: it only ever moves forward.  A
+    lower ``seq`` is a no-op so an out-of-order or replayed event can never
+    move the mark backwards (which would let a gap be "closed").
+    """
+    seq=int(seq)
+    if seq < 0:
+        raise ValueError("exchange sequence must be non-negative")
+    con=connect(path)
+    try:
+        con.execute(
+            "INSERT INTO exchange_sequence(scope,last_seq,updated_at) "
+            "VALUES (?,?,?) "
+            "ON CONFLICT(scope) DO UPDATE SET "
+            "last_seq=MAX(exchange_sequence.last_seq, excluded.last_seq),"
+            "updated_at=excluded.updated_at",
+            (scope, seq, ts or utc_now()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def set_exchange_sequence(path, scope, seq, ts=None):
+    """Explicitly set a stream watermark (re-baseline after reconciliation).
+
+    This is the ONLY non-monotonic write to the watermark and is reserved
+    for an authoritative REST-snapshot reconciliation: after the local state
+    has been aligned to the exchange, the stream re-baselines so that
+    replayed events on a reconnect are not all flagged as gaps.  Event
+    application must NEVER call this — it uses ``advance_exchange_sequence``
+    so a single event can never move the mark backwards.
+    """
+    seq=int(seq)
+    if seq < 0:
+        raise ValueError("exchange sequence must be non-negative")
+    con=connect(path)
+    try:
+        con.execute(
+            "INSERT INTO exchange_sequence(scope,last_seq,updated_at) "
+            "VALUES (?,?,?) "
+            "ON CONFLICT(scope) DO UPDATE SET "
+            "last_seq=excluded.last_seq, updated_at=excluded.updated_at",
+            (scope, seq, ts or utc_now()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
 
 class OrderPersistenceError(ValueError):
     """Raised when a persisted order's immutable identity would be changed."""

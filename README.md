@@ -157,6 +157,42 @@ Lapisan observability read-only, tidak pernah menyentuh logic trading:
   decision, kill state, jumlah order/pending) supaya restart berikutnya
   bisa verifikasi hand-off yang bersih.
 
+#### Exchange events & reconciliation (Roadmap E)
+
+Lapisan exchange-side yang **read/outcome-only** dan deterministik
+(`exchange_events.ExchangeEventApplier`). Memetakan event fill / cancel /
+reject / expire ke `PaperOrderEngine` + `CancelController`. **Tidak ada**
+jalur placement order, **tidak ada** release kill latch, dan **tidak ada**
+implementasi live stream — reconciler-nya adalah abstraksi (seam) yang
+masih kosong, jadi tidak ada kode live yang bisa kehabili.
+
+Sifat deterministik yang dites:
+
+- **Event duplikat** — `event_id` yang sudah tercatat = no-op idempoten.
+- **Out-of-order / gap** — seq <= watermark = OUT_OF_ORDER; seq >
+  watermark+1 = SEQUENCE_GAP. Keduanya TIDAK di-apply dan menandai
+  reconciliation REST diperlukan. Watermark monotonic.
+- **Partial / full fill** — via `apply_fill`; fill melebihi qty tersisa
+  ditolak engine dan ditandai reconcile (tidak dipaksa).
+- **Cancel / already-canceled** — order terminal = no-op bersih.
+- **Unknown order / unknown state** — dicatat, TIDAK di-apply, ditandai
+  reconcile; tidak pernah inventing exposure lokal.
+- **Stale local state / network failure** — snapshot REST yang authoritative
+  lewat seam read-only; snapshot tidak dapat dicapai = fail-closed (state
+  lokal tidak disentuh, watermark tidak di-reset).
+- **Restart recovery** — watermark + log event persist di SQLite
+  (`exchange_sequence`, `exchange_events`); proses baru lanjut dari
+  watermark dan tidak apply ulang event yang sudah dilihat.
+- **Convergence** — apply ulang event set yang sama, dan reconcile ulang
+  dari snapshot yang sama, menghasilkan state lokal yang identik.
+- **Interaksi kill-state** — applier tidak pernah placement order dan
+  tidak release kill latch; saat kill aktif, applier hanya mencatat
+  cancel/fill agar jalur release operator melihat pending set yang akurat.
+
+Sebelum implementasi live user-data stream diizinkan: model deterministik +
+test adalah deliverable Roadmap E. Live feed = tugas terpisah,
+berizin eksplisit.
+
 Bahkan kalau lu merasa:
 
 > "Tenang bro, gue tau risikonya."

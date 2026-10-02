@@ -176,6 +176,50 @@ placement or risk decisions.
   result block a legitimate start, and never let a genuinely corrupt state
   pass silently.
 
+## Exchange events and reconciliation (Roadmap E)
+
+Exchange-side state is external.  The deterministic, paper-only layer
+(``exchange_events.ExchangeEventApplier``) maps exchange fill / cancel /
+reject / expire events onto the existing ``PaperOrderEngine`` and
+``CancelController``.  It is **read/outcome-only**: it has no order-placement
+path and never releases the kill latch.
+
+Treat the stream as untrusted and reconcile:
+
+- **Duplicate events** — an ``event_id`` already recorded is an idempotent
+  no-op; the same exchange fill may be replayed safely.
+- **Out-of-order / sequence gaps** — a sequence at or below the watermark is
+  OUT_OF_ORDER; beyond watermark+1 is a SEQUENCE_GAP.  Neither is applied;
+  both flag that REST reconciliation is required.  The watermark is a
+  monotonic high-water mark, advanced only on a successfully applied,
+  in-order event.
+- **Partial / full fills** — mapped to ``PaperOrderEngine.apply_fill``; a
+  fill that exceeds remaining quantity is rejected by the engine and flagged
+  for reconciliation (never forced).
+- **Cancel / already-canceled** — mapped to the cancel path; an already
+  terminal order is a clean no-op.
+- **Unknown order / state** — an event referencing an order we never had, or
+  a state we cannot classify, is recorded and NOT applied; it is flagged for
+  reconciliation, never invented into local exposure.
+- **Stale local state** — an authoritative REST snapshot is applied via the
+  read-only reconciler seam, aligning local order state; an order known only
+  to the exchange is flagged for operator review, never auto-created.
+- **Network failure** — reconciliation that cannot reach a snapshot is
+  fail-closed: local state is left untouched and the watermark is not
+  re-baselined.
+- **Restart recovery** — the watermark and the event log persist in SQLite;
+  a fresh process resumes from the persisted watermark and re-applies nothing
+  already seen.
+- **Convergence** — repeated application of the same events, and repeated
+  reconciliation from the same snapshot, produce identical local state.
+- **Kill-state interaction** — the applier never places orders and never
+  releases the kill latch; while the kill is active it only records
+  cancels/fills so the operator release path sees an accurate pending set.
+
+No live Binance user-data stream implementation is present; the reconciler is
+an abstract seam (a real implementation is a future, separately-authorized
+task).  The deterministic model and tests are the deliverable of Roadmap E.
+
 ## Configuration
 
 Fail closed. Validate:

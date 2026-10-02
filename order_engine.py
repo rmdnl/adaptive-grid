@@ -78,8 +78,10 @@ class OrderState(str, Enum):
 _ALLOWED_TRANSITIONS = {
     OrderState.PLANNED: frozenset({OrderState.SUBMITTED}),
     OrderState.SUBMITTED: frozenset({OrderState.OPEN, OrderState.REJECTED}),
-    OrderState.OPEN: frozenset({OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCELED}),
-    OrderState.PARTIALLY_FILLED: frozenset({OrderState.FILLED, OrderState.CANCELED}),
+    OrderState.OPEN: frozenset({OrderState.PARTIALLY_FILLED, OrderState.FILLED,
+                              OrderState.CANCELED, OrderState.REJECTED}),
+    OrderState.PARTIALLY_FILLED: frozenset({OrderState.FILLED, OrderState.CANCELED,
+                                             OrderState.REJECTED}),
     OrderState.FILLED: frozenset(),
     OrderState.CANCELED: frozenset(),
     OrderState.REJECTED: frozenset(),

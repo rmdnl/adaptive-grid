@@ -126,42 +126,132 @@ Commits: see "Commit hashes" below.
 - `1311b03` docs: add autonomous run report; correct README test-count target
 - (this milestone) `feat: F-H2 fail-closed cancel-on-kill + explicit reference reset`
 
+## Milestone 3 — Roadmap G operational resilience + Roadmap E exchange events
+
+Test result: **1093 passed, 0 failed** (full `pytest -q`). Targeted:
+`tests/test_roadmap_g.py` (17) and `tests/test_roadmap_e.py` (21) pass.
+
+### Roadmap G — operational resilience (read-only observability + safe
+boundaries; no trading-logic changes)
+
+- `health.py` — `HealthStatus` / `HealthReport` / `collect_health_report` /
+  `write_health_jsonl`. Deterministic, machine-parseable snapshot of the
+  persisted state (kill latch, reconciliation health, reference equity, local
+  order counts, pending cancels, last risk/plan/cycle decisions, last run
+  marker). A fresh DB with no paper activity is healthy-by-construction; a
+  corrupt DB with activity is UNHEALTHY. The JSON payload is `sort_keys`
+  with no wall-clock fields, so two identical states are byte-identical.
+- `shutdown.py` — `ShutdownCoordinator`: a shutdown request only flips a
+  flag; the run loop consults it at safe boundaries. Idempotent; the 2nd
+  request sets `forced`; `complete()` is terminal. Signal handlers are opt-in
+  and never used by the paper path or tests.
+- `runstate.py` — `persist_run_state` / `read_run_state` /
+  `verify_restart_safety` / `mark_run_interrupted` / `has_paper_activity`.
+  The restart gate reads kill latch + prior run marker + reconciliation and
+  decides RESUME / KILL_BRANCH / RECONCILE_THEN_RESUME / REFUSE. A fresh DB
+  is safe to resume; corruption with activity is refused fail-closed.
+- `main()` wiring: a `verify_restart_safety` REFUSE at the top of the run
+  stops the process before any market data is fetched; a
+  `shutdown.is_requested` check at the paper-cycle boundary skips the cycle;
+  and a run-state marker + health JSONL line are persisted on completion
+  (a health-report write failure is logged, not fatal — observability is
+  never a trading gate).
+- `scripts/status_report.py` — read-only operator status report; exit 0/1/2
+  by status; `--json` / `--log`; refuses unless the config is explicitly
+  dry-run with live execution disabled.
+- Tests: `tests/test_roadmap_g.py` (17) — status precedence + exit codes,
+  deterministic JSON, restart verdicts (fresh / completed / interrupted-with
+  activity / kill / corrupt-with-activity), coordinator idempotency / forced /
+  terminal-complete / boundary check, main() COMPLETED marker + JSONL, main()
+  cycle-skip on shutdown request, main() REFUSE on corrupt-with-activity, kill
+  veto, and collect_health_report reflecting kill/reference/unsafe-config.
+
+### Roadmap E — deterministic, paper-only exchange events
+
+- `exchange_events.py` — `ExchangeEventApplier` + typed `ExchangeEvent` /
+  `ExchangeEventType` / `ApplyResult`. Maps exchange fill / cancel / reject /
+  expire events onto the existing `PaperOrderEngine` + `CancelController`.
+  **Read/outcome-only**: no order-placement path, no kill-latch release, no
+  live stream (the `RestReconciler` is an abstract seam). A per-scope
+  sequence watermark (monotonic high-water mark, advanced only on a
+  successfully applied in-order event) plus a persisted event log
+  (`exchange_events` / `exchange_sequence`) deliver:
+  * duplicate events → idempotent no-op;
+  * out-of-order / sequence gap → recorded, NOT applied, reconciliation
+    required;
+  * partial / full fills → `apply_fill` (excess qty rejected by the engine,
+    flagged, never forced);
+  * cancel / already-canceled → cancel path; terminal orders are clean no-ops;
+  * unknown order / unknown state → recorded, NOT applied, flagged;
+  * stale local state / network failure → fail-closed REST reconciliation via
+    the read-only seam (local state untouched on failure, watermark not
+    re-baselined);
+  * restart recovery → resume from the persisted watermark, re-apply nothing
+    already seen;
+  * convergence → repeated apply / reconcile from the same inputs yields
+    identical local state;
+  * kill-state interaction → the applier never places orders and never
+    releases the latch; while killed it only records cancels/fills.
+- `order_engine.py` — extended the state machine so `OPEN` and
+  `PARTIALLY_FILLED` may also transition to `REJECTED` (an exchange rejection
+  that arrives after local submission). Pure extension; no transitions
+  removed.
+- `storage.py` — new `exchange_events` / `exchange_sequence` tables +
+  `record_exchange_event` / `get_exchange_event` / `get_exchange_sequence` /
+  `has_exchange_sequence` / `advance_exchange_sequence` /
+  `set_exchange_sequence` (monotonic advance, plus an explicit re-baseline
+  reserved for authoritative reconciliation).
+- Tests: `tests/test_roadmap_e.py` (21) — partial/full fill, fill exceeding
+  remaining qty rejected, fill-on-FILLED idempotent, duplicate no-op,
+  out-of-order + sequence gap not applied, cancel confirmation,
+  already-canceled no-op, reject transition, unknown local order, unknown
+  event kind, cancel-on-filled stale-state flag, network-failure fail-closed
+  (no reconciler / connection error), restart recovery, reconciliation
+  convergence, exchange-only orders flagged for review, no order placement,
+  and kill-latch interaction.
+
+Commits: see "Commit hashes" below.
+
+## Commit hashes
+
+- `288349d` feat: persist equity-drawdown kill-switch reference across restarts (PATCH 1 / F-H1)
+- `1311b03` docs: add autonomous run report; correct README test-count target
+- `72bb9a4` feat: F-H2 fail-closed cancel-on-kill + explicit reference reset
+- `ef2d3a9` feat: Roadmap G operational resilience (health/shutdown/restart-recovery)
+- (this milestone) `feat: Roadmap E deterministic exchange-event applier + REST reconciliation seam`
+
 ## Remaining tasks (next safe milestones, not yet started)
 
-DONE in this run: F-H2 cancel-on-kill (incl. persistence/restart + no-new-orders
-veto + crash-safe pre-latch) and the explicit operator reference-reset command.
+DONE in this run: F-H2 cancel-on-kill + explicit reference reset; Roadmap G
+(health / status / graceful shutdown / restart-recovery hardening); Roadmap E
+(deterministic exchange-event applier + REST reconciliation seam + tests).
 
-1. **Roadmap G: operational resilience** — structured logging, health/status
-   reporting, graceful shutdown, restart recovery beyond what `recovery.py`
-   already provides.
-2. **Roadmap E: exchange event handling** (user-data stream) with
-   deterministic reconnect/retry; reconcile local vs exchange state.  The
-   cancel-on-kill path currently reconciles against LOCAL paper state; a real
-   exchange-side cancel outcome (user-data stream / REST cancel) would plug
-   into `CancelController._run_canceler` via the injected `canceler`.
-3. **Operator kill-state release UX** — the release command is tested and
-   documented; a dashboard/observability surface (roadmap, explicitly not a
-   trading-control layer) is a future, non-safety-critical task.
-4. **Roadmap H final audit** — secret scan, default review, changelog.
+1. **Roadmap H final audit** — secret scan, configuration/default audit,
+   risk-invariant audit, test audit, changelog / documentation, final
+   repository audit.  (The remaining safe roadmap item.)
 
 ## Known limitations
 
-- Live trading remains disabled (`dry_run: true`, `allow_live_execution: false`,
-  `main()` raises if dry_run is false). No withdrawal permission anywhere.
-- `open_orders` reconciliation is still advisory: `open_orders_available_gate`
-  blocks the plan whenever open-order state cannot be VERIFIED (UNKNOWN status).
-  The F-H2 cancel path reconciles LOCAL paper-order + reservation state; a real
-  exchange-side cancel/outcome feed is a follow-up (Roadmap E) and would plug
-  into `CancelController` via the injected `canceler` seam.
+- Live trading remains disabled (`dry_run: true`,
+  `allow_live_execution: false`, `main()` raises if dry_run is false). No
+  withdrawal permission anywhere.
+- The Roadmap E `RestReconciler` is an abstract seam: there is no live
+  Binance user-data stream or REST cancel/fetch implementation in this
+  repository.  The deterministic model, state machine, and tests are the
+  deliverable; a live feed is a future, separately-authorized task.  Until
+  then, reconciliation reconciles against LOCAL paper state.
+- `open_orders` reconciliation is still advisory:
+  `open_orders_available_gate` blocks the plan whenever open-order state
+  cannot be VERIFIED.
 - The kill-state release command is paper-only and refuses to run when the
   config is not explicitly dry-run with live execution disabled.
 - The 15m lower-boundary stop and range-break kill remain fail-closed; the
   persisted peak is used only for the 2% equity drawdown gate.
-- Grid invariants unchanged: 0.30% hard min net, 0.60% gross step, 2% drawdown
-  kill, strict range protection, risk-engine veto over every order.
+- Grid invariants unchanged: 0.30% hard min net, 0.60% gross step, 2%
+  drawdown kill, strict range protection, risk-engine veto over every order.
 
 ## Blocked decisions (require human authorization)
 
-- None in this run. (Items above are follow-ups, not blockers.) Enabling live
-  trading, loosening any risk parameter, or adding withdrawal permission
-  would each require explicit human sign-off per AGENTS.md and were NOT done.
+- None in this run. Enabling live trading, a real exchange event stream,
+  loosening any risk parameter, or adding withdrawal permission would each
+  require explicit human sign-off per AGENTS.md and were NOT done.
