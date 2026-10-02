@@ -297,6 +297,65 @@ across Milestones 5 and Round 3 audit hardening).
 Targeted: `tests/test_15m_lower_boundary_kill.py` 22/22 pass; related
 risk/cancel/recovery/config suites (169) pass.
 
+## Round 4 — Paper Soak Test (commits `d687eb1`, `33d4422`)
+
+Long-running deterministic PAPER-ONLY soak test proving the paper engine
+remains deterministic, state-consistent, restart-safe,
+reconciliation-safe, kill-switch-safe, duplicate-order-safe, and fail-closed.
+
+Harness: `tests/test_paper_soak.py` (11 tests, no network, no live Binance).
+
+### Objectives covered
+
+- **A+K. Long deterministic run + replay**: 2 x 10,000 cycles (seed=42,
+  default `MAIN_SOAK_CYCLES`; override via `PAPER_SOAK_CYCLES` env var).
+  8-segment regime sequence cycled deterministically to reach target.
+  Two identical runs → byte-equal order IDs, statuses, fills, account
+  state, and kill state.
+- **B. Market regimes**: ranging / trend-up / trend-down / sharp-move /
+  boundary-approach / range-break / recovery / 15m lower-boundary kill.
+  Accounting invariants verified every cycle (first 500 cycles) and every
+  100 cycles thereafter.
+- **C. Order lifecycle**: fill / partial-fill / cancel / duplicate-event /
+  rejected / rejected-partial-fill, exercised via PaperSession and
+  PaperOrderEngine; invariants checked after every event.
+- **D. Network failure simulation**: UNKNOWN cancel keeps kill active;
+  FAILED cancel keeps kill active; CONFIRMED cancel releases reservation;
+  duplicate fill event returns `idempotent=True`.
+- **E. Restart chaos**: restart before-submit, after-kill-activation,
+  after-partial-fill; no duplicate orders; kill persists; invariants hold.
+- **F. Kill-switch**: equity drawdown exact/above/below 2%; range-break
+  ±1% buffer; 15m candle close <= LOWER x 0.98; kill persists across
+  restart; unknown/failed cancel keeps kill active; subsequent cycles
+  blocked.
+- **G. Inventory/accounting conservation**: all balances >= 0, reservation
+  sums match account state, after every cycle across 50-cycle stress test.
+- **H. Order identity**: same `cycle_id` → same `client_order_id`;
+  idempotent replay adds no new orders; restart replay is idempotent.
+- **I. Persistence corruption fail-closed**: malformed reference equity
+  (returns None), corrupt order status (unhealthy), corrupt Decimal
+  (unhealthy), missing account state row (unhealthy), non-zero reservation
+  on CANCELED order (unhealthy).
+- **J. Reconciliation**: healthy local state passes recovery; exchange FILL /
+  CANCEL events applied via `ExchangeEventApplier`; unknown remote order not
+  applied; no-reconciler case raises (fail closed); duplicate event idempotent.
+- **M. State growth**: after 150 cycles — single `kill_state` row (PK),
+  single `paper_account_state` row (PK), final recovery healthy.
+
+### Result
+
+- Concrete safety findings: **NONE**
+- Soak suite: **11/11 passed** (674s, default 10,000-cycle config)
+- Full pytest: **1147 passed, 0 failed**
+
+### Remaining known limitations
+
+- OS-level SQLite write-failure (interrupted commit, disk error) is not
+  injected in this harness; `cycle_transaction` atomicity and
+  `PaperStateUnhealthyError` behavior are covered by existing
+  `tests/test_paper_orchestrator.py` and `tests/test_recovery.py`.
+- A live `RestReconciler` implementation is a future authorized task.
+
 ## Round 3 — Adversarial Safety Audit (commits `8bed7b5`, `71eb41a`, `57dfcbd`)
 
 Comprehensive adversarial audit attempting to break safety invariants
