@@ -292,22 +292,60 @@ Risk Engine gate wired into the production `main()` risk decision.
   invariant corrected (no longer claims the stop was already sufficient);
   `FINAL_INTEGRATION_AUDIT.md` marked HISTORICAL; this report updated.
 
-Test result: full `pytest -q` -> **1115 passed, 0 failed** (was 1093).
+Test result: full `pytest -q` -> **1136 passed, 0 failed** (was 1093; +43 total
+across Milestones 5 and Round 3 audit hardening).
 Targeted: `tests/test_15m_lower_boundary_kill.py` 22/22 pass; related
 risk/cancel/recovery/config suites (169) pass.
 
-## Remaining tasks (next safe milestones, not yet started)
+## Round 3 — Adversarial Safety Audit (commits `8bed7b5`, `71eb41a`, `57dfcbd`)
+
+Comprehensive adversarial audit attempting to break safety invariants
+through real exchange/API failure modes.
+
+### Concrete findings fixed
+
+**Finding 1: Silent latest CLOSED candle drop in fetch_klines (commit `8bed7b5`)**
+- Root cause: `pd.to_numeric(errors="coerce")` + `dropna()` silently removed
+  the latest CLOSED candle when it had malformed OHLCV. The 15m kill gate
+  would then evaluate a *previous* candle's close, violating fail-closed.
+- Fix: latest CLOSED candle OHLCV validated BEFORE dropna; raises
+  `MarketDataError`. Only older/middle candles are dropped.
+- Tests: `tests/test_fetch_klines_safety.py` (19 tests, spec A–I).
+
+**Finding 2: NaN/Infinity equity bypass (commit `57dfcbd`)**
+- Root cause: `build_account_risk_state` checked `current_equity < 0` but
+  NaN passes `NaN < 0` as False in Decimal arithmetic. A non-finite equity
+  would produce NaN drawdown/inventory that could bypass kill gates.
+- Fix: explicit `current_equity.is_finite()` check →
+  `AccountValidationError("Current equity is not finite")`.
+- Tests: `test_account_risk_rejects_nan_equity`,
+  `test_account_risk_rejects_infinite_equity`, expanded
+  `test_dd_kill_exact_threshold_blocks` (added above-threshold boundary).
+
+### Non-findings (analyzed, no change needed)
+
+- **Indicator-layer dropna in latest_valid_row**: safe — fetch_klines now
+  validates OHLCV before `enrich()`; derived indicator NaN (rolling warm-up)
+  correctly falls back to previous valid observation; the kill gate uses
+  raw close from validated DataFrame, not `latest_valid_row`.
+- **Kill-switch concurrent activation**: kill-trigger reasons make
+  `combined.allowed=False`; the cycle gate at `main.py:960` requires
+  `combined.allowed`, preventing orders in a kill-triggering run. The
+  `kill_now_active` re-read is defense-in-depth for restart recovery.
+- **Timeout-after-submit duplicate order**: paper path has no network gap
+  between submit and persist — SQLite `BEGIN IMMEDIATE`/commit provides
+  atomicity. Restart reuses same `cycle_id` → same `fill_id` → idempotent.
+- **NaN in snapshot balances**: already rejected by `_account_decimal()`
+  in `fetch_account_snapshot`.
+- **Malformed/missing latest closed candle**: now raises `MarketDataError`
+  before `main()` reaches indicator computation or order placement (verified
+  by `test_main_aborts_on_malformed_latest_closed_candle`).
+
+### Remaining tasks (next safe milestones)
 
 NONE remaining on the safe roadmap. Roadmap H (final audit) is complete this
 run; every safe milestone (F-H1, F-H2, Roadmap G, Roadmap E, Roadmap H) is
-done. The only remaining work — enabling live trading or a live exchange
-event stream — requires explicit human authorization and is therefore out of
-scope for autonomous work.
-
-1. **(Blocked on human authorization)** A live Binance user-data stream /
-   REST cancel-fetach implementation to populate the Roadmap E
-   `RestReconciler` seam.  Not built: enabling live trading is a safety
-   invariant, not a coding task, and must be explicitly authorized.
+done.
 
 ## Known limitations
 

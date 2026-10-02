@@ -7,27 +7,47 @@ invariant.
 
 ## Release line: v3.2.2 (dedicated 15m candle-close lower-boundary kill)
 
-### Milestone: 15m lower-boundary candle-close kill (this commit)
+### Milestone: 15m lower-boundary candle-close kill (commit `20b13f7`)
 - `risk_engine.lower_boundary_15m_kill` — dedicated fail-closed Decimal
   gate: kill when the latest CLOSED 15m candle close is
   `<= LOWER_PRICE * (1 - stop_if_below_lower_pct)`.  Distinct outcomes:
   `LOWER_BOUNDARY_STOP_CONFIG_INVALID`,
   `LOWER_BOUNDARY_STOP_DATA_UNAVAILABLE`, `LOWER_BOUNDARY_STOP_15M`.
   Independent of the unchanged current-price `range_break_kill`.
-- `main.py` — reads the close from the fetched closed-kline DataFrame
-  (`df["close"].iloc[-1]`; ticker is never a substitute), evaluates the
-  gate inside the combined risk decision, and adds
-  `LOWER_BOUNDARY_STOP_15M` to the kill-trigger set (latch + cancel-on-
-  kill + restart survival).  Invalid config/data vetoes the run without
-  latching the kill state.
-- `config.yaml` / `config_loader.py` — `risk.stop_if_below_lower_pct` is
-  now required (default `0.02` in the shipped config) and validated as a
-  finite Decimal strictly in (0,1); no hidden fallback.  All test-fixture
-  configs updated explicitly.
+- `main.py` — `_latest_closed_candle_close(df)` reads the close from the
+  fetched closed-kline DataFrame (`df["close"].iloc[-1]`; ticker never a
+  substitute; None on missing/NaN/Inf/non-positive → fail-closed veto).
+  Gate wired into the combined risk decision; `LOWER_BOUNDARY_STOP_15M`
+  added to the kill-trigger set (latch + cancel-on-kill + restart survival).
+  `CONFIG_INVALID` / `DATA_UNAVAILABLE` veto the run without latching kill.
+- `config.yaml` / `config_loader.py` — `risk.stop_if_below_lower_pct`
+  required & validated (finite Decimal strictly in (0,1)); no hidden fallback.
+  All test-fixture configs updated explicitly.
 - Tests: `tests/test_15m_lower_boundary_kill.py` (22) — spec A–L plus
   config-validation and production-wiring guard tests.
 - Docs: AGENTS.md invariant, LIMITATIONS.md audit rows, README safeguard
   section, FINAL_INTEGRATION_AUDIT.md marked historical.
+
+### Hardening: fetch_klines latest CLOSED candle validation (commit `8bed7b5`)
+- **Root cause:** `fetch_klines()` used `pd.to_numeric(errors="coerce")` +
+  `dropna()`, silently removing malformed latest CLOSED candle rows.
+  The 15m lower-boundary kill could not evaluate safely on a substituted
+  previous candle.
+- **Fix:** latest CLOSED candle OHLCV validated BEFORE `dropna()`.
+  Missing/NaN/Inf/non-positive/zero/negative → `MarketDataError` (fail
+  closed). Only older/middle candles are dropped by `dropna`.
+- Tests: `tests/test_fetch_klines_safety.py` (19) — spec A–I plus
+  production-wiring and indicator non-finding tests.
+
+### Hardening: account equity finiteness + boundary tests (commit `57dfcbd`)
+- **Root cause:** `build_account_risk_state` checked `current_equity < 0`
+  but NaN passes `NaN < 0` as False in Decimal arithmetic, potentially
+  producing NaN drawdown/inventory that silently bypasses kill gates.
+- **Fix:** explicit `current_equity.is_finite()` check →
+  `AccountValidationError("Current equity is not finite")`.
+- Tests: expanded `test_dd_kill_exact_threshold_blocks` with
+  "just above 2%" + Decimal boundary; added
+  `test_account_risk_rejects_nan_equity` / `test_account_risk_rejects_infinite_equity`.
 
 ## Release line: v3.2.1 (safety foundation + deterministic paper core)
 

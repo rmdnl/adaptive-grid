@@ -4,7 +4,7 @@
 
 | Check | Result |
 |-------|--------|
-| Full test suite (`pytest -q`) | **1115 passed, 0 failed** (incl. 22 dedicated 15m lower-boundary-kill tests) |
+|| Full test suite (`pytest -q`) | **1136 passed, 0 failed** (incl. 22 dedicated 15m lower-boundary-kill tests + 19 fetch_klines safety tests + 2 equity finiteness tests) |
 | Hardcoded secrets in tracked files | none |
 | `.env` tracked | no |
 | `.venv` / DB / logs / caches tracked | no |
@@ -46,6 +46,14 @@
   unchanged).  The config field `risk.stop_if_below_lower_pct` is required by
   `config_loader.validate_config` (finite Decimal strictly in (0,1)); there
   is no hidden fallback default.  See `tests/test_15m_lower_boundary_kill.py`.
+- `fetch_klines` validates the latest CLOSED candle OHLCV BEFORE the
+  `dropna()` pass (fail-closed `MarketDataError` for NaN/Inf/non-positive/
+  non-numeric on the critical closed row; older/middle rows may still be
+  dropped).  See `tests/test_fetch_klines_safety.py`.
+- `build_account_risk_state` validates `current_equity.is_finite()`
+  (NaN/Infinity equity fails closed with `AccountValidationError`) before
+  computing drawdown/inventory percentages.  See
+  `tests/test_market_data.py::test_account_risk_rejects_nan_equity`.
 - Risk Engine has veto authority over every order.
 - Kill state prevents new orders and survives restart.
 - No secrets committed, printed, or hardcoded; no withdrawal permission.
