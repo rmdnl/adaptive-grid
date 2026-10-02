@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -671,11 +672,41 @@ def fetch_klines(client, symbol, interval="15m", limit=200, drop_incomplete=True
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    df = df.dropna(subset=["open","high","low","close","volume"]).reset_index(drop=True)
 
     if drop_incomplete:
         now = datetime.now(timezone.utc)
         df = df[df["close_time"] <= pd.Timestamp(now)].reset_index(drop=True)
+    
+    # SAFETY: validate the latest CLOSED candle BEFORE dropna. If the most
+    # recent closed candle has malformed/NaN/Inf/non-positive close, the
+    # 15m lower-boundary kill cannot evaluate safely. Fail closed; never
+    # silently substitute the previous valid candle.
+    if df.empty:
+        raise MarketDataError("No klines returned after time filtering")
+    latest_row = df.iloc[-1]
+    if latest_row["close"] is None or pd.isna(latest_row["close"]):
+        raise MarketDataError("Latest CLOSED candle has NaN close; fail closed")
+    try:
+        close_val = float(latest_row["close"])
+        if not np.isfinite(close_val) or close_val <= 0:
+            raise MarketDataError("Latest CLOSED candle close is non-finite or non-positive; fail closed")
+    except (TypeError, ValueError):
+        raise MarketDataError("Latest CLOSED candle close is non-numeric; fail closed")
+    
+    # Also validate other OHLCV fields on the latest row (required for indicators)
+    for field in ["open", "high", "low", "volume"]:
+        if latest_row[field] is None or pd.isna(latest_row[field]):
+            raise MarketDataError(f"Latest CLOSED candle has NaN {field}; fail closed")
+        try:
+            val = float(latest_row[field])
+            if not np.isfinite(val) or val <= 0:
+                raise MarketDataError(f"Latest CLOSED candle {field} is non-finite or non-positive; fail closed")
+        except (TypeError, ValueError):
+            raise MarketDataError(f"Latest CLOSED candle {field} is non-numeric; fail closed")
+    
+    # Now safe to drop older/middle malformed candles (does not affect the
+    # validated latest CLOSED candle).
+    df = df.dropna(subset=["open","high","low","close","volume"]).reset_index(drop=True)
     if len(df) < 50:
         raise RuntimeError("Not enough closed klines after removing incomplete candle")
     return df
