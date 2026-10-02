@@ -506,7 +506,7 @@ def test_H_transaction_rollback_on_failure(tmp_path):
     import grid_lifecycle as gl
     original_record = gl.LifecycleManager._record_transition
 
-    def _boom(self, con, transition):
+    def _boom(self, con, transition, prefix=""):
         raise RuntimeError("injected failure")
 
     mgr = _new_manager(tmp_path)

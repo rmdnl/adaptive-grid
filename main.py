@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -50,8 +49,9 @@ from market_features import (
 )
 from market_regime import MarketRegime, classify_market_regime
 from paper_accounting import PaperAccountingEngine
+from paper_orchestrator import PaperSession, PaperCycleInput
+from grid_lifecycle import LifecycleManager
 from range_quality import calculate_range_quality
-from order_engine import OrderIntent, PaperOrderEngine, make_client_order_id
 from profit_model import profit_class
 from range_engine import auto_range
 from risk_engine import (
@@ -65,6 +65,11 @@ from symbol_rules import parse_symbol_info, validate_quantized_order_plan
 # Intentionally process-local: no historical equity is inferred or persisted.
 _SESSION_REFERENCE_EQUITY: Decimal | None = None
 
+# FIX 4B: clock seam for the deterministic paper cycle.  Production uses the
+# wall clock; tests may inject a clock aligned to their fixture candle data so
+# the orchestrator's market-freshness gate passes deterministically.
+_PAPER_CYCLE_CLOCK = None
+
 def _logger(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     logger=logging.getLogger("adaptive_grid"); logger.setLevel(logging.INFO)
@@ -74,44 +79,118 @@ def _logger(path):
     fh=logging.FileHandler(path, encoding="utf-8"); fh.setFormatter(formatter); logger.addHandler(fh)
     return logger
 
-def _paper_order_intents(plan, symbol, order_type, prefix):
-    created_at = datetime.now(timezone.utc)
-    intents = []
-    for cell in plan.cells:
-        if not cell.allowed:
-            continue
-        for side, price in (("BUY", cell.buy_price), ("SELL", cell.sell_price)):
-            intents.append(OrderIntent(
-                client_order_id=make_client_order_id(prefix, symbol, cell.index, side),
-                symbol=symbol,
-                side=side,
-                order_type=order_type,
-                price=price,
-                quantity=cell.quantity,
-                time_in_force="GTC",
-                grid_index=cell.index,
-                created_at=created_at,
-            ))
-    return intents
+def _run_paper_cycle(db_path, cfg, symbol, rules, current_price, kline_df,
+                     lower, upper, risk_decision, regime, range_quality_score,
+                     candle_index, active_plan=None):
+    """Run one deterministic paper cycle through the authoritative orchestrator.
 
-def _submit_paper_orders(engine, plan, symbol, risk_decision, lower_price,
-                          order_type, prefix, dry_run, submit_new=True):
-    if not dry_run or not risk_decision.allowed or not plan.allowed:
-        return []
+    FIX 4B: this replaces the old non-transactional, per-order
+    ``_submit_paper_orders`` loop (F-1: no lifecycle-inventory gate; F-2: no
+    atomic cycle transaction).  ``PaperSession.run_cycle`` owns a single cycle
+    transaction that atomically applies the lifecycle-integrity gate, the
+    inventory-allocation gate, the post-quantization profit gate, order
+    submission, deterministic fills and recovery — all-or-nothing.
 
-    orders = []
-    for intent in _paper_order_intents(plan, symbol, order_type, prefix):
-        existing = engine.get(intent.client_order_id)
-        if existing is not None:
-            orders.append(existing)
-            continue
-        if not submit_new:
-            # Phase 5A: current plan stays untouched — no new orders, no cancellation.
-            continue
-        orders.append(
-            engine.submit(intent, risk_decision, lower_price, plan.effective_upper)
-        )
-    return orders
+    FIX 4C (F-4): ``active_plan`` is the main-side active plan read from the
+    authoritative lifecycle DB (see ``_lifecycle_active_plan``).  Forwarding it
+    to the cycle makes main.py and PaperSession/PaperOrchestrator run the
+    planner with identical active-plan inputs, so both paths derive the SAME
+    plan decision and the SAME lifecycle generation — no main-invented
+    generation counter.
+
+    The clock resolves to ``_PAPER_CYCLE_CLOCK`` (test seam) or, in
+    production, a wall clock anchored to the last closed candle so the
+    orchestrator's market-freshness gate compares against candle data, not
+    the run-time instant.
+    """
+    global _PAPER_CYCLE_CLOCK
+    clock = _PAPER_CYCLE_CLOCK
+    if clock is None:
+        # Anchor to the last closed candle (plus one candle) so the
+        # orchestrator's market-freshness gate compares against the candle
+        # data rather than the run-time instant.  When no candle DataFrame is
+        # available, fall back to the wall clock.
+        if hasattr(kline_df, "iloc") and len(kline_df):
+            last_close = kline_df["close_time"].iloc[-1]
+            anchor = last_close.to_pydatetime()
+            clock = lambda: anchor + timedelta(minutes=15)
+        else:
+            clock = lambda: datetime.now(timezone.utc)
+    accounting = PaperAccountingEngine(
+        rules.base_asset,
+        rules.quote_asset,
+        Decimal(str(cfg["paper"]["initial_base_balance"])),
+        Decimal(str(cfg["paper"]["initial_quote_balance"])),
+        Decimal(str(cfg["paper"]["maker_fee"])),
+        Decimal(str(cfg["paper"]["taker_fee"])),
+        str(cfg["paper"]["fee_asset"]),
+    )
+    # Reuse the single authoritative SQLite file for both the order engine and
+    # the lifecycle manager (same-file cycle transaction, no ATTACH needed).
+    session = PaperSession(db_path, db_path, accounting, client_order_prefix="AG")
+    cycle_input = PaperCycleInput(
+        candle_index=candle_index,
+        symbol=symbol,
+        current_price=current_price,
+        kline_df=kline_df,
+        # Quote is intentionally not passed: the orchestrator only consumes
+        # it for the quote-freshness check, and the regime is supplied
+        # pre-computed by main.py's market-intelligence layer.
+        quote=None,
+        lower_price=lower,
+        upper_price=upper,
+        # FIX 4C (F-4): forward the lifecycle-derived active plan so the
+        # orchestrator's planner runs with the same active-plan inputs main
+        # used — both paths share the identical plan decision and lifecycle
+        # generation.  main only runs this cycle on a fresh GRID_ALLOWED, at
+        # which point active_plan is None; when a plan is active it is the
+        # authoritative lifecycle value, never a main-invented counter.
+        active_plan=active_plan,
+        regime=regime,
+        range_quality_score=range_quality_score,
+        cfg=cfg,
+        maker_fee=Decimal(str(cfg["paper"]["maker_fee"])),
+        taker_fee=Decimal(str(cfg["paper"]["taker_fee"])),
+        fee_asset=str(cfg["paper"]["fee_asset"]),
+        risk_decision=risk_decision,
+        clock=clock,
+        dry_run=True,
+        rules=rules,
+    )
+    return session.run_cycle(cycle_input)
+
+def _lifecycle_active_plan(db_path):
+    """Read the authoritative active plan from the lifecycle manager DB.
+
+    FIX 4C (F-4): the lifecycle database is the SINGLE source of truth for the
+    active plan and its generation namespace.  ``main.py`` does NOT maintain
+    an independent plan-generation counter; it reads what the lifecycle
+    manager owns (the same rows the orchestrator reads).  ``None`` when the
+    lifecycle state has no active plan (NO_ACTIVE_GRID / BLOCKED / empty).
+
+    The returned generation is ``LifecycleManager.get_generation()`` (the
+    authoritative manager generation), not a main-invented value, so any
+    conflicting legacy ``bot_state`` value cannot pollute the executable
+    generation.
+    """
+    manager = LifecycleManager(db_path)
+    active = manager.get_active_plan()
+    if active is None:
+        return None
+    # generation = the authoritative manager generation (max recorded), which
+    # for an ACTIVE plan equals the active plan's own generation.
+    generation = manager.get_generation()
+    return ActivePlan(
+        plan_id=active.plan_id,
+        candidate_lower=active.candidate_lower,
+        candidate_upper=active.candidate_upper,
+        grid_step=active.grid_step,
+        grid_count=active.grid_count,
+        regime=MarketRegime(active.regime),
+        range_quality_score=active.range_quality_score,
+        candle_index=active.candle_index,
+        generation=generation,
+    )
 
 def main():
     global _SESSION_REFERENCE_EQUITY
@@ -283,22 +362,12 @@ def main():
         eval_index = int(get_state(db_path, "adaptive_eval_index") or "0") + 1
         set_state(db_path, "adaptive_eval_index", str(eval_index))
 
-        raw_active = get_state(db_path, "last_active_plan")
-        if raw_active:
-            try:
-                active_data = json.loads(raw_active)
-                active_plan = ActivePlan(
-                    plan_id=active_data["plan_id"],
-                    candidate_lower=Decimal(str(active_data["candidate_lower"])),
-                    candidate_upper=Decimal(str(active_data["candidate_upper"])),
-                    grid_step=Decimal(str(active_data["grid_step"])),
-                    grid_count=int(active_data["grid_count"]),
-                    regime=MarketRegime(active_data["regime"]),
-                    range_quality_score=Decimal(str(active_data["range_quality_score"])),
-                    candle_index=int(active_data.get("candle_index", 0)),
-                )
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                active_plan = None
+        # FIX 4C (F-4): the active plan is read EXCLUSIVELY from the lifecycle
+        # manager database — the single authoritative source for plan identity
+        # and its generation namespace.  main.py keeps NO independent
+        # plan-generation counter; a stale/conflicting bot_state value cannot
+        # pollute the executable generation because main never reads it back.
+        active_plan = _lifecycle_active_plan(db_path)
 
         base_available = Decimal(str(cfg["paper"]["initial_base_balance"]))
         try:
@@ -339,6 +408,12 @@ def main():
 
         if adaptive_plan.decision == PlanDecision.GRID_ALLOWED:
             allow_new_orders = True
+            # FIX 4C (F-4): write only an INFORMATIONAL plan-identity mirror
+            # for observability.  main.py owns NO generation namespace: the
+            # executable generation is owned exclusively by the lifecycle
+            # manager (advanced atomically in the orchestrator's cycle
+            # transaction via activate_plan) and is never read back from
+            # bot_state.  This mirror deliberately carries no generation key.
             set_state(db_path, "last_active_plan", {
                 "plan_id": adaptive_plan.plan_id,
                 "candidate_lower": str(adaptive_plan.candidate_lower),
@@ -531,48 +606,91 @@ def main():
     else:
         logger.info("Open orders verified: count=%d",len(open_orders))
 
-    paper_orders = []
-    if combined.allowed and plan_validation is not None:
-        accounting = PaperAccountingEngine(
-            rules.base_asset,
-            rules.quote_asset,
-            Decimal(str(cfg["paper"]["initial_base_balance"])),
-            Decimal(str(cfg["paper"]["initial_quote_balance"])),
-            Decimal(str(cfg["paper"]["maker_fee"])),
-            Decimal(str(cfg["paper"]["taker_fee"])),
-            str(cfg["paper"]["fee_asset"]),
+    # FIX 4B: paper execution is routed through the authoritative orchestrator
+    # (PaperSession.run_cycle).  The orchestrator owns a single atomic cycle
+    # transaction that enforces the lifecycle-integrity gate, the
+    # inventory-allocation gate, the post-quantization profit gate, order
+    # submission, deterministic fills and recovery.  This removes the old
+    # non-transactional, per-order ``_submit_paper_orders`` loop (F-1/F-2).
+    cycle_result = None
+    # FIX 4B: run the paper cycle through the orchestrator only when main's
+    # planner allows a NEW grid (allow_new_orders is True solely on a fresh
+    # GRID_ALLOWED; keep/reconfig/cooldown/blocked leave the active plan
+    # untouched — the original ``submit_new`` semantics).  This keeps the
+    # orchestrator's lifecycle DB in sync with main's decision and skips the
+    # submission cycle on keep/reconfig so no new orders are placed.
+    if (
+        combined.allowed
+        and plan_validation is not None
+        and allow_new_orders
+    ):
+        cycle_candle_index = int(get_state(db_path, "paper_cycle_index") or "0") + 1
+        set_state(db_path, "paper_cycle_index", str(cycle_candle_index))
+        cycle_regime = (
+            market_intelligence_decision.regime
+            if market_intelligence_decision is not None
+            else (adaptive_plan.regime if adaptive_plan is not None else MarketRegime.RANGE)
         )
-        engine = PaperOrderEngine(db_path, accounting=accounting)
-        order_type = (
-            "LIMIT_MAKER"
-            if cfg["execution"]["prefer_limit_maker"]
-            else "LIMIT"
+        cycle_quality = (
+            market_intelligence_decision.range_quality_score
+            if market_intelligence_decision is not None
+            else (adaptive_plan.range_quality_score if adaptive_plan is not None else Decimal("80"))
         )
-        paper_orders = _submit_paper_orders(
-            engine,
-            plan_validation,
+        cycle_result = _run_paper_cycle(
+            db_path,
+            cfg,
             symbol,
-            combined,
-            lower,
-            order_type,
-            "AG",
-            cfg["environment"]["dry_run"],
-            submit_new=allow_new_orders,
+            rules,
+            current_price=current_price,
+            kline_df=df,
+            lower=lower,
+            upper=upper,
+            risk_decision=combined,
+            regime=cycle_regime,
+            range_quality_score=cycle_quality,
+            candle_index=cycle_candle_index,
+            active_plan=active_plan,
         )
-    state_counts = {}
-    for order in paper_orders:
-        state = order.state.value
-        state_counts[state] = state_counts.get(state, 0) + 1
-    set_state(db_path,"last_paper_orders",{
-        "count":len(paper_orders),
-        "states":state_counts,
-    })
+        set_state(db_path, "last_paper_orders", {
+            "count": cycle_result.orders_submitted,
+            "states": {"OPEN": cycle_result.orders_submitted}
+            if cycle_result.orders_submitted else {},
+            "cycle_id": cycle_result.cycle_id,
+            "plan_decision": (
+                cycle_result.plan_decision.value
+                if cycle_result.plan_decision else None
+            ),
+            "lifecycle_transition": cycle_result.lifecycle_transition,
+            "orders_submitted": cycle_result.orders_submitted,
+            "orders_skipped": cycle_result.orders_skipped,
+            "fills_applied": cycle_result.fills_applied,
+            "recovery_healthy": cycle_result.recovery_healthy,
+            "is_idempotent": cycle_result.is_idempotent,
+            "success": cycle_result.success,
+            "blocked_reason": cycle_result.blocked_reason,
+            "error": cycle_result.error,
+        })
 
     if not combined.allowed:
         logger.warning("ORDER PLAN BLOCKED: %s",combined.reason)
-    else:
-        logger.info("ORDER PLAN PASS: paper orders submitted=%d states=%s",
-                    len(paper_orders), state_counts)
+    elif cycle_result is not None:
+        logger.info(
+            "PAPER CYCLE PASS: submitted=%d skipped=%d fills=%d plan=%s "
+            "transition=%s recovery_healthy=%s success=%s",
+            cycle_result.orders_submitted,
+            cycle_result.orders_skipped,
+            cycle_result.fills_applied,
+            cycle_result.plan_decision.value
+            if cycle_result.plan_decision else None,
+            cycle_result.lifecycle_transition,
+            cycle_result.recovery_healthy,
+            cycle_result.success,
+        )
+        if cycle_result.blocked_reason:
+            logger.error("PAPER CYCLE BLOCKED: %s", cycle_result.blocked_reason)
+        if cycle_result.error:
+            logger.error("PAPER CYCLE ROLLED BACK (no mutation persisted): %s",
+                         cycle_result.error)
 
     print("\nResult:")
     print(f"  Risk decision : {'PASS' if combined.allowed else 'BLOCK'}")

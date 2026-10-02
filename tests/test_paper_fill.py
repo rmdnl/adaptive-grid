@@ -22,9 +22,9 @@ NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 FILL_TIME = NOW + timedelta(minutes=1)
 
 
-def _intent(index=0, side="BUY", price="100", quantity="2"):
+def _intent(index=0, side="BUY", price="100", quantity="2", generation=0):
     return OrderIntent(
-        client_order_id=make_client_order_id("AG", "BNBUSDT", index, side),
+        client_order_id=make_client_order_id("AG", "BNBUSDT", generation, index, side),
         symbol="BNBUSDT",
         side=side,
         order_type="LIMIT_MAKER",
@@ -32,14 +32,15 @@ def _intent(index=0, side="BUY", price="100", quantity="2"):
         quantity=Decimal(quantity),
         time_in_force="GTC",
         grid_index=index,
+        generation=generation,
         created_at=NOW,
     )
 
 
-def _engine(tmp_path, side="BUY", price="100", quantity="2", index=0):
+def _engine(tmp_path, side="BUY", price="100", quantity="2", index=0, generation=0):
     engine = PaperOrderEngine(str(tmp_path / "paper.sqlite3"), clock=lambda: NOW)
     engine.submit(
-        _intent(index=index, side=side, price=price, quantity=quantity),
+        _intent(index=index, side=side, price=price, quantity=quantity, generation=generation),
         RiskDecision(True),
         Decimal("90"),
         Decimal("110"),
@@ -51,9 +52,9 @@ def _fill_id(index):
     return f"fill-{index:05d}"
 
 
-def _apply(engine, side="BUY", price="100", quantity="2", market_price="100", fill_quantity="1", index=0):
+def _apply(engine, side="BUY", price="100", quantity="2", market_price="100", fill_quantity="1", index=0, generation=0):
     return engine.apply_fill(
-        make_client_order_id("AG", "BNBUSDT", index, side),
+        make_client_order_id("AG", "BNBUSDT", generation, index, side),
         _fill_id(index),
         "BNBUSDT",
         Decimal(market_price),
@@ -199,7 +200,7 @@ def test_zero_or_negative_fill_is_rejected(tmp_path, quantity):
 
     with pytest.raises(PaperFillValidationError, match="fill_quantity"):
         engine.apply_fill(
-            make_client_order_id("AG", "BNBUSDT", 0, "BUY"),
+            make_client_order_id("AG", "BNBUSDT", 0, 0, "BUY"),
             _fill_id(0),
             "BNBUSDT",
             Decimal("99"),
@@ -214,7 +215,7 @@ def test_invalid_market_price_is_rejected(tmp_path, market_price):
 
     with pytest.raises(PaperFillValidationError, match="market_price"):
         engine.apply_fill(
-            make_client_order_id("AG", "BNBUSDT", 0, "BUY"),
+            make_client_order_id("AG", "BNBUSDT", 0, 0, "BUY"),
             _fill_id(0),
             "BNBUSDT",
             market_price,
@@ -251,7 +252,7 @@ def test_wrong_symbol_is_rejected(tmp_path):
 
     with pytest.raises(PaperFillSymbolMismatch, match="ETHUSDT"):
         engine.apply_fill(
-            make_client_order_id("AG", "BNBUSDT", 0, "BUY"),
+            make_client_order_id("AG", "BNBUSDT", 0, 0, "BUY"),
             _fill_id(0),
             "ETHUSDT",
             Decimal("99"),
@@ -262,7 +263,7 @@ def test_wrong_symbol_is_rejected(tmp_path):
 
 def test_duplicate_fill_event_is_idempotent(tmp_path):
     engine = _engine(tmp_path, side="BUY", quantity="2")
-    client_order_id = make_client_order_id("AG", "BNBUSDT", 0, "BUY")
+    client_order_id = make_client_order_id("AG", "BNBUSDT", 0, 0, "BUY")
 
     first = engine.apply_fill(
         client_order_id, _fill_id(0), "BNBUSDT", Decimal("99"), Decimal("1"), FILL_TIME
@@ -281,7 +282,7 @@ def test_duplicate_fill_event_is_idempotent(tmp_path):
 
 def test_fill_identity_mismatch_is_rejected(tmp_path):
     engine = _engine(tmp_path, side="BUY", quantity="2")
-    client_order_id = make_client_order_id("AG", "BNBUSDT", 0, "BUY")
+    client_order_id = make_client_order_id("AG", "BNBUSDT", 0, 0, "BUY")
 
     engine.apply_fill(
         client_order_id, _fill_id(0), "BNBUSDT", Decimal("99"), Decimal("1"), FILL_TIME
@@ -295,7 +296,7 @@ def test_fill_identity_mismatch_is_rejected(tmp_path):
 
 def test_fill_state_survives_engine_restart(tmp_path):
     engine = _engine(tmp_path, side="BUY", quantity="2")
-    client_order_id = make_client_order_id("AG", "BNBUSDT", 0, "BUY")
+    client_order_id = make_client_order_id("AG", "BNBUSDT", 0, 0, "BUY")
     engine.apply_fill(
         client_order_id, _fill_id(0), "BNBUSDT", Decimal("99"), Decimal("1"), FILL_TIME
     )
@@ -309,7 +310,7 @@ def test_fill_state_survives_engine_restart(tmp_path):
 
 def test_fill_update_and_event_are_atomic_and_retryable(tmp_path):
     engine = _engine(tmp_path, side="BUY", quantity="2")
-    client_order_id = make_client_order_id("AG", "BNBUSDT", 0, "BUY")
+    client_order_id = make_client_order_id("AG", "BNBUSDT", 0, 0, "BUY")
 
     with sqlite3.connect(engine.db_path) as connection:
         connection.execute("DROP TABLE fills")

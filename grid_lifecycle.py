@@ -319,9 +319,17 @@ class LifecycleManager:
                 "ON pending_reconfigs(candidate_plan_id)"
             )
 
-    def get_current_state(self) -> LifecycleState:
-        """Get the current global lifecycle state."""
-        state_entry = get_state(self.db_path, "lifecycle:state")
+    def get_current_state(self, con=None, prefix: str = "") -> LifecycleState:
+        """Get the current global lifecycle state.
+
+        When ``con`` is supplied (cycle transaction join) the state is read
+        from the caller's connection/prefix so it sees uncommitted cycle
+        mutations.
+        """
+        if con is not None:
+            state_entry = self._get_state_on(con, prefix, "lifecycle:state")
+        else:
+            state_entry = get_state(self.db_path, "lifecycle:state")
         if state_entry is None:
             return LifecycleState.NO_ACTIVE_GRID
 
@@ -339,49 +347,66 @@ class LifecycleManager:
         }
         set_state(self.db_path, "lifecycle:state", state_data)
 
-    def _set_state_on(self, con, state: LifecycleState) -> None:
+    def _get_state_on(self, con, prefix: str, key: str):
+        """Read one bot_state value on the given connection.
+
+        ``prefix`` is the schema alias for the (possibly attached) lifecycle
+        database.  Returns the raw value string or ``None``.
+        """
+        row = con.execute(
+            f"SELECT value FROM {self._table('bot_state', prefix)} WHERE key=?",
+            (key,),
+        ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def _set_state_on(self, con, state: LifecycleState, prefix: str = "") -> None:
         """Set global lifecycle state using the given (open) connection."""
         payload = json.dumps({
             "state": state.value,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }, separators=(",", ":"))
         con.execute(
-            "INSERT INTO bot_state(key,value) VALUES (?,?) "
+            f"INSERT INTO {self._table('bot_state', prefix)}(key,value) VALUES (?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             ("lifecycle:state", payload),
         )
 
-    def get_generation(self) -> int:
+    def get_generation(self, con=None, prefix: str = "") -> int:
         """Get the current generation counter (highest recorded generation)."""
-        con = connect(self.db_path)
-        try:
-            return self._get_max_generation(con)
-        finally:
-            con.close()
+        def block(c):
+            return self._get_max_generation(c, prefix)
+        return self._run_on(con, prefix, block)
 
-    def _get_max_generation(self, con) -> int:
+    def _get_max_generation(self, con, prefix: str = "") -> int:
         """Read the highest recorded generation from an open connection."""
-        row = con.execute("SELECT MAX(generation) as gen FROM generations").fetchone()
+        row = con.execute(
+            f"SELECT MAX(generation) as gen FROM {self._table('generations', prefix)}"
+        ).fetchone()
         return row["gen"] if row is not None and row["gen"] is not None else 0
 
-    def get_active_plan(self) -> Optional[ActivePlanState]:
+    def get_active_plan(self, con=None, prefix: str = "") -> Optional[ActivePlanState]:
         """Get the currently active grid plan, if any.
 
         The active plan remains visible while a reconfiguration is pending
         (trading still governed by the active plan during reconfig evaluation).
+
+        When ``con`` is supplied (cycle transaction join) the row is read from
+        the caller's connection so it sees uncommitted cycle mutations.
         """
-        state = self.get_current_state()
+        state = self.get_current_state(con=con, prefix=prefix)
         if state in (LifecycleState.NO_ACTIVE_GRID, LifecycleState.BLOCKED):
             return None
 
-        con = connect(self.db_path)
+        own = con is None
+        if own:
+            con = connect(self.db_path)
         try:
             row = con.execute(
-                """
+                f"""
                 SELECT plan_id, pair, candidate_lower, candidate_upper, grid_step, grid_count,
                        regime, range_quality_score, candle_index, generation,
                        lifecycle_state
-                FROM active_plans
+                FROM {self._table('active_plans', prefix)}
                 WHERE lifecycle_state IN (?, ?)
                 ORDER BY generation DESC, created_at DESC
                 LIMIT 1
@@ -406,19 +431,27 @@ class LifecycleManager:
                 lifecycle_state=LifecycleState(row["lifecycle_state"]),
             )
         finally:
-            con.close()
+            if own:
+                con.close()
 
-    def get_candidate_plan(self, candidate_plan_id: str) -> Optional[CandidatePlanState]:
-        """Get a candidate plan by ID."""
-        con = connect(self.db_path)
+    def get_candidate_plan(self, candidate_plan_id: str,
+                           con=None, prefix: str = "") -> Optional[CandidatePlanState]:
+        """Get a candidate plan by ID.
+
+        When ``con`` is supplied (cycle transaction join) the row is read from
+        the caller's connection so it sees uncommitted cycle mutations.
+        """
+        own = con is None
+        if own:
+            con = connect(self.db_path)
         try:
             row = con.execute(
-                """
+                f"""
                 SELECT plan_id, active_plan_id, pair, regime, candidate_lower,
                        candidate_upper, grid_step, grid_count, range_quality_score,
                        decision, reasons, generated_at_candle, generation,
                        lifecycle_state
-                FROM candidate_plans
+                FROM {self._table('candidate_plans', prefix)}
                 WHERE plan_id = ?
                 """,
                 (candidate_plan_id,)
@@ -444,16 +477,24 @@ class LifecycleManager:
                 lifecycle_state=LifecycleState(row["lifecycle_state"]),
             )
         finally:
-            con.close()
+            if own:
+                con.close()
 
-    def get_pending_reconfiguration(self, active_plan_id: str) -> Optional[CandidatePlanState]:
-        """Get pending reconfiguration for the given active plan, if any."""
-        con = connect(self.db_path)
+    def get_pending_reconfiguration(self, active_plan_id: str,
+                                    con=None, prefix: str = "") -> Optional[CandidatePlanState]:
+        """Get pending reconfiguration for the given active plan, if any.
+
+        When ``con`` is supplied (cycle transaction join) the rows are read
+        from the caller's connection so they see uncommitted cycle mutations.
+        """
+        own = con is None
+        if own:
+            con = connect(self.db_path)
         try:
             row = con.execute(
-                """
+                f"""
                 SELECT candidate_plan_id
-                FROM pending_reconfigs
+                FROM {self._table('pending_reconfigs', prefix)}
                 WHERE active_plan_id = ? AND status IN ('PENDING', 'VALIDATED')
                 ORDER BY created_at DESC
                 LIMIT 1
@@ -464,9 +505,11 @@ class LifecycleManager:
             if row is None:
                 return None
 
-            return self.get_candidate_plan(row["candidate_plan_id"])
+            return self.get_candidate_plan(row["candidate_plan_id"],
+                                           con=con, prefix=prefix)
         finally:
-            con.close()
+            if own:
+                con.close()
 
     def get_transition_history(self, limit: int = 50) -> List[LifecycleTransition]:
         """Get recent lifecycle transitions for audit trail."""
@@ -496,35 +539,52 @@ class LifecycleManager:
         finally:
             con.close()
 
-    def activate_plan(self, plan: AdaptiveGridPlan, cfg: Dict[str,
- Any]) -> LifecycleTransition:
+    def _transition_row_on(self, con, action: str, details_like: str,
+                           prefix: str) -> Optional[dict]:
+        """Latest lifecycle_transitions row matching an action + details fragment."""
+        return con.execute(
+            f"""SELECT transition_id, from_state, to_state, action, timestamp, details
+            FROM {self._table('lifecycle_transitions', prefix)} WHERE action = ? AND details LIKE ?
+            ORDER BY timestamp DESC LIMIT 1""",
+            (action, details_like)
+        ).fetchone()
+
+    def _transition_from_row(self, row: dict) -> LifecycleTransition:
+        return LifecycleTransition(
+            transition_id=row["transition_id"],
+            from_state=LifecycleState(row["from_state"]),
+            to_state=LifecycleState(row["to_state"]),
+            action=LifecycleAction(row["action"]),
+            timestamp=row["timestamp"],
+            details=json.loads(row["details"]),
+        )
+
+    def activate_plan(self, plan: AdaptiveGridPlan, cfg: Dict[str, Any],
+                      con=None, prefix: str = "") -> LifecycleTransition:
         """Activate a new grid plan (initial or recovery from BLOCKED).
 
         Idempotent: if plan_id already exists, returns the existing transition.
+
+        When ``con`` is supplied the mutation block runs on the caller's
+        connection (cycle-transaction join) and does not commit; when it is
+        None the method behaves exactly as before (private transaction).
         """
-        current_state = self.get_current_state()
+        current_state = self.get_current_state(con=con, prefix=prefix)
 
         # Idempotency: if this exact plan is already active, return existing transition early
-        con_check = connect(self.db_path)
-        try:
-            if self._is_duplicate_plan(con_check, plan.plan_id):
-                row = con_check.execute(
-                    """SELECT transition_id, from_state, to_state, action, timestamp, details
-                    FROM lifecycle_transitions WHERE action = ? AND details LIKE ?
-                    ORDER BY timestamp DESC LIMIT 1""",
-                    (LifecycleAction.ACTIVATE.value, f'%"{plan.plan_id}"%')
-                ).fetchone()
-                if row is not None:
-                    return LifecycleTransition(
-                        transition_id=row["transition_id"],
-                        from_state=LifecycleState(row["from_state"]),
-                        to_state=LifecycleState(row["to_state"]),
-                        action=LifecycleAction(row["action"]),
-                        timestamp=row["timestamp"],
-                        details=json.loads(row["details"]),
+        joined = con is not None
+        if not joined:
+            con_check = connect(self.db_path)
+            try:
+                if self._is_duplicate_plan(con_check, plan.plan_id, prefix=prefix):
+                    row = self._transition_row_on(
+                        con_check, LifecycleAction.ACTIVATE.value,
+                        f'%"{plan.plan_id}"%', prefix,
                     )
-        finally:
-            con_check.close()
+                    if row is not None:
+                        return self._transition_from_row(row)
+            finally:
+                con_check.close()
 
         if current_state not in (LifecycleState.NO_ACTIVE_GRID, LifecycleState.BLOCKED):
             raise LifecycleError(
@@ -548,39 +608,34 @@ class LifecycleManager:
         target_state = self._validate_transition(current_state, LifecycleAction.ACTIVATE)
         now = datetime.now(timezone.utc).isoformat()
 
-        with self._transaction() as con:
+        tx_con = con if joined else None
+        with self._transaction(tx_con) as c:
+            owns_commit = not joined
             # Idempotency fallback inside transaction
-            if self._is_duplicate_plan(con, plan.plan_id):
-                row = con.execute(
-                    """SELECT transition_id, from_state, to_state, action, timestamp, details
-                    FROM lifecycle_transitions WHERE action = ? AND details LIKE ?
-                    ORDER BY timestamp DESC LIMIT 1""",
-                    (LifecycleAction.ACTIVATE.value, f'%"{plan.plan_id}"%')
-                ).fetchone()
+            if self._is_duplicate_plan(c, plan.plan_id, prefix=prefix):
+                row = self._transition_row_on(
+                    c, LifecycleAction.ACTIVATE.value,
+                    f'%"{plan.plan_id}"%', prefix,
+                )
                 if row is not None:
-                    con.commit()
-                    return LifecycleTransition(
-                        transition_id=row["transition_id"],
-                        from_state=LifecycleState(row["from_state"]),
-                        to_state=LifecycleState(row["to_state"]),
-                        action=LifecycleAction(row["action"]),
-                        timestamp=row["timestamp"],
-                        details=json.loads(row["details"]),
-                    )
+                    if owns_commit:
+                        c.commit()
+                    return self._transition_from_row(row)
 
             # Determine generation
-            new_generation = self._get_max_generation(con) + 1
+            new_generation = self._get_max_generation(c, prefix) + 1
 
             # Deactivate any previous active plan
-            con.execute(
-                "UPDATE active_plans SET lifecycle_state = ?, updated_at = ? WHERE lifecycle_state = ?",
+            c.execute(
+                f"UPDATE {self._table('active_plans', prefix)} "
+                "SET lifecycle_state = ?, updated_at = ? WHERE lifecycle_state = ?",
                 (LifecycleState.BLOCKED.value, now, LifecycleState.ACTIVE.value)
             )
 
             # Insert active plan
-            con.execute(
-                """
-                INSERT OR IGNORE INTO active_plans (
+            c.execute(
+                f"""
+                INSERT OR IGNORE INTO {self._table('active_plans', prefix)} (
                     plan_id, pair, candidate_lower, candidate_upper, grid_step, grid_count,
                     regime, range_quality_score, candle_index, generation,
                     lifecycle_state, created_at, updated_at
@@ -595,37 +650,46 @@ class LifecycleManager:
             )
 
             # Record generation
-            con.execute(
-                "INSERT OR IGNORE INTO generations (generation, active_plan_id, previous_plan_id, created_at, status) VALUES (?, ?, ?, ?, ?)",
+            c.execute(
+                f"INSERT OR IGNORE INTO {self._table('generations', prefix)} "
+                "(generation, active_plan_id, previous_plan_id, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (new_generation, plan.plan_id, None, now, "ACTIVE")
             )
 
             # Set global state
-            self._set_state_on(con, target_state)
+            self._set_state_on(c, target_state, prefix)
 
             # Create transition
             transition = LifecycleTransition.create(
                 current_state, target_state, LifecycleAction.ACTIVATE,
                 {"plan_id": plan.plan_id, "generation": new_generation, "candle_index": 0}
             )
-            self._record_transition(con, transition)
-            con.commit()
+            self._record_transition(c, transition, prefix)
+            if owns_commit:
+                c.commit()
 
         return transition
 
     def handle_planner_decision(self, adaptive_plan: AdaptiveGridPlan,
                                active_plan_state: Optional[ActivePlanState],
                                cfg: Dict[str, Any],
-                               candle_index: int = 0) -> LifecycleTransition:
-        """Process a planner decision and trigger appropriate lifecycle transitions."""
-        current_state = self.get_current_state()
+                               candle_index: int = 0,
+                               con=None, prefix: str = "") -> LifecycleTransition:
+        """Process a planner decision and trigger appropriate lifecycle transitions.
+
+        When ``con`` is supplied the mutation path joins the caller's
+        transaction (cycle ownership); when ``con`` is None the method
+        behaves exactly as before (private transactions).
+        """
+        current_state = self.get_current_state(con=con, prefix=prefix)
 
         if active_plan_state is None:
             # No active plan, handle according to decision
             if adaptive_plan.decision == PlanDecision.GRID_ALLOWED:
-                return self.activate_plan(adaptive_plan, cfg)
+                return self.activate_plan(adaptive_plan, cfg, con=con, prefix=prefix)
             elif adaptive_plan.decision == PlanDecision.GRID_BLOCKED:
-                return self._transition_to_blocked()
+                return self._transition_to_blocked(con=con, prefix=prefix)
             else:
                 raise LifecycleError(
                     ValidationErrorCode.INVALID_TRANSITION,
@@ -634,11 +698,19 @@ class LifecycleManager:
 
         # We have an active plan
         if adaptive_plan.decision == PlanDecision.KEEP_CURRENT_PLAN:
-            return self._transition_to_keep_current(active_plan_state, adaptive_plan, candle_index)
+            return self._transition_to_keep_current(
+                active_plan_state, adaptive_plan, candle_index,
+                con=con, prefix=prefix,
+            )
         elif adaptive_plan.decision == PlanDecision.RECONFIGURATION_REQUIRED:
-            return self._transition_to_pending_reconfig(active_plan_state, adaptive_plan, candle_index)
+            return self._transition_to_pending_reconfig(
+                active_plan_state, adaptive_plan, candle_index,
+                con=con, prefix=prefix,
+            )
         elif adaptive_plan.decision == PlanDecision.GRID_BLOCKED:
-            return self._transition_to_blocked(active_plan_state)
+            return self._transition_to_blocked(
+                active_plan_state, con=con, prefix=prefix,
+            )
         else:
             raise LifecycleError(
                 ValidationErrorCode.INVALID_TRANSITION,
@@ -646,41 +718,39 @@ class LifecycleManager:
             )
 
     def validate_pending_reconfiguration(self, active_plan_id: str,
-                                          candle_index: int = 0) -> LifecycleTransition:
+                                          candle_index: int = 0,
+                                          con=None, prefix: str = "") -> LifecycleTransition:
         """Validate the pending reconfiguration and move to READY_TO_RECONFIGURE.
 
         Idempotent: if already validated, returns the existing transition.
-        """
-        # Idempotency: if already READY_TO_RECONFIGURE, return existing VALIDATE_PENDING transition
-        con_check = connect(self.db_path)
-        try:
-            if self.get_current_state() == LifecycleState.READY_TO_RECONFIGURE:
-                row = con_check.execute(
-                    """SELECT transition_id, from_state, to_state, action, timestamp, details
-                    FROM lifecycle_transitions WHERE action = ? AND details LIKE ?
-                    ORDER BY timestamp DESC LIMIT 1""",
-                    (LifecycleAction.VALIDATE_PENDING.value, f'%"{active_plan_id}"%')
-                ).fetchone()
-                if row is not None:
-                    return LifecycleTransition(
-                        transition_id=row["transition_id"],
-                        from_state=LifecycleState(row["from_state"]),
-                        to_state=LifecycleState(row["to_state"]),
-                        action=LifecycleAction(row["action"]),
-                        timestamp=row["timestamp"],
-                        details=json.loads(row["details"]),
-                    )
-        finally:
-            con_check.close()
 
-        current_state = self.get_current_state()
+        When ``con`` is supplied the mutation block joins the caller's
+        transaction (cycle ownership); when ``con`` is None it behaves as
+        before (private transaction).
+        """
+        joined = con is not None
+        # Idempotency: if already READY_TO_RECONFIGURE, return existing VALIDATE_PENDING transition
+        pre_con = con if joined else connect(self.db_path)
+        try:
+            if self.get_current_state(con=con, prefix=prefix) == LifecycleState.READY_TO_RECONFIGURE:
+                row = self._transition_row_on(
+                    pre_con, LifecycleAction.VALIDATE_PENDING.value,
+                    f'%"{active_plan_id}"%', prefix,
+                )
+                if row is not None:
+                    return self._transition_from_row(row)
+        finally:
+            if not joined:
+                pre_con.close()
+
+        current_state = self.get_current_state(con=con, prefix=prefix)
         if current_state != LifecycleState.RECONFIGURATION_PENDING:
             raise LifecycleError(
                 ValidationErrorCode.INVALID_TRANSITION,
                 f"Cannot validate pending reconfiguration from state {current_state}"
             )
 
-        pending = self.get_pending_reconfiguration(active_plan_id)
+        pending = self.get_pending_reconfiguration(active_plan_id, con=con, prefix=prefix)
         if pending is None:
             raise LifecycleError(
                 ValidationErrorCode.TRANSITION_REJECTED,
@@ -688,7 +758,7 @@ class LifecycleManager:
             )
 
         # Stale generation check
-        active_plan = self.get_active_plan()
+        active_plan = self.get_active_plan(con=con, prefix=prefix)
         if active_plan is not None and pending.generation <= active_plan.generation:
             raise LifecycleError(
                 ValidationErrorCode.STALE_CANDIDATE_PLAN,
@@ -698,37 +768,43 @@ class LifecycleManager:
         target_state = self._validate_transition(current_state, LifecycleAction.VALIDATE_PENDING)
         now = datetime.now(timezone.utc).isoformat()
 
-        with self._transaction() as con:
+        tx_con = con if joined else None
+        with self._transaction(tx_con) as c:
+            owns_commit = not joined
             # Idempotency: check for existing VALIDATE_PENDING transition for
             # this exact (active plan, candidate, generation) identity, so
             # distinct reconfiguration cycles never collide.
             if self._is_duplicate_transition(
-                con, current_state, target_state, LifecycleAction.VALIDATE_PENDING,
+                c, current_state, target_state, LifecycleAction.VALIDATE_PENDING,
                 plan_id=active_plan_id, candidate_plan_id=pending.plan_id,
-                generation=pending.generation,
+                generation=pending.generation, prefix=prefix,
             ):
                 existing = self._find_transition(
-                    con, LifecycleAction.VALIDATE_PENDING,
+                    c, LifecycleAction.VALIDATE_PENDING,
                     plan_id=active_plan_id, candidate_plan_id=pending.plan_id,
+                    prefix=prefix,
                 )
                 if existing is not None:
-                    con.commit()
+                    if owns_commit:
+                        c.commit()
                     return existing
 
             # Update candidate plan lifecycle state
-            con.execute(
-                "UPDATE candidate_plans SET lifecycle_state = ? WHERE plan_id = ?",
+            c.execute(
+                f"UPDATE {self._table('candidate_plans', prefix)} "
+                "SET lifecycle_state = ? WHERE plan_id = ?",
                 (LifecycleState.READY_TO_RECONFIGURE.value, pending.plan_id)
             )
 
             # Update pending_reconfigs status
-            con.execute(
-                "UPDATE pending_reconfigs SET status = ? WHERE active_plan_id = ? AND status = 'PENDING'",
+            c.execute(
+                f"UPDATE {self._table('pending_reconfigs', prefix)} "
+                "SET status = ? WHERE active_plan_id = ? AND status = 'PENDING'",
                 ("VALIDATED", active_plan_id)
             )
 
             # Set global state
-            self._set_state_on(con, target_state)
+            self._set_state_on(c, target_state, prefix)
 
             # Create transition
             transition = LifecycleTransition.create(
@@ -742,57 +818,61 @@ class LifecycleManager:
                     "generation": pending.generation,
                 }
             )
-            self._record_transition(con, transition)
-            con.commit()
+            self._record_transition(c, transition, prefix)
+            if owns_commit:
+                c.commit()
 
         return transition
 
     def finalize_reconfiguration(self, active_plan_id: str,
-                                 candle_index: int = 0) -> LifecycleTransition:
+                                 candle_index: int = 0,
+                                 con=None, prefix: str = "") -> LifecycleTransition:
         """Finalize reconfiguration: swap candidate plan into active.
 
         Idempotent: if already finalized, returns the existing transition.
-        """
-        # Idempotency: if already back to ACTIVE, return existing ACTIVATE transition for this candidate
-        con_check = connect(self.db_path)
-        try:
-            row = con_check.execute(
-                """SELECT c.plan_id FROM pending_reconfigs p
-                JOIN candidate_plans c ON c.plan_id = p.candidate_plan_id
-                WHERE p.active_plan_id = ?
-                ORDER BY p.created_at DESC LIMIT 1""",
-                (active_plan_id,)
-            ).fetchone()
-            if row is not None and self.get_current_state() == LifecycleState.ACTIVE:
-                row2 = con_check.execute(
-                    """SELECT transition_id, from_state, to_state, action, timestamp, details
-                    FROM lifecycle_transitions WHERE action = ? AND details LIKE ?
-                    ORDER BY timestamp DESC LIMIT 1""",
-                    (LifecycleAction.ACTIVATE.value, f'%"{row["plan_id"]}"%')
-                ).fetchone()
-                if row2 is not None:
-                    return LifecycleTransition(
-                        transition_id=row2["transition_id"],
-                        from_state=LifecycleState(row2["from_state"]),
-                        to_state=LifecycleState(row2["to_state"]),
-                        action=LifecycleAction(row2["action"]),
-                        timestamp=row2["timestamp"],
-                        details=json.loads(row2["details"]),
-                    )
-        finally:
-            con_check.close()
 
-        current_state = self.get_current_state()
+        When ``con`` is supplied the mutation block joins the caller's
+        transaction (cycle ownership); when ``con`` is None it behaves as
+        before (private transaction).
+        """
+        joined = con is not None
+        # Idempotency: if already back to ACTIVE, return the existing READY
+        # -> ACTIVE reconfiguration-swap transition for this candidate.
+        # The lookup is scoped to the reconfiguration-swap rows only; the
+        # legacy initial-activation ACTIVATE row (NO_ACTIVE_GRID -> ACTIVE,
+        # same plan_id when candidate and active ids coincide) must NOT
+        # alias this early return, or the swap is silently skipped and the
+        # state wedges at READY_TO_RECONFIGURE (Phase 7A anomaly A1).
+        pre_con = con if joined else connect(self.db_path)
+        try:
+            if self.get_current_state(con=con, prefix=prefix) == LifecycleState.ACTIVE:
+                row2 = con.execute(
+                    f"""SELECT transition_id, from_state, to_state, action, timestamp, details
+                    FROM {self._table('lifecycle_transitions', prefix)}
+                    WHERE action = ? AND from_state = ?
+                    AND details LIKE ?
+                    ORDER BY timestamp DESC LIMIT 1""",
+                        (LifecycleAction.ACTIVATE.value,
+                         LifecycleState.READY_TO_RECONFIGURE.value,
+                         f'"previous_plan_id": "{active_plan_id}"'),
+                    ).fetchone()
+                if row2 is not None:
+                    return self._transition_from_row(row2)
+        finally:
+            if not joined:
+                pre_con.close()
+
+        current_state = self.get_current_state(con=con, prefix=prefix)
         if current_state != LifecycleState.READY_TO_RECONFIGURE:
             raise LifecycleError(
                 ValidationErrorCode.INVALID_TRANSITION,
                 f"Cannot finalize reconfiguration from state {current_state}"
             )
 
-        pending = self.get_pending_reconfiguration(active_plan_id)
+        pending = self.get_pending_reconfiguration(active_plan_id, con=con, prefix=prefix)
         candidate = None
         if pending is not None:
-            candidate = self.get_candidate_plan(pending.plan_id)
+            candidate = self.get_candidate_plan(pending.plan_id, con=con, prefix=prefix)
         if candidate is None:
             raise LifecycleError(
                 ValidationErrorCode.TRANSITION_REJECTED,
@@ -802,37 +882,46 @@ class LifecycleManager:
         target_state = self._validate_transition(current_state, LifecycleAction.ACTIVATE)
         now = datetime.now(timezone.utc).isoformat()
 
-        with self._transaction() as con:
-            # Idempotency: check for existing ACTIVATE transition for this candidate
-            row = con.execute(
-                """SELECT transition_id, from_state, to_state, action, timestamp, details
-                FROM lifecycle_transitions WHERE action = ? AND details LIKE ?
+        tx_con = con if joined else None
+        with self._transaction(tx_con) as c:
+            owns_commit = not joined
+            # Idempotency: return the existing reconfiguration-swap
+            # transition (READY_TO_RECONFIGURE -> ACTIVE) for this
+            # candidate if it was already recorded.  Scoped to the swap
+            # rows; the legacy initial-activation ACTIVATE row
+            # (NO_ACTIVE_GRID -> ACTIVE, same plan_id when candidate and
+            # active ids coincide) must NOT alias this check, or the
+            # swap is silently skipped and the state wedges at READY
+            # (Phase 7A anomaly A1).
+            row = c.execute(
+                f"""SELECT transition_id, from_state, to_state, action, timestamp, details
+                FROM {self._table('lifecycle_transitions', prefix)}
+                WHERE action = ? AND from_state = ?
+                AND (details LIKE ? OR details LIKE ?)
                 ORDER BY timestamp DESC LIMIT 1""",
-                (LifecycleAction.ACTIVATE.value, f'%"{candidate.plan_id}"%')
+                (LifecycleAction.ACTIVATE.value,
+                 LifecycleState.READY_TO_RECONFIGURE.value,
+                 f'"plan_id": "{candidate.plan_id}"',
+                 f'"candidate_plan_id": "{candidate.plan_id}"'),
             ).fetchone()
             if row is not None:
-                con.commit()
-                return LifecycleTransition(
-                    transition_id=row["transition_id"],
-                    from_state=LifecycleState(row["from_state"]),
-                    to_state=LifecycleState(row["to_state"]),
-                    action=LifecycleAction(row["action"]),
-                    timestamp=row["timestamp"],
-                    details=json.loads(row["details"]),
-                )
+                if owns_commit:
+                    c.commit()
+                return self._transition_from_row(row)
 
             # Deactivate current active plan / mark previous generation
-            con.execute(
-                "UPDATE active_plans SET lifecycle_state = ?, updated_at = ? WHERE plan_id = ?",
+            c.execute(
+                f"UPDATE {self._table('active_plans', prefix)} "
+                "SET lifecycle_state = ?, updated_at = ? WHERE plan_id = ?",
                 (LifecycleState.BLOCKED.value, now, active_plan_id)
             )
 
-            new_generation = self._get_max_generation(con) + 1
+            new_generation = self._get_max_generation(c, prefix) + 1
 
             # Swap candidate into active_plans
-            con.execute(
-                """
-                INSERT OR REPLACE INTO active_plans (
+            c.execute(
+                f"""
+                INSERT OR REPLACE INTO {self._table('active_plans', prefix)} (
                     plan_id, pair, candidate_lower, candidate_upper, grid_step, grid_count,
                     regime, range_quality_score, candle_index, generation,
                     lifecycle_state, created_at, updated_at
@@ -847,23 +936,26 @@ class LifecycleManager:
             )
 
             # Record new generation
-            con.execute(
-                "INSERT OR IGNORE INTO generations (generation, active_plan_id, created_at, status) VALUES (?, ?, ?, ?)",
+            c.execute(
+                f"INSERT OR IGNORE INTO {self._table('generations', prefix)} "
+                "(generation, active_plan_id, created_at, status) VALUES (?, ?, ?, ?)",
                 (new_generation, candidate.plan_id, now, "ACTIVE")
             )
 
             # Mark candidate as consumed
-            con.execute(
-                "UPDATE candidate_plans SET lifecycle_state = ? WHERE plan_id = ?",
+            c.execute(
+                f"UPDATE {self._table('candidate_plans', prefix)} "
+                "SET lifecycle_state = ? WHERE plan_id = ?",
                 (LifecycleState.BLOCKED.value, candidate.plan_id)
             )
-            con.execute(
-                "UPDATE pending_reconfigs SET status = ? WHERE active_plan_id = ? AND status IN ('PENDING','VALIDATED')",
+            c.execute(
+                f"UPDATE {self._table('pending_reconfigs', prefix)} "
+                "SET status = ? WHERE active_plan_id = ? AND status IN ('PENDING','VALIDATED')",
                 ("FINALIZED", active_plan_id)
             )
 
             # Set global state
-            self._set_state_on(con, target_state)
+            self._set_state_on(c, target_state, prefix)
 
             # Create transition
             transition = LifecycleTransition.create(
@@ -877,14 +969,21 @@ class LifecycleManager:
                     "generation": new_generation,
                 }
             )
-            self._record_transition(con, transition)
-            con.commit()
+            self._record_transition(c, transition, prefix)
+            if owns_commit:
+                c.commit()
 
         return transition
 
-    def _transition_to_blocked(self, active_plan_state: Optional[ActivePlanState] = None) -> LifecycleTransition:
-        """Transition to BLOCKED state."""
-        current_state = self.get_current_state()
+    def _transition_to_blocked(self, active_plan_state: Optional[ActivePlanState] = None,
+                               con=None, prefix: str = "") -> LifecycleTransition:
+        """Transition to BLOCKED state.
+
+        When ``con`` is supplied the mutation block joins the caller's
+        transaction (cycle ownership); when ``con`` is None it behaves as
+        before (private transaction).
+        """
+        current_state = self.get_current_state(con=con, prefix=prefix)
 
         if current_state == LifecycleState.BLOCKED:
             return LifecycleTransition.create(
@@ -898,30 +997,35 @@ class LifecycleManager:
         target_state = self._validate_transition(current_state, LifecycleAction.BLOCK)
         now = datetime.now(timezone.utc).isoformat()
 
-        with self._transaction() as con:
+        joined = con is not None
+        tx_con = con if joined else None
+        with self._transaction(tx_con) as c:
+            owns_commit = not joined
             # Idempotency: check for a duplicate BLOCK transition for the same
             # active plan. Scoping by plan_id keeps separate cycles independent.
             plan_id = active_plan_state.plan_id if active_plan_state is not None else None
             if self._is_duplicate_transition(
-                con, current_state, LifecycleState.BLOCKED, LifecycleAction.BLOCK,
-                plan_id=plan_id,
+                c, current_state, LifecycleState.BLOCKED, LifecycleAction.BLOCK,
+                plan_id=plan_id, prefix=prefix,
             ):
                 existing = self._find_transition(
-                    con, LifecycleAction.BLOCK, plan_id=plan_id,
+                    c, LifecycleAction.BLOCK, plan_id=plan_id, prefix=prefix,
                 )
                 if existing is not None:
-                    con.commit()
+                    if owns_commit:
+                        c.commit()
                     return existing
 
             # Update active plan if present
             if active_plan_state is not None:
-                con.execute(
-                    "UPDATE active_plans SET lifecycle_state = ?, updated_at = ? WHERE plan_id = ?",
+                c.execute(
+                    f"UPDATE {self._table('active_plans', prefix)} "
+                    "SET lifecycle_state = ?, updated_at = ? WHERE plan_id = ?",
                     (LifecycleState.BLOCKED.value, now, active_plan_state.plan_id)
                 )
 
             # Set global state to BLOCKED
-            self._set_state_on(con, target_state)
+            self._set_state_on(c, target_state, prefix)
 
             # Create transition
             transition = LifecycleTransition.create(
@@ -930,16 +1034,23 @@ class LifecycleManager:
                 LifecycleAction.BLOCK,
                 {"active_plan_id": active_plan_state.plan_id if active_plan_state else None}
             )
-            self._record_transition(con, transition)
-            con.commit()
+            self._record_transition(c, transition, prefix)
+            if owns_commit:
+                c.commit()
 
         return transition
 
     def _transition_to_keep_current(self, active_plan_state: ActivePlanState,
                                     adaptive_plan: AdaptiveGridPlan,
-                                    candle_index: int = 0) -> LifecycleTransition:
-        """Transition to KEEP_CURRENT_PLAN (no state change)."""
-        current_state = self.get_current_state()
+                                    candle_index: int = 0,
+                                    con=None, prefix: str = "") -> LifecycleTransition:
+        """Transition to KEEP_CURRENT_PLAN (no state change).
+
+        When ``con`` is supplied the transition record joins the caller's
+        transaction (cycle ownership); when ``con`` is None it behaves as
+        before (private transaction).
+        """
+        current_state = self.get_current_state(con=con, prefix=prefix)
 
         # Validate transition
         target_state = self._validate_transition(current_state, LifecycleAction.KEEP_CURRENT)
@@ -961,15 +1072,87 @@ class LifecycleManager:
             }
         )
 
-        with self._transaction() as con:
-            self._record_transition(con, transition)
-            con.commit()
+        joined = con is not None
+        tx_con = con if joined else None
+        with self._transaction(tx_con) as c:
+            owns_commit = not joined
+            self._record_transition(c, transition, prefix)
+            if owns_commit:
+                c.commit()
 
         return transition
 
+    def _pending_reconfig_check(self, c, active_plan_state, candidate_plan_id,
+                               current_state, prefix: str):
+        """Run the pre-transaction guards for ENTER_PENDING.
+
+        Raises ``LifecycleError`` on any violation. Uses ``prefix`` to address
+        lifecycle tables on the (possibly attached) schema.
+        """
+        # Idempotent replay: the exact same pair is still pending and the
+        # machine has not progressed past it.
+        if current_state in (
+            LifecycleState.RECONFIGURATION_PENDING,
+            LifecycleState.READY_TO_RECONFIGURE,
+        ):
+            row = c.execute(
+                f"SELECT status FROM {self._table('pending_reconfigs', prefix)} "
+                "WHERE active_plan_id = ? AND candidate_plan_id = ? LIMIT 1",
+                (active_plan_state.plan_id, candidate_plan_id)
+            ).fetchone()
+            if row is not None and row["status"] in ("PENDING", "VALIDATED"):
+                existing = self._find_transition(
+                    c, LifecycleAction.ENTER_PENDING,
+                    plan_id=active_plan_state.plan_id,
+                    candidate_plan_id=candidate_plan_id,
+                    prefix=prefix,
+                )
+                if existing is not None:
+                    return existing
+
+        # Single-use guard: any prior use of this candidate (including a
+        # terminal FINALIZED row) forbids re-entering PENDING.
+        used = c.execute(
+            f"SELECT 1 FROM {self._table('pending_reconfigs', prefix)} "
+            "WHERE candidate_plan_id = ? LIMIT 1",
+            (candidate_plan_id,)
+        ).fetchone()
+        if used is not None:
+            raise LifecycleError(
+                ValidationErrorCode.DUPLICATE_TRANSITION,
+                f"Candidate plan {candidate_plan_id} has already been used in a "
+                f"previous reconfiguration cycle; candidate plans are single-use"
+            )
+
+        # Stale / terminal candidate row: reject it.
+        cand = c.execute(
+            f"SELECT lifecycle_state, generation FROM "
+            f"{self._table('candidate_plans', prefix)} WHERE plan_id = ?",
+            (candidate_plan_id,)
+        ).fetchone()
+        if cand is not None:
+            max_gen = self._get_max_generation(c, prefix)
+            if (cand["lifecycle_state"] in (
+                LifecycleState.ACTIVE.value,
+                LifecycleState.BLOCKED.value,
+                LifecycleState.READY_TO_RECONFIGURE.value,
+            ) or cand["generation"] <= max_gen):
+                raise LifecycleError(
+                    ValidationErrorCode.DUPLICATE_TRANSITION,
+                    f"Candidate plan {candidate_plan_id} is terminal or stale "
+                    f"(lifecycle_state={cand['lifecycle_state']}, gen={cand['generation']}) "
+                    f"and cannot re-enter PENDING"
+                )
+            raise LifecycleError(
+                ValidationErrorCode.DUPLICATE_TRANSITION,
+                f"Candidate plan {candidate_plan_id} already exists in the lifecycle"
+            )
+        return None
+
     def _transition_to_pending_reconfig(self, active_plan_state: ActivePlanState,
                                         adaptive_plan: AdaptiveGridPlan,
-                                        candle_index: int = 0) -> LifecycleTransition:
+                                        candle_index: int = 0,
+                                        con=None, prefix: str = "") -> LifecycleTransition:
         """Transition to RECONFIGURATION_PENDING.
 
         Candidate plans are globally single-use:
@@ -977,98 +1160,63 @@ class LifecycleManager:
           while it is still pending replays the existing transition (idempotent).
         - A candidate that was finalized, consumed, stale-rejected, or otherwise
           terminally processed is rejected and can never re-enter PENDING.
+
+        When ``con`` is supplied the mutation block joins the caller's
+        transaction (cycle ownership); when ``con`` is None it behaves as
+        before (private transaction).
         """
         candidate_plan_id = adaptive_plan.plan_id
-        current_state = self.get_current_state()
+        current_state = self.get_current_state(con=con, prefix=prefix)
 
-        con_check = connect(self.db_path)
+        # Idempotent / guard pre-checks. When joining the cycle transaction we
+        # run them on the caller's connection; otherwise on a private one.
+        joined = con is not None
+        pre_con = con if joined else connect(self.db_path)
         try:
-            # Idempotent replay: the exact same pair is still pending and the
-            # machine has not progressed past it.
-            if current_state in (
-                LifecycleState.RECONFIGURATION_PENDING,
-                LifecycleState.READY_TO_RECONFIGURE,
-            ):
-                row = con_check.execute(
-                    "SELECT status FROM pending_reconfigs "
-                    "WHERE active_plan_id = ? AND candidate_plan_id = ? LIMIT 1",
-                    (active_plan_state.plan_id, candidate_plan_id)
-                ).fetchone()
-                if row is not None and row["status"] in ("PENDING", "VALIDATED"):
-                    existing = self._find_transition(
-                        con_check, LifecycleAction.ENTER_PENDING,
-                        plan_id=active_plan_state.plan_id,
-                        candidate_plan_id=candidate_plan_id,
-                    )
-                    if existing is not None:
-                        return existing
-
-            # Single-use guard: any prior use of this candidate (including a
-            # terminal FINALIZED row) forbids re-entering PENDING.
-            used = con_check.execute(
-                "SELECT 1 FROM pending_reconfigs WHERE candidate_plan_id = ? LIMIT 1",
-                (candidate_plan_id,)
-            ).fetchone()
-            if used is not None:
-                raise LifecycleError(
-                    ValidationErrorCode.DUPLICATE_TRANSITION,
-                    f"Candidate plan {candidate_plan_id} has already been used in a "
-                    f"previous reconfiguration cycle; candidate plans are single-use"
-                )
-
-            # Stale / terminal candidate row: reject it.
-            cand = con_check.execute(
-                "SELECT lifecycle_state, generation FROM candidate_plans WHERE plan_id = ?",
-                (candidate_plan_id,)
-            ).fetchone()
-            if cand is not None:
-                max_gen = self._get_max_generation(con_check)
-                if (cand["lifecycle_state"] in (
-                    LifecycleState.ACTIVE.value,
-                    LifecycleState.BLOCKED.value,
-                    LifecycleState.READY_TO_RECONFIGURE.value,
-                ) or cand["generation"] <= max_gen):
-                    raise LifecycleError(
-                        ValidationErrorCode.DUPLICATE_TRANSITION,
-                        f"Candidate plan {candidate_plan_id} is terminal or stale "
-                        f"(lifecycle_state={cand['lifecycle_state']}, gen={cand['generation']}) "
-                        f"and cannot re-enter PENDING"
-                    )
-                raise LifecycleError(
-                    ValidationErrorCode.DUPLICATE_TRANSITION,
-                    f"Candidate plan {candidate_plan_id} already exists in the lifecycle"
-                )
+            replay = self._pending_reconfig_check(
+                pre_con, active_plan_state, candidate_plan_id,
+                current_state, prefix,
+            )
+            if replay is not None:
+                return replay
         finally:
-            con_check.close()
+            if not joined:
+                pre_con.close()
 
         # Validate transition (fail-closed: e.g. ENTER_PENDING while PENDING is rejected)
         target_state = self._validate_transition(current_state, LifecycleAction.ENTER_PENDING)
 
         now = datetime.now(timezone.utc).isoformat()
-        new_generation = self.get_generation() + 1
+        new_generation = self.get_generation(con=con, prefix=prefix) + 1
 
         try:
-            with self._transaction() as con:
-                # Re-check inside the lock: the same pair may have been recorded
-                # between the early check and BEGIN IMMEDIATE.
-                row = con.execute(
-                    "SELECT status FROM pending_reconfigs "
+            tx_con = con if joined else None
+            with self._transaction(tx_con) as c:
+                owns_commit = not joined
+
+                # Re-check inside the lock: the same pair may have been
+                # recorded between the early check and BEGIN IMMEDIATE.
+                row = c.execute(
+                    f"SELECT status FROM {self._table('pending_reconfigs', prefix)} "
                     "WHERE active_plan_id = ? AND candidate_plan_id = ? LIMIT 1",
                     (active_plan_state.plan_id, candidate_plan_id)
                 ).fetchone()
                 if row is not None and row["status"] in ("PENDING", "VALIDATED"):
                     existing = self._find_transition(
-                        con, LifecycleAction.ENTER_PENDING,
+                        c, LifecycleAction.ENTER_PENDING,
                         plan_id=active_plan_state.plan_id,
                         candidate_plan_id=candidate_plan_id,
+                        prefix=prefix,
                     )
-                    con.commit()
+                    if owns_commit:
+                        c.commit()
                     if existing is not None:
                         return existing
 
                 # Single-use guard re-checked under the lock.
-                used = con.execute(
-                    "SELECT 1 FROM pending_reconfigs WHERE candidate_plan_id = ? LIMIT 1",
+                used = c.execute(
+                    f"SELECT 1 FROM {self._table('pending_reconfigs', prefix)} "
+                    "WHERE candidate_plan_id = ? LIMIT 1",
                     (candidate_plan_id,)
                 ).fetchone()
                 if used is not None:
@@ -1080,9 +1228,9 @@ class LifecycleManager:
                 # Insert candidate plan into candidate_plans table.
                 # Plain INSERT (not OR IGNORE): a pre-existing row must have been
                 # caught above; the PK violation here is fail-closed.
-                con.execute(
-                    """
-                    INSERT INTO candidate_plans (
+                c.execute(
+                    f"""
+                    INSERT INTO {self._table('candidate_plans', prefix)} (
                         plan_id, active_plan_id, pair, regime, candidate_lower,
                         candidate_upper, grid_step, grid_count, range_quality_score,
                         decision, reasons, generated_at_candle, generation,
@@ -1111,9 +1259,9 @@ class LifecycleManager:
                 # Insert pending reconfiguration. Plain INSERT: the UNIQUE
                 # (candidate_plan_id) database guard is the last line of defense.
                 reconfig_id = f"{active_plan_state.plan_id}_{candidate_plan_id}_{now}"
-                con.execute(
-                    """
-                    INSERT INTO pending_reconfigs (
+                c.execute(
+                    f"""
+                    INSERT INTO {self._table('pending_reconfigs', prefix)} (
                         reconfig_id, active_plan_id, candidate_plan_id,
                         from_generation, to_generation, decision, reasons,
                         created_at, expires_at, status
@@ -1134,13 +1282,14 @@ class LifecycleManager:
                 )
 
                 # Update active plan lifecycle state to RECONFIGURATION_PENDING
-                con.execute(
-                    "UPDATE active_plans SET lifecycle_state = ?, updated_at = ? WHERE plan_id = ?",
+                c.execute(
+                    f"UPDATE {self._table('active_plans', prefix)} "
+                    "SET lifecycle_state = ?, updated_at = ? WHERE plan_id = ?",
                     (LifecycleState.RECONFIGURATION_PENDING.value, now, active_plan_state.plan_id)
                 )
 
                 # Set global state
-                self._set_state_on(con, target_state)
+                self._set_state_on(c, target_state, prefix)
 
                 # Create transition
                 transition = LifecycleTransition.create(
@@ -1154,8 +1303,9 @@ class LifecycleManager:
                         "generation": new_generation,
                     }
                 )
-                self._record_transition(con, transition)
-                con.commit()
+                self._record_transition(c, transition, prefix)
+                if owns_commit:
+                    c.commit()
         except sqlite3.IntegrityError as exc:
             # Database-level single-use guard fired (concurrent race or legacy
             # conflict that slipped past the application checks).
@@ -1179,10 +1329,11 @@ class LifecycleManager:
             )
         return allowed[action]
 
-    def _record_transition(self, con, transition: LifecycleTransition) -> None:
+    def _record_transition(self, con, transition: LifecycleTransition,
+                           prefix: str = "") -> None:
         """Insert a transition record (idempotent via transition_id PK)."""
         con.execute(
-            "INSERT OR IGNORE INTO lifecycle_transitions "
+            f"INSERT OR IGNORE INTO {self._table('lifecycle_transitions', prefix)} "
             "(transition_id, from_state, to_state, action, timestamp, details, event_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
@@ -1201,7 +1352,8 @@ class LifecycleManager:
                                  action: LifecycleAction,
                                  plan_id: Optional[str] = None,
                                  candidate_plan_id: Optional[str] = None,
-                                 generation: Optional[int] = None) -> bool:
+                                 generation: Optional[int] = None,
+                                 prefix: str = "") -> bool:
         """Check whether an identical transition for the same lifecycle identity
         has already been recorded.
 
@@ -1210,7 +1362,7 @@ class LifecycleManager:
         fields transitions from different plans or reconfiguration cycles would
         incorrectly look like duplicates of one another.
         """
-        sql = ("SELECT 1 FROM lifecycle_transitions "
+        sql = (f"SELECT 1 FROM {self._table('lifecycle_transitions', prefix)} "
                "WHERE from_state = ? AND to_state = ? AND action = ?")
         params: List[Any] = [from_state.value, to_state.value, action.value]
         if plan_id is not None:
@@ -1231,11 +1383,11 @@ class LifecycleManager:
 
     def _find_transition(self, con, action: LifecycleAction,
                          plan_id: Optional[str] = None,
-                         candidate_plan_id: Optional[str] = None
-                         ) -> Optional[LifecycleTransition]:
+                         candidate_plan_id: Optional[str] = None,
+                         prefix: str = "") -> Optional[LifecycleTransition]:
         """Return the most recent recorded transition matching action + identity."""
-        sql = ("SELECT transition_id, from_state, to_state, action, timestamp, details "
-               "FROM lifecycle_transitions WHERE action = ?")
+        sql = (f"SELECT transition_id, from_state, to_state, action, timestamp, details "
+               f"FROM {self._table('lifecycle_transitions', prefix)} WHERE action = ?")
         params: List[Any] = [action.value]
         if plan_id is not None:
             # Transitions record the plan under either "plan_id" (ACTIVATE /
@@ -1259,10 +1411,11 @@ class LifecycleManager:
             details=json.loads(row["details"]),
         )
 
-    def _is_duplicate_plan(self, con, plan_id: str) -> bool:
+    def _is_duplicate_plan(self, con, plan_id: str, prefix: str = "") -> bool:
         """Check whether the plan already exists in active_plans."""
         row = con.execute(
-            "SELECT 1 FROM active_plans WHERE plan_id = ? LIMIT 1",
+            f"SELECT 1 FROM {self._table('active_plans', prefix)} "
+            "WHERE plan_id = ? LIMIT 1",
             (plan_id,)
         ).fetchone()
         return row is not None
@@ -1289,22 +1442,69 @@ class LifecycleManager:
         ).fetchone()
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, con=None, owns_commit=True):
         """Context manager for database transactions.
 
-        Provides a connection with BEGIN IMMEDIATE. Caller must call
-        con.commit() explicitly. On exception, rollback is automatic.
+        Standalone (``con is None``): opens a private connection with
+        ``BEGIN IMMEDIATE``; the caller commits explicitly. When ``con`` is
+        supplied the caller already owns an open transaction (e.g. the cycle
+        transaction), so the body runs directly on it and no commit or rollback
+        is issued here -- the outer owner commits exactly once.
         """
-        con = connect(self.db_path)
-        try:
-            con.execute("BEGIN IMMEDIATE")
+        if con is not None:
             yield con
-            # Do NOT auto-commit; caller must call con.commit() explicitly
+            return
+        own = connect(self.db_path)
+        try:
+            own.execute("BEGIN IMMEDIATE")
+            yield own
         except Exception:
-            con.rollback()
+            own.rollback()
             raise
         finally:
-            con.close()
+            own.close()
+
+    def _table(self, name: str, prefix: str) -> str:
+        """Return a schema-prefixed table name for lifecycle SQL.
+
+        ``prefix`` is ``"lifecycle."`` when the lifecycle database was attached
+        to the order-DB connection, or ``""`` when lifecycle tables live in the
+        connection's own ``main`` schema.
+        """
+        return f"{prefix}{name}"
+
+    # ------------------------------------------------------------------
+    # Transaction-join support (Patch 2D)
+    #
+    # Every read/mutation method accepts an optional ``con`` (the caller's
+    # open connection) and ``prefix`` ("lifecycle." when the lifecycle DB is
+    # attached to the order-DB connection). When ``con`` is supplied the body
+    # runs on it and no commit/close happens here -- the outer cycle owner
+    # commits exactly once. When ``con`` is None the method behaves exactly
+    # as before (private connection, own transaction).
+    # ------------------------------------------------------------------
+
+    def _run_on(self, con, prefix: str, block):
+        """Run ``block(con)`` on ``con`` when supplied, else standalone.
+
+        ``block`` receives the connection to issue SQL on. In the joined case
+        the connection is the caller's and ownership (commit/close) is left
+        with the caller. In the standalone case a private connection with
+        BEGIN IMMEDIATE is opened and closed here.
+        """
+        if con is not None:
+            return block(con)
+        own = connect(self.db_path)
+        try:
+            own.execute("BEGIN IMMEDIATE")
+            result = block(own)
+            own.commit()
+        except Exception:
+            own.rollback()
+            raise
+        finally:
+            own.close()
+        return result
 
 
 class LifecycleError(Exception):

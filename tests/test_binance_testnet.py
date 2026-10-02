@@ -129,7 +129,7 @@ def test_valid_testnet_configuration():
     cfg = _valid_config()
     assert cfg.environment == "testnet"
     assert cfg.base_url == "https://testnet.binance.vision"
-    assert cfg.rest_base_path == "https://testnet.binance.vision/api"
+    assert cfg.rest_base_path == "https://testnet.binance.vision"
 
 
 # ===========================================================================

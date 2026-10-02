@@ -172,8 +172,15 @@ _ACTIVE_FILLABLE_STATES = frozenset({"OPEN", "PARTIALLY_FILLED"})
 # Raw row loaders (read-only)
 # ---------------------------------------------------------------------------
 
-def _load_order_rows(path: str) -> list[dict[str, Any]]:
-    con = connect(path)
+def _load_order_rows(path: str, con=None) -> list[dict[str, Any]]:
+    """Load order rows; when ``con`` is supplied read from that connection.
+
+    A cycle transaction validates its post-mutation state through its own
+    connection so the reconciliation sees the uncommitted cycle results.
+    """
+    owns = con is None
+    if owns:
+        con = connect(path)
     try:
         rows = con.execute(
             "SELECT client_order_id, symbol, side, order_type, grid_index, "
@@ -183,11 +190,14 @@ def _load_order_rows(path: str) -> list[dict[str, Any]]:
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
-def _load_fill_rows(path: str) -> list[dict[str, Any]]:
-    con = connect(path)
+def _load_fill_rows(path: str, con=None) -> list[dict[str, Any]]:
+    owns = con is None
+    if owns:
+        con = connect(path)
     try:
         rows = con.execute(
             "SELECT trade_id, order_id, symbol, side, price, quantity, fee, "
@@ -196,11 +206,14 @@ def _load_fill_rows(path: str) -> list[dict[str, Any]]:
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
-def _load_reservation_rows(path: str) -> list[dict[str, Any]]:
-    con = connect(path)
+def _load_reservation_rows(path: str, con=None) -> list[dict[str, Any]]:
+    owns = con is None
+    if owns:
+        con = connect(path)
     try:
         rows = con.execute(
             "SELECT client_order_id, side, asset, original_amount, "
@@ -209,11 +222,14 @@ def _load_reservation_rows(path: str) -> list[dict[str, Any]]:
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
-def _load_account_state_row(path: str) -> dict[str, Any] | None:
-    con = connect(path)
+def _load_account_state_row(path: str, con=None) -> dict[str, Any] | None:
+    owns = con is None
+    if owns:
+        con = connect(path)
     try:
         row = con.execute(
             "SELECT base_asset, quote_asset, base_free, base_reserved, "
@@ -223,11 +239,14 @@ def _load_account_state_row(path: str) -> dict[str, Any] | None:
         ).fetchone()
         return dict(row) if row is not None else None
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
-def _load_accounting_event_rows(path: str) -> list[dict[str, Any]]:
-    con = connect(path)
+def _load_accounting_event_rows(path: str, con=None) -> list[dict[str, Any]]:
+    owns = con is None
+    if owns:
+        con = connect(path)
     try:
         rows = con.execute(
             "SELECT event_id, event_type, client_order_id, payload_json, created_at "
@@ -235,7 +254,8 @@ def _load_accounting_event_rows(path: str) -> list[dict[str, Any]]:
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
 # ---------------------------------------------------------------------------
@@ -818,7 +838,7 @@ def _validate_order_internal_consistency(
 # Top-level recovery entry point
 # ---------------------------------------------------------------------------
 
-def recover_paper_state(db_path: str) -> RecoveryResult:
+def recover_paper_state(db_path: str, con=None) -> RecoveryResult:
     """Run a full read-only recovery and reconciliation of paper state.
 
     This function never mutates the database.  It loads all persisted
@@ -827,16 +847,21 @@ def recover_paper_state(db_path: str) -> RecoveryResult:
 
     When ``result.healthy`` is ``False``, the paper engine must refuse
     all new submissions, fills, and transitions (fail-closed).
+
+    When ``con`` is supplied the rows are read through the caller's open
+    connection (cycle-transaction join) so the reconciliation sees the
+    cycle's uncommitted post-mutation state; when ``con`` is None each
+    load uses a private connection (standalone read of committed state).
     """
     errors: list[RecoveryError] = []
     warnings: list[RecoveryWarning] = []
 
     # --- Load raw rows (read-only) ---
-    order_rows = _load_order_rows(db_path)
-    fill_rows = _load_fill_rows(db_path)
-    reservation_rows = _load_reservation_rows(db_path)
-    account_row = _load_account_state_row(db_path)
-    event_rows = _load_accounting_event_rows(db_path)
+    order_rows = _load_order_rows(db_path, con=con)
+    fill_rows = _load_fill_rows(db_path, con=con)
+    reservation_rows = _load_reservation_rows(db_path, con=con)
+    account_row = _load_account_state_row(db_path, con=con)
+    event_rows = _load_accounting_event_rows(db_path, con=con)
 
     # --- Reconstruct in-memory models ---
     orders = _reconstruct_orders(order_rows, errors)

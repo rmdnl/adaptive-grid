@@ -144,6 +144,11 @@ class ActivePlan:
     # candle_index is a monotonically increasing integer (closed-candle count),
     # used for cooldown tracking without using wall-clock time.
     candle_index: int = 0
+    # generation is a monotonically increasing plan-generation counter; each
+    # distinct active-plan identity increments it, giving every plan generation
+    # its own order-identity namespace. Defaults to 0 for legacy states that
+    # predate generation tracking.
+    generation: int = 0
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
@@ -8,10 +9,10 @@ from typing import Any
 import pandas as pd
 
 try:
-    from binance_sdk_spot.spot import Spot, ConfigurationRestAPI, SPOT_REST_API_PROD_URL
+    from binance_sdk_spot.spot import Spot, ConfigurationRestAPI
     from binance_sdk_spot.rest_api.models import KlinesIntervalEnum
 except ImportError:
-    Spot = ConfigurationRestAPI = SPOT_REST_API_PROD_URL = None
+    Spot = ConfigurationRestAPI = None
     KlinesIntervalEnum = None
 
 INTERVAL_MAP = {
@@ -20,6 +21,50 @@ INTERVAL_MAP = {
     "6h":"INTERVAL_6h","8h":"INTERVAL_8h","12h":"INTERVAL_12h","1d":"INTERVAL_1d",
 }
 MAX_TICKER_AGE_SECONDS = 10
+
+
+# ---------------------------------------------------------------------------
+# Credential redaction (finding 1/6).  Central, deterministic helper shared by
+# every error path that embeds an SDK exception or a known secret.  It never
+# returns the full credential: known secrets are masked to a short
+# prefix...suffix and key/secret/signature/bearer tokens are replaced with a
+# fixed placeholder.
+# ---------------------------------------------------------------------------
+_SECRET_TOKEN_RE = re.compile(
+    r"(api[_-]?key|apikey|api[_-]?secret|secret[_-]?key|signature|hmac|access[_-]?token"
+    r"|auth(orization)?|token)\s*[:=]\s*[\"']?[A-Za-z0-9\-_./+=%]{4,}",
+    re.IGNORECASE,
+)
+_BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9\-_./+=%]+", re.IGNORECASE)
+_BEARER_REPLACEMENT = "Bearer=[redacted]"
+
+
+def _mask_secret(value: str, keep: int = 4) -> str:
+    """Return a deterministic short mask of a secret value (abcd...7890)."""
+    text = str(value)
+    if len(text) <= keep * 2:
+        return "***"
+    return f"{text[:keep]}...{text[-keep:]}"
+
+
+def redact_credentials(message: str, *, known_secrets=()) -> str:
+    """Return ``message`` with credential material removed.
+
+    - Any string in ``known_secrets`` is replaced by a short prefix...suffix
+      mask so the full value can never appear in logs, exceptions, or repr.
+    - Key/secret/signature/bearer token patterns embedded in the message are
+      replaced with a fixed placeholder.
+
+    Deterministic: the same input always yields the same output.
+    """
+    text = str(message)
+    for secret in known_secrets:
+        value = str(secret)
+        if len(value) > 4:
+            text = text.replace(value, _mask_secret(value))
+    text = _BEARER_RE.sub(_BEARER_REPLACEMENT, text)
+    text = _SECRET_TOKEN_RE.sub(r"\1=[redacted]", text)
+    return text
 
 
 class MarketDataError(RuntimeError):
@@ -133,19 +178,44 @@ class MarketQuote:
             raise MarketDataError("Quote mid price must be positive for spread")
         return self.spread / mid
 
+#: The ONLY base URL this market-data module may reach.  Testnet is the single
+#: approved endpoint; there is no live/production path in this codebase.
+_APPROVED_TESTNET_BASE = "https://testnet.binance.vision"
+_APPROVED_TESTNET_REST = "https://testnet.binance.vision"
+
+
 def _base_path(mode):
+    """Return the approved testnet REST base for a testnet mode.
+
+    Finding 7: the dormant production path was removed.  Any mode that is not
+    exactly ``"testnet"`` fails closed — it is never silently routed to a live
+    or production endpoint.  ``missing/invalid config ≠ fallback to live``.
+    """
     if mode == "testnet":
-        return "https://testnet.binance.vision/api"
-    if mode == "live":
-        return SPOT_REST_API_PROD_URL or "https://api.binance.com/api"
-    raise ValueError(f"Unknown Binance mode: {mode}")
+        return _APPROVED_TESTNET_REST
+    raise MarketDataError(
+        f"Unsupported Binance mode {mode!r}: only 'testnet' is permitted. "
+        "Live/production execution is not available in this release."
+    )
 
 def make_client(mode, api_key="", api_secret=""):
+    """Construct a read-only Binance Spot TESTNET client.
+
+    Finding 7: this is the single client-construction path.  It only ever
+    reaches the approved testnet base URL; ``_base_path`` rejects every other
+    mode, so a testnet configuration can never instantiate or reach a live
+    Binance client.  Credentials are passed to the SDK but are never emitted
+    into logs or exception text by this module.
+    """
     if Spot is None or ConfigurationRestAPI is None:
         raise RuntimeError("Install binance-sdk-spot==11.3.0")
+    base = _base_path(mode)
+    if base != _APPROVED_TESTNET_REST:
+        # Defensive: no code path should reach here; fail closed anyway.
+        raise MarketDataError("Refusing to build a client outside the approved testnet")
     cfg = ConfigurationRestAPI(
         api_key=api_key or "", api_secret=api_secret or "",
-        base_path=_base_path(mode), timeout=5000, retries=3, backoff=1000,
+        base_path=base, timeout=5000, retries=3, backoff=1000,
         keep_alive=True, compression=True,
     )
     return Spot(config_rest_api=cfg)
@@ -182,7 +252,8 @@ def fetch_ticker_price(client, symbol) -> TickerSnapshot:
         payload = _model_to_plain(response.data())
     except Exception as exc:
         raise MarketDataError(
-            f"Binance ticker price request failed for {normalized_symbol}: {exc}"
+            f"Binance ticker price request failed for {normalized_symbol}: "
+            f"{redact_credentials(str(exc))}"
         ) from exc
 
     if not isinstance(payload, dict):
@@ -272,7 +343,8 @@ def fetch_book_ticker(client, symbol) -> MarketQuote:
         payload = _model_to_plain(response.data())
     except Exception as exc:
         raise MarketDataError(
-            f"Binance book ticker request failed for {normalized_symbol}: {exc}"
+            f"Binance book ticker request failed for {normalized_symbol}: "
+            f"{redact_credentials(str(exc))}"
         ) from exc
 
     if not isinstance(payload, dict):
@@ -375,7 +447,8 @@ def fetch_account_snapshot(client, base_asset: str, quote_asset: str) -> Account
         payload = _model_to_plain(response.data())
     except Exception as exc:
         raise AccountRequestError(
-            f"Binance account information request failed for {base}/{quote}: {exc}"
+            f"Binance account information request failed for {base}/{quote}: "
+            f"{redact_credentials(str(exc))}"
         ) from exc
 
     if not isinstance(payload, dict) or not isinstance(payload.get("balances"), list):
@@ -499,7 +572,8 @@ def fetch_open_orders(client, symbol: str) -> tuple[OpenOrder, ...]:
         response = client.rest_api.get_open_orders(symbol=normalized_symbol)
     except Exception as exc:
         raise OpenOrdersRequestError(
-            f"Binance open-orders request failed for {normalized_symbol}: {exc}"
+            f"Binance open-orders request failed for {normalized_symbol}: "
+            f"{redact_credentials(str(exc))}"
         ) from exc
     try:
         payload = _model_to_plain(response.data())

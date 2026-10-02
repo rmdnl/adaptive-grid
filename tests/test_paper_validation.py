@@ -107,15 +107,24 @@ def test_validation_with_empty_candles():
 def test_existing_paper_orchestrator_still_works():
     """Ensure our validation additions don't break existing Phase 5D."""
     from paper_orchestrator import generate_cycle_id
-    
+
+    # Patch 2A: cycle identity is now (candle_index, symbol, plan_id,
+    # risk_decision) — open_order_ids removed from the identity.
     cycle_id = generate_cycle_id(
         candle_index=1000,
         symbol="BTCUSDT",
         plan_id="test_plan",
-        order_ids=("order1", "order2"),
     )
     assert isinstance(cycle_id, str)
     assert len(cycle_id) > 0
+
+    # Deterministic: same inputs → same cycle_id
+    cycle_id2 = generate_cycle_id(
+        candle_index=1000,
+        symbol="BTCUSDT",
+        plan_id="test_plan",
+    )
+    assert cycle_id == cycle_id2
 
 
 # =============================================================================
@@ -819,6 +828,7 @@ def test_scenario_ac_recovery_failure():
         quantity=Decimal("0.01"),
         time_in_force="GTC",
         grid_index=0,
+        generation=0,
         created_at=datetime.now(timezone.utc),
     )
     with pytest.raises(PaperStateUnhealthyError):
@@ -1046,7 +1056,7 @@ def test_scenario_aj_fee_accounting():
 
     buy = make_order(OrderIntent(
         "aj_b_base", "BTCUSDT", "BUY", "LIMIT",
-        Decimal("40000"), Decimal("0.1"), "GTC", 0, now,
+        Decimal("40000"), Decimal("0.1"), "GTC", 0, 0, now,
     ))
     ru = base_acc.prepare_reservation(s0, buy, now)
     fill_buy = PaperFill(
@@ -1069,7 +1079,7 @@ def test_scenario_aj_fee_accounting():
     # Complete SELL cycle to produce realized_pnl
     sell = make_order(OrderIntent(
         "aj_s_base", "BTCUSDT", "SELL", "LIMIT",
-        Decimal("41000"), Decimal("0.1"), "GTC", 0, now,
+        Decimal("41000"), Decimal("0.1"), "GTC", 0, 0, now,
     ))
     ru2 = base_acc.prepare_reservation(s1, sell, now)
     fill_sell = PaperFill(
@@ -1106,7 +1116,7 @@ def test_scenario_aj_fee_accounting():
 
     qbuy = make_order(OrderIntent(
         "aj_b_quote", "BTCUSDT", "BUY", "LIMIT",
-        Decimal("40000"), Decimal("0.1"), "GTC", 0, now,
+        Decimal("40000"), Decimal("0.1"), "GTC", 0, 0, now,
     ))
     ruq = q_acc.prepare_reservation(q0, qbuy, now)
     qfill_buy = PaperFill(
@@ -1127,7 +1137,7 @@ def test_scenario_aj_fee_accounting():
 
     qsell = make_order(OrderIntent(
         "aj_s_quote", "BTCUSDT", "SELL", "LIMIT",
-        Decimal("41000"), Decimal("0.1"), "GTC", 0, now,
+        Decimal("41000"), Decimal("0.1"), "GTC", 0, 0, now,
     ))
     ruq2 = q_acc.prepare_reservation(q1, qsell, now)
     qfill_sell = PaperFill(
@@ -1657,7 +1667,7 @@ def test_scenario_at_mid_operation_crash():
 
         # Create buy order intent
         order = OrderIntent(
-            client_order_id=make_client_order_id("AG", "BTCUSDT", 0, "BUY"),
+            client_order_id=make_client_order_id("AG", "BTCUSDT", 0, 0, "BUY"),
             symbol="BTCUSDT",
             side="BUY",
             order_type="LIMIT",
@@ -1665,6 +1675,7 @@ def test_scenario_at_mid_operation_crash():
             quantity=Decimal("0.1"),
             time_in_force="GTC",
             grid_index=0,
+            generation=0,
             created_at=datetime.now(timezone.utc),
         )
 
@@ -2188,7 +2199,7 @@ def test_scenario_aw_fee_asset_coverage():
         client_order_id="test_buy_base_fee",
         symbol="BTCUSDT", side="BUY", order_type="LIMIT",
         price=Decimal("40000.0"), quantity=Decimal("0.1"),
-        time_in_force="GTC", grid_index=0, created_at=now,
+        time_in_force="GTC", grid_index=0, generation=0, created_at=now,
     )
     buy_order = make_order(buy_intent)
     ru = accounting_base.prepare_reservation(s0, buy_order, now)
@@ -2228,7 +2239,7 @@ def test_scenario_aw_fee_asset_coverage():
         client_order_id="test_buy_quote_fee",
         symbol="BTCUSDT", side="BUY", order_type="LIMIT",
         price=Decimal("40000.0"), quantity=Decimal("0.1"),
-        time_in_force="GTC", grid_index=0, created_at=now,
+        time_in_force="GTC", grid_index=0, generation=0, created_at=now,
     )
     buy_order2 = make_order(buy_intent2)
     ru2 = accounting_quote.prepare_reservation(q0, buy_order2, now)
@@ -2266,7 +2277,7 @@ def test_scenario_aw_fee_asset_coverage():
         client_order_id="test_sell_quote_fee",
         symbol="BTCUSDT", side="SELL", order_type="LIMIT",
         price=sell_price, quantity=Decimal("0.1"),
-        time_in_force="GTC", grid_index=0, created_at=now,
+        time_in_force="GTC", grid_index=0, generation=0, created_at=now,
     )
     sell_order = make_order(sell_intent)
     ru3 = accounting_quote.prepare_reservation(s2, sell_order, now)

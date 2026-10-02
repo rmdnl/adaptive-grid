@@ -46,9 +46,9 @@ def _accounting():
     )
 
 
-def _intent(index=0, side="BUY", price="100", quantity="1"):
+def _intent(index=0, side="BUY", price="100", quantity="1", generation=0):
     return OrderIntent(
-        client_order_id=make_client_order_id("AG", "BNBUSDT", index, side),
+        client_order_id=make_client_order_id("AG", "BNBUSDT", generation, index, side),
         symbol="BNBUSDT",
         side=side,
         order_type="LIMIT_MAKER",
@@ -56,6 +56,7 @@ def _intent(index=0, side="BUY", price="100", quantity="1"):
         quantity=Decimal(quantity),
         time_in_force="GTC",
         grid_index=index,
+        generation=generation,
         created_at=NOW,
     )
 

@@ -98,20 +98,54 @@ def _decimal(value: object, field: str) -> Decimal:
     return result
 
 
-def make_client_order_id(prefix: str, symbol: str, grid_index: int, side: str) -> str:
-    """Build a stable Binance-safe grid identity without randomness."""
+def make_client_order_id(
+    prefix: str,
+    symbol: str,
+    generation: int,
+    grid_index: int,
+    side: str,
+) -> str:
+    """Build a stable, generation-aware Binance-safe grid identity.
+
+    Format: ``{prefix}-{symbol}-G{generation:05d}-{grid_index:05d}-{side[0]}``
+    e.g. ``AG-BTCUSDT-G00002-00001-B``
+
+    The ``G`` marker between symbol and grid index makes the new format
+    structurally distinct from the legacy ``{prefix}-{symbol}-{index:05d}-{side}``
+    format (which has no ``G``), so new IDs can never collide with legacy ones.
+    """
     if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9]+", prefix):
         raise OrderIntentValidationError("client-order prefix must be ASCII alphanumeric")
     if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]+", symbol):
         raise OrderIntentValidationError("symbol must be uppercase ASCII alphanumeric")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        raise OrderIntentValidationError("generation must be a non-negative integer")
     if not isinstance(grid_index, int) or isinstance(grid_index, bool) or grid_index < 0:
         raise OrderIntentValidationError("grid_index must be a non-negative integer")
     if side not in {"BUY", "SELL"}:
         raise OrderIntentValidationError("side must be BUY or SELL")
-    result = f"{prefix}-{symbol}-{grid_index:05d}-{side[0]}"
+    result = f"{prefix}-{symbol}-G{generation:05d}-{grid_index:05d}-{side[0]}"
     if not _CLIENT_ORDER_ID_RE.fullmatch(result):
         raise OrderIntentValidationError("generated client_order_id is not Binance-safe")
     return result
+
+
+def parse_generation_from_client_order_id(client_order_id: str) -> int | None:
+    """Extract the generation from a generation-aware client_order_id.
+
+    Returns ``None`` for legacy-format IDs (no ``G`` marker), which is the
+    read-only compatibility path: legacy orders are read as-is but never
+    reused by new submissions.
+    """
+    if not isinstance(client_order_id, str):
+        return None
+    m = re.fullmatch(
+        r"[A-Za-z0-9]+-[A-Z0-9]+-G(\d{1,5})-\d{5}-[BS]",
+        client_order_id,
+    )
+    if m is None:
+        return None
+    return int(m.group(1))
 
 
 @dataclass(frozen=True)
@@ -124,6 +158,7 @@ class OrderIntent:
     quantity: Decimal
     time_in_force: str
     grid_index: int
+    generation: int
     created_at: datetime
 
     def __post_init__(self) -> None:
@@ -143,6 +178,18 @@ class OrderIntent:
             )
         if not isinstance(self.grid_index, int) or isinstance(self.grid_index, bool) or self.grid_index < 0:
             raise OrderIntentValidationError("grid_index must be a non-negative integer")
+        if not isinstance(self.generation, int) or isinstance(self.generation, bool) or self.generation < 0:
+            raise OrderIntentValidationError("generation must be a non-negative integer")
+        # Invariant: generation-aware IDs (with G marker) must encode the same
+        # generation as the intent field; a mismatch is a tampered ID.
+        # Legacy IDs (no G marker) are read-only compatibility: they carry no
+        # generation marker and are treated as generation 0.
+        encoded = parse_generation_from_client_order_id(self.client_order_id)
+        if encoded is not None and encoded != self.generation:
+            raise OrderIntentValidationError(
+                f"client_order_id encodes generation {encoded} but intent "
+                f"generation is {self.generation}"
+            )
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise OrderIntentValidationError("created_at must be timezone-aware")
         object.__setattr__(self, "price", _decimal(self.price, "price"))
@@ -237,13 +284,18 @@ class PaperOrderEngine:
             if reconcile_on_init:
                 self.reconcile()
 
-    def reconcile(self) -> RecoveryResult:
+    def reconcile(self, con=None) -> RecoveryResult:
         """Run a read-only recovery and reconciliation, caching the result.
 
         When the result is unhealthy, ``submit``, ``apply_fill``, and
         ``transition`` will raise ``PaperStateUnhealthyError``.
+
+        When ``con`` is supplied (cycle-transaction join) the reconciliation
+        reads through the caller's open connection so it validates the
+        cycle's uncommitted post-mutation state; when ``con`` is None it
+        reads committed state through private connections (standalone).
         """
-        self._recovery_result = recover_paper_state(self.db_path)
+        self._recovery_result = recover_paper_state(self.db_path, con=con)
         return self._recovery_result
 
     @property
@@ -263,15 +315,23 @@ class PaperOrderEngine:
             raise ValueError("paper-order clock must return a timezone-aware datetime")
         return now
 
-    def get(self, client_order_id: str) -> PaperOrder | None:
-        row = get_order(self.db_path, client_order_id)
+    def get(self, client_order_id: str, con=None) -> PaperOrder | None:
+        row = get_order(self.db_path, client_order_id, con=con)
         if row is None:
             return None
+        # Read-only compatibility: parse generation from the persisted ID.
+        # New generation-aware IDs (with G marker) return their generation.
+        # Legacy IDs (no G marker) fall back to generation 0 so they remain
+        # readable; they are never reused by new submissions.
+        generation = parse_generation_from_client_order_id(client_order_id)
+        if generation is None:
+            generation = 0
         intent = OrderIntent(
             client_order_id=row["client_order_id"], symbol=row["symbol"], side=row["side"],
             order_type=row["order_type"], price=Decimal(row["price"]),
             quantity=Decimal(row["quantity"]), time_in_force=row["time_in_force"],
-            grid_index=int(row["grid_index"]), created_at=datetime.fromisoformat(row["created_at"]),
+            grid_index=int(row["grid_index"]), generation=generation,
+            created_at=datetime.fromisoformat(row["created_at"]),
         )
         return PaperOrder(
             intent,
@@ -286,12 +346,14 @@ class PaperOrderEngine:
         risk_decision: RiskDecision,
         lower_price: Decimal,
         effective_upper: Decimal,
+        con=None,
     ) -> PaperOrder:
         self._ensure_healthy()
         if not isinstance(intent, OrderIntent):
             raise OrderIntentValidationError("A valid OrderIntent is required")
         expected_client_order_id = make_client_order_id(
-            self.client_order_prefix, intent.symbol, intent.grid_index, intent.side
+            self.client_order_prefix, intent.symbol,
+            intent.generation, intent.grid_index, intent.side
         )
         if intent.client_order_id != expected_client_order_id:
             raise OrderIdentityMismatch(
@@ -318,7 +380,7 @@ class PaperOrderEngine:
         opened = transition_order(submitted, OrderState.OPEN, self._now())
         accounting_update = None
         if self.accounting is not None:
-            state = get_paper_account_state(self.db_path)
+            state = get_paper_account_state(self.db_path, con=con)
             if state is None:
                 raise RuntimeError("Paper account state is missing")
             state_obj = PaperOrderEngine._state_from_dict(state)
@@ -326,7 +388,7 @@ class PaperOrderEngine:
                 state_obj, opened, self._now()
             )
         save_order_submission(
-            self.db_path, planned, submitted, opened, accounting_update
+            self.db_path, planned, submitted, opened, accounting_update, con=con
         )
         return opened
 
@@ -340,12 +402,13 @@ class PaperOrderEngine:
         filled_at: datetime | None = None,
         fee_rate: Decimal | None = None,
         fee_asset: str | None = None,
+        con=None,
     ) -> PaperFillResult:
         self._ensure_healthy()
         if not isinstance(fill_id, str) or not _FILL_ID_RE.fullmatch(fill_id):
             raise PaperFillValidationError("fill_id must be non-empty and paper-safe")
 
-        order = self.get(client_order_id)
+        order = self.get(client_order_id, con=con)
         if order is None:
             raise KeyError(f"Unknown paper order: {client_order_id}")
         if symbol != order.intent.symbol:
@@ -363,7 +426,7 @@ class PaperOrderEngine:
         elif not isinstance(filled_at, datetime) or filled_at.tzinfo is None:
             raise PaperFillValidationError("filled_at must be timezone-aware")
 
-        existing_fill = get_fill(self.db_path, fill_id)
+        existing_fill = get_fill(self.db_path, fill_id, con=con)
         if existing_fill is not None:
             same_event = (
                 existing_fill["order_id"] == client_order_id
@@ -437,9 +500,9 @@ class PaperOrderEngine:
 
         accounting_update = None
         if self.accounting is not None:
-            state = get_paper_account_state(self.db_path)
+            state = get_paper_account_state(self.db_path, con=con)
             reservation = get_paper_reservation(
-                self.db_path, client_order_id
+                self.db_path, client_order_id, con=con
             )
             if state is None or reservation is None:
                 raise RuntimeError("Paper accounting state or reservation is missing")
@@ -455,10 +518,10 @@ class PaperOrderEngine:
                 fee_asset=fee_asset,
             )
         applied = save_paper_fill(
-            self.db_path, order, filled_order, fill, accounting_update
+            self.db_path, order, filled_order, fill, accounting_update, con=con
         )
         if not applied:
-            existing = get_fill(self.db_path, fill_id)
+            existing = get_fill(self.db_path, fill_id, con=con)
             if existing is None:
                 raise FillIdentityMismatch(
                     f"Fill identity {fill_id!r} exists but its event cannot be read"
@@ -476,7 +539,7 @@ class PaperOrderEngine:
                 filled_at=datetime.fromisoformat(existing["event_time"]),
             )
             return PaperFillResult(
-                order=self.get(client_order_id) or filled_order,
+                order=self.get(client_order_id, con=con) or filled_order,
                 fill=existing_fill,
                 applied=False,
                 idempotent=True,
@@ -519,9 +582,11 @@ class PaperOrderEngine:
             updated_at=reservation["updated_at"],
         )
 
-    def transition(self, client_order_id: str, target: OrderState) -> PaperOrder:
+    def transition(
+        self, client_order_id: str, target: OrderState, con=None,
+    ) -> PaperOrder:
         self._ensure_healthy()
-        order = self.get(client_order_id)
+        order = self.get(client_order_id, con=con)
         if order is None:
             raise KeyError(f"Unknown paper order: {client_order_id}")
         updated = transition_order(order, target, self._now())
@@ -530,9 +595,9 @@ class PaperOrderEngine:
             OrderState.CANCELED,
             OrderState.REJECTED,
         }:
-            reservation = get_paper_reservation(self.db_path, client_order_id)
+            reservation = get_paper_reservation(self.db_path, client_order_id, con=con)
             if reservation is not None:
-                state = get_paper_account_state(self.db_path)
+                state = get_paper_account_state(self.db_path, con=con)
                 if state is None:
                     raise RuntimeError("Paper account state is missing")
                 state_obj = PaperOrderEngine._state_from_dict(state)
@@ -549,5 +614,6 @@ class PaperOrderEngine:
             updated,
             accounting_update,
             expected_order=order,
+            con=con,
         )
         return updated

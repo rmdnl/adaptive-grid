@@ -18,6 +18,7 @@ from order_engine import (
     PaperOrderEngine,
     RiskVeto,
     make_client_order_id,
+    parse_generation_from_client_order_id,
     transition_order,
 )
 from risk_engine import RiskDecision, equity_dd_kill, open_orders_gate, profit_gate, strict_order_price_gate
@@ -33,12 +34,13 @@ from storage import (
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 
 
-def _intent(index=12, side="BUY", **changes):
+def _intent(index=12, side="BUY", generation=0, **changes):
     values = {
-        "client_order_id": make_client_order_id("AG", "BTCUSDT", index, side),
+        "client_order_id": make_client_order_id("AG", "BTCUSDT", generation, index, side),
         "symbol": "BTCUSDT", "side": side, "order_type": "LIMIT",
         "price": Decimal("100"), "quantity": Decimal("0.25"),
-        "time_in_force": "GTC", "grid_index": index, "created_at": NOW,
+        "time_in_force": "GTC", "grid_index": index, "generation": generation,
+        "created_at": NOW,
     }
     values.update(changes)
     return OrderIntent(**values)
@@ -71,12 +73,135 @@ def test_every_terminal_state_transition_is_rejected(terminal, target):
 
 
 def test_client_order_id_is_deterministic_safe_and_distinguishes_grid_and_side():
-    first = make_client_order_id("AG", "BTCUSDT", 12, "BUY")
-    assert first == make_client_order_id("AG", "BTCUSDT", 12, "BUY")
-    assert first != make_client_order_id("AG", "BTCUSDT", 13, "BUY")
-    assert first != make_client_order_id("AG", "BTCUSDT", 12, "SELL")
+    first = make_client_order_id("AG", "BTCUSDT", 0, 12, "BUY")
+    assert first == make_client_order_id("AG", "BTCUSDT", 0, 12, "BUY")
+    assert first != make_client_order_id("AG", "BTCUSDT", 0, 13, "BUY")
+    assert first != make_client_order_id("AG", "BTCUSDT", 0, 12, "SELL")
     assert re.fullmatch(r"[A-Za-z0-9_-]+", first)
     assert len(first) <= 36
+
+
+def test_client_order_id_is_distinct_across_generations():
+    gen1 = make_client_order_id("AG", "BTCUSDT", 1, 12, "BUY")
+    gen2 = make_client_order_id("AG", "BTCUSDT", 2, 12, "BUY")
+    assert gen1 != gen2
+    # Each generation produces the same ID for the same inputs
+    assert gen1 == make_client_order_id("AG", "BTCUSDT", 1, 12, "BUY")
+    assert gen2 == make_client_order_id("AG", "BTCUSDT", 2, 12, "BUY")
+    # Format check: generation-aware IDs contain the G marker
+    assert "-G" in gen1
+    assert "-G" in gen2
+    # Length constraint still holds
+    assert len(gen1) <= 36
+    assert len(gen2) <= 36
+
+
+@pytest.mark.parametrize("bad_generation", [-1, True, 1.5, "2", None])
+def test_make_client_order_id_rejects_invalid_generation(bad_generation):
+    with pytest.raises(OrderIntentValidationError, match="generation"):
+        make_client_order_id("AG", "BTCUSDT", bad_generation, 12, "BUY")
+
+
+def test_missing_generation_field_fails_closed():
+    with pytest.raises(TypeError):
+        OrderIntent(
+            client_order_id=make_client_order_id("AG", "BTCUSDT", 0, 12, "BUY"),
+            symbol="BTCUSDT", side="BUY", order_type="LIMIT",
+            price=Decimal("100"), quantity=Decimal("0.25"),
+            time_in_force="GTC", grid_index=12,
+            created_at=NOW,
+        )
+
+
+@pytest.mark.parametrize(("intent_generation", "id_generation"), [(1, 2), (2, 1)])
+def test_stale_or_tampered_generation_in_client_order_id_is_rejected(
+    intent_generation, id_generation
+):
+    # Intent generation X with an ID encoding generation Y is a tampered/stale
+    # identity and must be rejected before any submission.
+    with pytest.raises(OrderIntentValidationError, match="encodes generation"):
+        _intent(
+            generation=intent_generation,
+            client_order_id=make_client_order_id(
+                "AG", "BTCUSDT", id_generation, 12, "BUY"
+            ),
+        )
+
+
+def test_generation_2_submits_after_generation_1_is_terminal(tmp_path):
+    # Terminal orders from generation 1 must not block generation 2 with the
+    # same symbol/grid_index/side.
+    engine = _engine(tmp_path)
+    gen1 = engine.submit(
+        _intent(generation=1), RiskDecision(True), Decimal("90"), Decimal("110")
+    )
+    engine.transition(gen1.intent.client_order_id, OrderState.FILLED)
+    assert engine.get(gen1.intent.client_order_id).state is OrderState.FILLED
+
+    gen2 = engine.submit(
+        _intent(generation=2), RiskDecision(True), Decimal("90"), Decimal("110")
+    )
+    assert gen2.intent.client_order_id != gen1.intent.client_order_id
+    assert gen2.state is OrderState.OPEN
+
+
+def test_duplicate_within_same_generation_remains_blocked(tmp_path):
+    engine = _engine(tmp_path)
+    engine.submit(_intent(generation=3), RiskDecision(True), Decimal("90"), Decimal("110"))
+    with pytest.raises(DuplicateOrder):
+        engine.submit(_intent(generation=3), RiskDecision(True), Decimal("90"), Decimal("110"))
+
+
+def test_generation_replay_after_restart_is_idempotent(tmp_path):
+    engine = _engine(tmp_path)
+    original = engine.submit(
+        _intent(generation=5), RiskDecision(True), Decimal("90"), Decimal("110")
+    )
+    replayed = _engine(tmp_path).get(original.intent.client_order_id)
+    assert replayed == original
+    assert replayed.intent.client_order_id == original.intent.client_order_id
+    assert replayed.intent.generation == 5
+
+
+def test_new_format_is_never_a_legacy_id():
+    # Legacy IDs carry no G marker; the new format is structurally distinct so
+    # new submissions can never reuse historical legacy identities.
+    legacy = "AG-BTCUSDT-00012-B"
+    new = make_client_order_id("AG", "BTCUSDT", 0, 12, "BUY")
+    assert new != legacy
+    assert "-G" in new and "-G" not in legacy
+    assert parse_generation_from_client_order_id(legacy) is None
+
+
+@pytest.mark.parametrize("prefix", ["AG" * 7])
+def test_long_prefix_deterministically_rejected(prefix):
+    # 14-char prefix + 7-char symbol + 5-digit generation + 5-digit index +
+    # side exceeds the 36-char limit; rejection is deterministic, not silent.
+    with pytest.raises(OrderIntentValidationError, match="Binance-safe"):
+        make_client_order_id(prefix, "BTCUSDT", 99999, 99999, "BUY")
+
+
+def test_long_combination_within_limit_remains_valid():
+    ok = make_client_order_id("AG" * 5, "BTCUSDT", 99999, 99999, "BUY")
+    assert len(ok) <= 36
+    assert re.fullmatch(r"[A-Za-z0-9_-]{1,36}", ok)
+    assert parse_generation_from_client_order_id(ok) == 99999
+
+
+def test_parse_generation_from_client_order_id():
+    from order_engine import parse_generation_from_client_order_id
+
+    # Generation-aware IDs
+    gid = make_client_order_id("AG", "BTCUSDT", 42, 12, "BUY")
+    assert parse_generation_from_client_order_id(gid) == 42
+
+    # Legacy-format IDs (no G marker) return None
+    legacy = "AG-BTCUSDT-00012-B"
+    assert parse_generation_from_client_order_id(legacy) is None
+
+    # Malformed returns None
+    assert parse_generation_from_client_order_id("garbage") is None
+    assert parse_generation_from_client_order_id(12345) is None  # type: ignore
 
 
 @pytest.mark.parametrize("change", [
@@ -98,6 +223,7 @@ def test_submission_rejects_client_id_that_claims_wrong_grid_identity(tmp_path, 
         "quantity": original.quantity,
         "time_in_force": original.time_in_force,
         "grid_index": original.grid_index,
+        "generation": original.generation,
         "created_at": original.created_at,
     }
     values.update(change)
@@ -119,7 +245,7 @@ def test_submission_uses_configured_client_order_prefix(tmp_path):
     engine = PaperOrderEngine(
         str(tmp_path / "grid.sqlite3"), clock=lambda: NOW, client_order_prefix="PAPER"
     )
-    intent = _intent(client_order_id=make_client_order_id("PAPER", "BTCUSDT", 12, "BUY"))
+    intent = _intent(client_order_id=make_client_order_id("PAPER", "BTCUSDT", 0, 12, "BUY"))
     assert engine.submit(intent, RiskDecision(True), Decimal("90"), Decimal("110")).state is OrderState.OPEN
 
 

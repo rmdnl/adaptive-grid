@@ -318,3 +318,13 @@ def _validate_binance(cfg: dict[str, Any]) -> None:
     timeout = int(bn.get("timeout_ms", 0))
     if timeout > 30000:
         raise ConfigError("binance.timeout_ms must not exceed 30000 (30s) to avoid runaway requests")
+
+    # Optional defensive response-size guards (Patch 3).  When absent the
+    # adapter defaults apply; when present they must be positive integers.
+    for key in ("max_open_orders", "max_account_assets"):
+        if key in bn:
+            value = bn.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ConfigError(
+                    f"binance.{key}, when provided, must be an integer >= 1"
+                )

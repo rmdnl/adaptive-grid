@@ -277,6 +277,27 @@ class PaperAccountingEngine:
                     )
             base_free_after = state.base_free + base_increase
 
+            remaining_reservation = reservation.remaining_amount - gross_quote
+            if remaining_reservation < 0:
+                raise InsufficientPaperFunds(
+                    "BUY fill exceeds the original quote reservation"
+                )
+            # PATCH 5A (reservation settlement): a terminal BUY fill must not
+            # leave a live per-order reservation behind (recovery invariant
+            # RESERVATION_TERMINAL_NONZERO).  The quote that was reserved at
+            # the limit price but not spent at the (better) fill price is a
+            # surplus credit; release it back to the free quote balance so a
+            # legitimately completed order settles its reservation to zero and
+            # the post-cycle state reconciles healthy.  Partial fills keep
+            # their residual (their order is still active).
+            if order_after.state.value == "FILLED" and remaining_reservation > 0:
+                quote_free_after += remaining_reservation
+                quote_reserved_after -= remaining_reservation
+                if quote_reserved_after < 0:
+                    raise InsufficientPaperFunds(
+                        "BUY fill settlement exceeds reserved quote"
+                    )
+                remaining_reservation = Decimal("0")
             new_state = replace(
                 state,
                 base_free=base_free_after,
@@ -286,11 +307,6 @@ class PaperAccountingEngine:
                 total_fees=state.total_fees + fee_quote_value,
                 updated_at=fill.filled_at,
             )
-            remaining_reservation = reservation.remaining_amount - gross_quote
-            if remaining_reservation < 0:
-                raise InsufficientPaperFunds(
-                    "BUY fill exceeds the original quote reservation"
-                )
         elif order_before.intent.side == "SELL":
             base_reserved_after = state.base_reserved - fill.quantity
             if base_reserved_after < 0:

@@ -213,6 +213,49 @@ def _allowed_intelligence():
     )
 
 
+def _seed_lifecycle_active_plan(db, plan_id, lower, upper, grid_step, grid_count,
+                                regime="RANGE", quality="85.0", candle_index=0,
+                                generation=1):
+    """Seed the AUTHORITATIVE lifecycle active plan (FIX 4C).
+
+    main.py now reads its active plan exclusively from the lifecycle database
+    (LifecycleManager), so tests that need a pre-existing active plan must seed
+    the lifecycle ``active_plans`` / ``generations`` / ``bot_state`` tables in the
+    shared DB file rather than the legacy bot_state ``last_active_plan`` mirror.
+    This mirrors the orchestrator's lifecycle DB (same SQLite file main.py runs
+    its paper cycle against).
+    """
+    from datetime import datetime, timezone
+    from grid_lifecycle import LifecycleManager
+    import json as _json
+
+    # Ensure the lifecycle tables exist in the shared file (idempotent).
+    LifecycleManager(str(db))._ensure_tables_exist()
+    ts = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(str(db)) as con:
+        con.execute(
+            """INSERT OR REPLACE INTO active_plans (
+                plan_id, pair, candidate_lower, candidate_upper, grid_step,
+                grid_count, regime, range_quality_score, candle_index,
+                generation, lifecycle_state, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (plan_id, "BTCUSDT", str(lower), str(upper), str(grid_step),
+             int(grid_count), regime, str(quality), int(candle_index),
+             int(generation), "ACTIVE", ts, ts),
+        )
+        con.execute(
+            "INSERT OR IGNORE INTO generations "
+            "(generation, active_plan_id, created_at, status) VALUES (?,?,?,?)",
+            (int(generation), plan_id, ts, "ACTIVE"),
+        )
+        con.execute(
+            "INSERT INTO bot_state(key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("lifecycle:state", _json.dumps({"state": "ACTIVE", "timestamp": ts})),
+        )
+        con.commit()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -260,16 +303,11 @@ def test_main_planner_cooldown_blocks_orders(monkeypatch, tmp_path):
     # Seed eval index to 10 and active plan at candle_index 9
     # After main increments: eval_index = 11, elapsed = 11 - 9 = 2 < cooldown_candles(4)
     set_state(db, "adaptive_eval_index", "10")
-    set_state(db, "last_active_plan", {
-        "plan_id": "plan_cooldown_test",
-        "candidate_lower": "98",
-        "candidate_upper": "103",
-        "grid_step": "0.006",
-        "grid_count": 20,
-        "regime": "RANGE",
-        "range_quality_score": "85.0",
-        "candle_index": 9,
-    })
+    _seed_lifecycle_active_plan(
+        db, plan_id="plan_cooldown_test", lower="98", upper="103",
+        grid_step="0.006", grid_count=20, regime="RANGE",
+        quality="85.0", candle_index=9,
+    )
 
     exit_code = main.main()
     assert exit_code == 0
@@ -308,16 +346,12 @@ def test_main_planner_keep_current_plan_no_orders(monkeypatch, tmp_path):
         current_candle_index=0,
     )
     set_state(db, "adaptive_eval_index", "10")
-    set_state(db, "last_active_plan", {
-        "plan_id": "plan_keep_test",
-        "candidate_lower": str(fresh.candidate_lower),
-        "candidate_upper": str(fresh.candidate_upper),
-        "grid_step": str(fresh.grid_step),
-        "grid_count": fresh.grid_count,
-        "regime": fresh.regime.value,
-        "range_quality_score": str(fresh.range_quality_score),
-        "candle_index": 5,
-    })
+    _seed_lifecycle_active_plan(
+        db, plan_id="plan_keep_test", lower=fresh.candidate_lower,
+        upper=fresh.candidate_upper, grid_step=fresh.grid_step,
+        grid_count=fresh.grid_count, regime=fresh.regime.value,
+        quality=fresh.range_quality_score, candle_index=5,
+    )
 
     exit_code = main.main()
     assert exit_code == 0
@@ -333,11 +367,13 @@ def test_main_planner_keep_current_plan_no_orders(monkeypatch, tmp_path):
     ad = json.loads(raw_ad)
     assert ad["decision"] == "KEEP_CURRENT_PLAN"
 
-    # Active plan NOT overwritten — still has original plan_id
-    raw_active = get_state(db, "last_active_plan")
-    assert raw_active is not None
-    active = json.loads(raw_active)
-    assert active["plan_id"] == "plan_keep_test"
+    # Active plan NOT overwritten in the authoritative lifecycle DB
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT plan_id FROM active_plans WHERE lifecycle_state='ACTIVE'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "plan_keep_test"
 
 
 def test_main_planner_reconfig_no_new_orders(monkeypatch, tmp_path):
@@ -348,16 +384,11 @@ def test_main_planner_reconfig_no_new_orders(monkeypatch, tmp_path):
     # Seed active plan with very different range (triggers 2% threshold)
     # candle_index=5, eval_index=10 → elapsed=6 ≥ 4 (no cooldown)
     set_state(db, "adaptive_eval_index", "10")
-    set_state(db, "last_active_plan", {
-        "plan_id": "plan_reconfig_old",
-        "candidate_lower": "90",
-        "candidate_upper": "110",
-        "grid_step": "0.006",
-        "grid_count": 20,
-        "regime": "RANGE",
-        "range_quality_score": "85.0",
-        "candle_index": 5,
-    })
+    _seed_lifecycle_active_plan(
+        db, plan_id="plan_reconfig_old", lower="90", upper="110",
+        grid_step="0.006", grid_count=20, regime="RANGE",
+        quality="85.0", candle_index=5,
+    )
 
     exit_code = main.main()
     assert exit_code == 0
@@ -373,11 +404,13 @@ def test_main_planner_reconfig_no_new_orders(monkeypatch, tmp_path):
     ad = json.loads(raw_ad)
     assert ad["decision"] == "RECONFIGURATION_REQUIRED"
 
-    # Old active plan NOT overwritten
-    raw_active = get_state(db, "last_active_plan")
-    assert raw_active is not None
-    active = json.loads(raw_active)
-    assert active["plan_id"] == "plan_reconfig_old"
+    # Old active plan NOT overwritten in the authoritative lifecycle DB
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT plan_id FROM active_plans WHERE lifecycle_state='ACTIVE'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "plan_reconfig_old"
 
 
 def test_main_planner_exception_fallback(monkeypatch, tmp_path):

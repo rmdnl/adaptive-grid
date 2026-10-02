@@ -3,15 +3,32 @@ import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pandas as pd
 import pytest
 
 import main
 from config_loader import ConfigError, validate_config
 from market_data import AccountSnapshot, OpenOrder, TickerSnapshot
-from order_engine import OrderPriceOutOfRange, PaperOrderEngine
 from risk_engine import RiskDecision
 from storage import get_state
-from symbol_rules import OrderPlanCell, OrderPlanValidation
+
+
+def _candles_df():
+    """Real closed-candle DataFrame so the orchestrator's market-freshness
+    gate sees valid candle data (the FIX 4B path routes paper execution
+    through PaperSession.run_cycle, which validates kline_df)."""
+    now = datetime.now(timezone.utc)
+    return pd.DataFrame([
+        {
+            "open_time": now - pd.Timedelta(minutes=30),
+            "close_time": now - pd.Timedelta(minutes=15),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.01,
+            "volume": 100.0,
+        },
+    ])
 
 
 def _symbol_info():
@@ -148,7 +165,7 @@ def _install_main_stubs(monkeypatch, tmp_path, dry_run=True, open_orders=(), ris
     monkeypatch.setattr(main, "load_config", lambda: _config(tmp_path, dry_run=dry_run))
     monkeypatch.setattr(main, "make_client", lambda *args, **kwargs: object())
     monkeypatch.setattr(main, "fetch_symbol_info", lambda client, symbol: _symbol_info())
-    monkeypatch.setattr(main, "fetch_klines", lambda client, symbol, interval, limit, drop_incomplete=True: object())
+    monkeypatch.setattr(main, "fetch_klines", lambda client, symbol, interval, limit, drop_incomplete=True: _candles_df())
     monkeypatch.setattr(main, "enrich", lambda df: None)
     monkeypatch.setattr(main, "latest_valid_row", lambda df: _latest_row())
     monkeypatch.setattr(main, "fetch_ticker_price", lambda client, symbol: _ticker())
@@ -208,75 +225,157 @@ def test_repeated_main_execution_does_not_duplicate_paper_orders(monkeypatch, tm
     assert {row[0] for row in second_rows} == {row[0] for row in first_rows}
 
 
-def test_paper_order_inside_effective_range_is_accepted(tmp_path):
-    cell = OrderPlanCell(
-        index=0,
-        buy_price=Decimal("100.50"),
-        sell_price=Decimal("101.50"),
-        quantity=Decimal("0.25"),
-        gross_pct=Decimal("0.006"),
-        net_pct=Decimal("0.004"),
-        allowed=True,
-        reasons=(),
-    )
-    plan = OrderPlanValidation(
-        allowed=True,
-        reason="ORDER_PLAN_PASS",
-        cells=(cell,),
-        planned_open_orders=1,
-        min_net_pct=Decimal("0.004"),
-        effective_upper=Decimal("102.00"),
-    )
-    engine = PaperOrderEngine(str(tmp_path / "paper.sqlite3"))
+def test_main_paper_cycle_submits_open_orders(monkeypatch, tmp_path):
+    """FIX 4B: main.py routes paper execution through the orchestrator cycle.
 
-    orders = main._submit_paper_orders(
-        engine,
-        plan,
-        "BNBUSDT",
-        RiskDecision(True),
-        Decimal("100.00"),
-        "LIMIT_MAKER",
-        "AG",
-        True,
-    )
+    An allowed, in-range run must produce OPEN paper orders via
+    ``PaperSession.run_cycle`` (replacing the removed per-order
+    ``_submit_paper_orders`` helper).  Orders carry the generation-aware
+    ``AG-...`` client-order identity owned by the orchestrator.
+    """
+    _install_main_stubs(monkeypatch, tmp_path)
 
-    assert len(orders) == 2
-    assert {order.intent.side for order in orders} == {"BUY", "SELL"}
-    assert {order.state.value for order in orders} == {"OPEN"}
+    assert main.main() == 0
+
+    db_path = tmp_path / "grid.sqlite3"
+    rows = _order_rows(db_path)
+    assert rows
+    assert {row[1] for row in rows} == {"BUY", "SELL"}
+    assert {row[2] for row in rows} == {"OPEN"}
+    # Every client_order_id is generation-marked and unique (orchestrator-issued).
+    ids = [row[0] for row in rows]
+    assert len(ids) == len(set(ids))
+    assert all(cid.startswith("AG-BNBUSDT-G") for cid in ids)
+
+    # The cycle result is surfaced through persisted state.
+    state = json.loads(get_state(db_path, "last_paper_orders"))
+    assert state["success"] is True
+    assert state["orders_submitted"] == len(rows)
+    assert state["recovery_healthy"] is True
+    assert state["plan_decision"] == "GRID_ALLOWED"
+    assert state["lifecycle_transition"] == "ACTIVE"
 
 
-def test_paper_order_outside_effective_range_is_rejected(tmp_path):
-    cell = OrderPlanCell(
-        index=0,
-        buy_price=Decimal("99.00"),
-        sell_price=Decimal("101.00"),
-        quantity=Decimal("0.25"),
-        gross_pct=Decimal("0.006"),
-        net_pct=Decimal("0.004"),
-        allowed=True,
-        reasons=(),
-    )
-    plan = OrderPlanValidation(
-        allowed=True,
-        reason="ORDER_PLAN_PASS",
-        cells=(cell,),
-        planned_open_orders=1,
-        min_net_pct=Decimal("0.004"),
-        effective_upper=Decimal("101.00"),
-    )
-    engine = PaperOrderEngine(str(tmp_path / "paper.sqlite3"))
+def test_main_paper_cycle_out_of_range_submits_no_orders(monkeypatch, tmp_path):
+    """FIX 4B adversarial: an out-of-range/zero-cell plan submits ZERO orders.
 
-    with pytest.raises(OrderPriceOutOfRange):
-        main._submit_paper_orders(
-            engine,
-            plan,
-            "BNBUSDT",
-            RiskDecision(True),
-            Decimal("100.00"),
-            "LIMIT_MAKER",
-            "AG",
-            True,
-        )
+    A configured range too narrow to produce a valid grid is blocked upstream
+    by main.py's own gates (combined.allowed=False), so the orchestrator cycle
+    is never entered — no partial order set can be created.
+    """
+    _install_main_stubs(monkeypatch, tmp_path)
+    db_path = tmp_path / "grid.sqlite3"
+    # Narrow the manual range below a single grid cell → no valid grid.
+    cfg = _config(tmp_path)
+    cfg["range"]["lower_price"] = Decimal("100")
+    cfg["range"]["upper_price"] = Decimal("100.5")
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+
+    assert main.main() == 0
+
+    with sqlite3.connect(db_path) as connection:
+        orders = connection.execute("SELECT count(*) FROM orders").fetchone()[0]
+        risk = json.loads(get_state(db_path, "last_risk_decision"))
+    assert orders == 0
+    assert risk["allowed"] is False
+    assert "GRID" in risk["reason"]
+
+
+def test_main_paper_cycle_is_atomic_rollback_on_later_order_failure(monkeypatch, tmp_path):
+    """FIX 4B (F-2): a later-order failure rolls back the ENTIRE cycle.
+
+    Inject a failure into the orchestrator's order submission so the second
+    order raises.  The single cycle transaction must roll back as a whole:
+    zero orders, zero reservations, zero lifecycle mutations survive, and the
+    cycle reports a deterministic failure without leaking the exception.
+    """
+    _install_main_stubs(monkeypatch, tmp_path)
+    db_path = str(tmp_path / "grid.sqlite3")
+
+    from paper_accounting import PaperAccountingEngine
+    from paper_orchestrator import PaperSession
+
+    # Pre-build the session exactly as main.py would (same accounting + DB),
+    # then inject a failure on the 2nd submission and drive run_cycle directly.
+    symbol_info = _symbol_info()
+    from symbol_rules import parse_symbol_info as _parse_rules
+    rules = _parse_rules(symbol_info)
+    accounting = PaperAccountingEngine(
+        rules.base_asset,
+        rules.quote_asset,
+        Decimal(str(_config(tmp_path)["paper"]["initial_base_balance"])),
+        Decimal(str(_config(tmp_path)["paper"]["initial_quote_balance"])),
+        Decimal("0.001"),
+        Decimal("0.001"),
+        "USDT",
+    )
+    session = PaperSession(db_path, db_path, accounting, client_order_prefix="AG")
+    engine = session.order_engine
+
+    original_submit = engine.submit
+    calls = {"n": 0}
+
+    def spy_submit(intent, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("injected mid-cycle order failure (F-2 regression)")
+        return original_submit(intent, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "submit", spy_submit)
+
+    cfg = _config(tmp_path)
+    from market_regime import MarketRegime
+    from paper_orchestrator import PaperCycleInput
+    from storage import init_db
+    init_db(db_path)
+
+    now = datetime.now(timezone.utc)
+    df = pd.DataFrame([
+        {
+            "open_time": now - pd.Timedelta(minutes=30),
+            "close_time": now - pd.Timedelta(minutes=15),
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.01,
+            "volume": 100.0,
+        }
+    ])
+    cycle_input = PaperCycleInput(
+        candle_index=1,
+        symbol="BNBUSDT",
+        current_price=Decimal("100.01"),
+        kline_df=df,
+        lower_price=Decimal("98"),
+        upper_price=Decimal("103"),
+        active_plan=None,
+        regime=MarketRegime.RANGE,
+        range_quality_score=Decimal("100"),
+        cfg=cfg,
+        maker_fee=Decimal("0.001"),
+        taker_fee=Decimal("0.001"),
+        fee_asset="USDT",
+        risk_decision=RiskDecision(True),
+        clock=lambda: now,
+        dry_run=True,
+        rules=rules,
+    )
+
+    # The failure is contained inside the cycle (no exception escapes).
+    result = session.run_cycle(cycle_input)
+
+    # Deterministic failure; no exception leaked to the caller.
+    assert result.success is False
+    assert result.error is not None and "CYCLE_ROLLED_BACK" in result.error
+    assert calls["n"] >= 2, "expected at least two submissions before failure"
+
+    # Atomic rollback: ZERO order/lifecycle mutations survive.
+    with sqlite3.connect(db_path) as connection:
+        order_rows = connection.execute(
+            "SELECT count(*) FROM orders").fetchone()[0]
+        reservation_rows = connection.execute(
+            "SELECT count(*) FROM paper_reservations").fetchone()[0]
+    assert order_rows == 0
+    assert reservation_rows == 0
+    # Post-rollback recovery reports a healthy pre-cycle state.
+    assert session.is_healthy() is True
 
 
 def test_binance_open_order_reconciliation_remains_independent(monkeypatch, tmp_path):

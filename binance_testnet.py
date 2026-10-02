@@ -32,7 +32,7 @@ except ImportError:
 # Approved testnet endpoints (absolute, no fallback)
 # ---------------------------------------------------------------------------
 _APPROVED_TESTNET_BASE = "https://testnet.binance.vision"
-_APPROVED_TESTNET_REST = "https://testnet.binance.vision/api"
+_APPROVED_TESTNET_REST = "https://testnet.binance.vision"
 _REJECTED_PRODUCTION_BASES = frozenset({
     "https://api.binance.com",
     "https://api-gcp.binance.com",
@@ -76,19 +76,34 @@ class BinanceTestnetEnvironmentError(BinanceTestnetError):
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+#: Defensive upper bound on open orders a single response may carry.  This is
+#: a resource/response-size guard only — it must NOT replace the
+#: PaperOrchestrator / order-engine capacity guard; both layers stay active.
+DEFAULT_MAX_OPEN_ORDERS = 100
+#: Defensive upper bound on the number of account asset rows in one response.
+DEFAULT_MAX_ACCOUNT_ASSETS = 1000
+
+
 @dataclass(frozen=True)
 class BinanceTestnetConfig:
-    """Immutable adapter configuration.  Validated at construction time."""
+    """Immutable adapter configuration.  Validated at construction time.
+
+    ``api_key`` and ``api_secret`` are excluded from the auto-generated
+    ``repr()``/``str()`` via ``repr=False`` so that a config object printed
+    in a log, traceback, or assert never exposes credentials (finding 6).
+    """
 
     environment: str
     base_url: str
-    api_key: str
-    api_secret: str
+    api_key: str = field(repr=False)
+    api_secret: str = field(repr=False)
     dry_run: bool
     allow_live_execution: bool
     timeout_ms: int = 5000
     retries: int = 3
     backoff_ms: int = 1000
+    max_open_orders: int = DEFAULT_MAX_OPEN_ORDERS
+    max_account_assets: int = DEFAULT_MAX_ACCOUNT_ASSETS
 
     def __post_init__(self) -> None:
         self._validate()
@@ -115,6 +130,15 @@ class BinanceTestnetConfig:
             raise BinanceTestnetEnvironmentError(
                 f"Base URL is not the approved testnet: {self.base_url!r}"
             )
+        # Defensive response-size guards must be positive integers.
+        if not isinstance(self.max_open_orders, int) or isinstance(self.max_open_orders, bool):
+            raise BinanceTestnetConfigError("max_open_orders must be an integer")
+        if self.max_open_orders < 1:
+            raise BinanceTestnetConfigError("max_open_orders must be >= 1")
+        if not isinstance(self.max_account_assets, int) or isinstance(self.max_account_assets, bool):
+            raise BinanceTestnetConfigError("max_account_assets must be an integer")
+        if self.max_account_assets < 1:
+            raise BinanceTestnetConfigError("max_account_assets must be >= 1")
 
     # -- public helpers ------------------------------------------------------
     @property
@@ -165,6 +189,15 @@ def load_testnet_config_from_env() -> BinanceTestnetConfig:
         )
     retries = _positive_int("BINANCE_RETRIES", 3, 0)
     backoff_ms = _positive_int("BINANCE_BACKOFF_MS", 1000, 0)
+    # Defensive response-size guards (finding 4/G).  When the variables are
+    # unset the defaults apply; when set they must be positive integers and are
+    # passed through to the frozen config, which re-validates.
+    max_open_orders = _positive_int(
+        "BINANCE_MAX_OPEN_ORDERS", DEFAULT_MAX_OPEN_ORDERS, 1
+    )
+    max_account_assets = _positive_int(
+        "BINANCE_MAX_ACCOUNT_ASSETS", DEFAULT_MAX_ACCOUNT_ASSETS, 1
+    )
 
     return BinanceTestnetConfig(
         environment=_env("BINANCE_ENV"),
@@ -176,6 +209,8 @@ def load_testnet_config_from_env() -> BinanceTestnetConfig:
         timeout_ms=timeout_ms,
         retries=retries,
         backoff_ms=backoff_ms,
+        max_open_orders=max_open_orders,
+        max_account_assets=max_account_assets,
     )
 
 
@@ -270,15 +305,94 @@ def _model_to_plain(value: Any) -> Any:
     return value
 
 
-def _decimal(value: Any, field: str) -> Decimal:
+def _validate_filter_consistency(filters: dict[str, Any], symbol: str) -> None:
+    """Reject internally contradictory symbol filter configurations (finding 8/I).
+
+    For each filter family that exposes paired bounds, verify the logical
+    invariant that the lower bound does not exceed the upper bound.  A
+    contradiction (e.g. ``minPrice > maxPrice``) is impossible exchange state
+    and is rejected outright — it is never silently clamped.  Filters absent
+    from the payload are skipped so optional filters do not block a symbol.
+    """
+    def _get(ft: str, key: str) -> Decimal | None:
+        raw = filters.get(ft)
+        if not isinstance(raw, dict):
+            return None
+        value = raw.get(key)
+        if value is None:
+            return None
+        return _decimal(value, f"{ft}.{key}")
+
+    pairs = (
+        ("PRICE_FILTER", "minPrice", "maxPrice"),
+        ("LOT_SIZE", "minQty", "maxQty"),
+        ("MARKET_LOT_SIZE", "minQty", "maxQty"),
+        ("MIN_NOTIONAL", "minNotional", "maxNotional"),
+        ("NOTIONAL", "minNotional", "maxNotional"),
+    )
+    for ft, lo_key, hi_key in pairs:
+        lo = _get(ft, lo_key)
+        hi = _get(ft, hi_key)
+        if lo is not None and hi is not None and lo > hi:
+            raise BinanceTestnetValidationError(
+                f"Contradictory {ft} for {symbol}: {lo_key}={lo} > {hi_key}={hi}"
+            )
+    for ft in ("PERCENT_PRICE", "PERCENT_PRICE_BY_SIDE"):
+        raw = filters.get(ft)
+        if not isinstance(raw, dict):
+            continue
+        if ft == "PERCENT_PRICE":
+            lo = _get(ft, "multiplierDown")
+            hi = _get(ft, "multiplierUp")
+            if lo is not None and hi is not None and lo > hi:
+                raise BinanceTestnetValidationError(
+                    f"Contradictory {ft} for {symbol}: "
+                    f"multiplierDown={lo} > multiplierUp={hi}"
+                )
+        else:
+            for side in ("BID", "ASK"):
+                sub = raw.get(side)
+                if not isinstance(sub, dict):
+                    continue
+                slo = _decimal(sub["multiplierDown"], f"{ft}.{side}.multiplierDown") \
+                    if sub.get("multiplierDown") is not None else None
+                shi = _decimal(sub["multiplierUp"], f"{ft}.{side}.multiplierUp") \
+                    if sub.get("multiplierUp") is not None else None
+                if slo is not None and shi is not None and slo > shi:
+                    raise BinanceTestnetValidationError(
+                        f"Contradictory {ft} {side} for {symbol}: "
+                        f"multiplierDown={slo} > multiplierUp={shi}"
+                    )
+
+
+def _decimal(value: Any, field: str, *, finite: bool = True) -> Decimal:
+    """Parse ``value`` to a Decimal, failing closed on malformed input.
+
+    ``finite`` (default True) rejects NaN and +/-Infinity.  This is a hard
+    requirement for any value that enters a financial calculation (finding 5):
+    converting to ``Decimal`` alone does NOT reject the string forms
+    ``'NaN'`` / ``'Infinity'`` / ``'-Infinity'``, so ``is_finite()`` is
+    applied explicitly before the value is returned.
+    """
     if value is None or isinstance(value, bool):
         raise BinanceTestnetValidationError(f"{field} must be numeric, got {value!r}")
+    if isinstance(value, str):
+        # Reject infinite/NaN string forms up front so the error is
+        # deterministic and the offending literal is visible (never a secret).
+        stripped = value.strip()
+        if stripped.lower() in ("nan", "inf", "infinity", "+inf", "+infinity",
+                                "-inf", "-infinity", "infinity"):
+            raise BinanceTestnetValidationError(
+                f"{field} is not a finite number: {value!r}"
+            )
     try:
         d = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError) as exc:
         raise BinanceTestnetValidationError(
             f"{field} is not a valid Decimal: {value!r}"
         ) from exc
+    if finite and not d.is_finite():
+        raise BinanceTestnetValidationError(f"{field} must be a finite number")
     return d
 
 
@@ -392,7 +506,13 @@ class BinanceTestnetClient:
         raw_balances = payload.get("balances")
         if not isinstance(raw_balances, list):
             raise BinanceTestnetValidationError("account balances is not a list")
+        if len(raw_balances) > self._config.max_account_assets:
+            raise BinanceTestnetValidationError(
+                f"account response lists {len(raw_balances)} assets, exceeding "
+                f"the configured maximum of {self._config.max_account_assets}"
+            )
         balances: list[BinanceAccountBalance] = []
+        seen_assets: set[str] = set()
         for item in raw_balances:
             if not isinstance(item, dict):
                 raise BinanceTestnetValidationError(
@@ -403,6 +523,13 @@ class BinanceTestnetClient:
                 raise BinanceTestnetValidationError(
                     "Account balance entry has empty asset"
                 )
+            if asset in seen_assets:
+                # Finding 6: duplicate asset rows make balances ambiguous.
+                # Do NOT sum, first, last, or deduplicate — fail closed.
+                raise BinanceTestnetValidationError(
+                    f"Duplicate asset in account response: {asset}"
+                )
+            seen_assets.add(asset)
             free = _decimal(item.get("free"), f"{asset}.free")
             locked = _decimal(item.get("locked"), f"{asset}.locked")
             if not free.is_finite() or free < 0:
@@ -432,6 +559,15 @@ class BinanceTestnetClient:
             )
         if not payload:
             return ()
+        # Finding 4/G: reject an open-order response that exceeds the
+        # configured maximum instead of silently truncating or processing an
+        # unexpectedly huge payload.  This guard is in ADDITION to the
+        # PaperOrchestrator/order-engine capacity guard; both remain active.
+        if len(payload) > self._config.max_open_orders:
+            raise BinanceTestnetValidationError(
+                f"open_orders response lists {len(payload)} orders, exceeding "
+                f"the configured maximum of {self._config.max_open_orders}"
+            )
         orders: list[BinanceOpenOrderSnapshot] = []
         for raw in payload:
             orders.append(_parse_open_order(raw, normalized))
@@ -467,6 +603,9 @@ class BinanceTestnetClient:
                 raise BinanceTestnetValidationError(
                     f"Missing critical filter {critical} for {symbol}"
                 )
+        # Reject contradictory filter bounds (finding 8/I) before exposing
+        # the snapshot to downstream allocation/planning.
+        _validate_filter_consistency(filter_map, symbol)
         return BinanceSymbolSnapshot(
             symbol=str(info.get("symbol", "")).upper(),
             base_asset=str(info.get("baseAsset", "")),

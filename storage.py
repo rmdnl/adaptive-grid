@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 SCHEMA_VERSION = "3.2.1"
+
+#: Schema alias used when a cycle transaction must span two SQLite files.  The
+#: order database is opened as ``main``; the lifecycle database is attached
+#: under this name so one transaction can cover both.
+LIFECYCLE_SCHEMA = "lifecycle"
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
@@ -21,6 +28,88 @@ def connect(path):
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA foreign_keys=ON")
     return con
+
+
+def same_file(a, b) -> bool:
+    """True when two SQLite paths resolve to the same file on disk."""
+    if a is None or b is None:
+        return False
+    if str(a) == str(b):
+        return True
+    try:
+        return os.path.samefile(str(a), str(b))
+    except (FileNotFoundError, OSError):
+        return False
+
+
+@contextlib.contextmanager
+def cycle_transaction(order_db_path, lifecycle_db_path=None):
+    """Own the single transaction that spans one logical paper cycle.
+
+    The order database is opened as ``main``.  When the lifecycle database is a
+    *different* file it is attached as ``LIFECYCLE_SCHEMA`` so that one
+    ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK`` covers both.  Every
+    cycle-owned mutation is issued on the yielded connection and no lower-level
+    component commits on its own, which is what makes the cycle atomic.
+
+    Yields:
+        ``(con, lifecycle_prefix)`` -- ``con`` is the shared connection and
+        ``lifecycle_prefix`` is ``"lifecycle."`` when the lifecycle database was
+        attached, or ``""`` when both logical databases share one file.
+    """
+    con = connect(order_db_path)
+    attached = False
+    try:
+        if lifecycle_db_path is not None and not same_file(order_db_path, lifecycle_db_path):
+            con.execute(
+                "ATTACH DATABASE ? AS %s" % LIFECYCLE_SCHEMA,
+                (str(Path(lifecycle_db_path)),),
+            )
+            attached = True
+        prefix = ("%s." % LIFECYCLE_SCHEMA) if attached else ""
+        # ATTACH must happen outside a transaction; BEGIN comes after.
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            yield con, prefix
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+    finally:
+        if attached:
+            # DETACH cannot run inside a transaction; rollback above has already
+            # ended it, so this is safe on both the success and failure paths.
+            try:
+                con.execute("DETACH DATABASE %s" % LIFECYCLE_SCHEMA)
+            except sqlite3.Error:
+                pass
+        con.close()
+
+
+@contextlib.contextmanager
+def _transaction(path, con: Optional[sqlite3.Connection] = None):
+    """Join the caller's transaction, or own a standalone atomic one.
+
+    When ``con`` is supplied the caller already owns an open transaction, so
+    the body runs directly on it and no commit happens here -- the outer cycle
+    commits exactly once.  When ``con`` is ``None`` a private connection is
+    opened and wrapped in ``BEGIN IMMEDIATE``, preserving the standalone
+    atomicity that the order/fill/accounting operations already had.
+    """
+    if con is not None:
+        yield con
+        return
+    own = connect(path)
+    try:
+        own.execute("BEGIN IMMEDIATE")
+        try:
+            yield own
+        except BaseException:
+            own.rollback()
+            raise
+        own.commit()
+    finally:
+        own.close()
 
 def init_db(path):
     con=connect(path)
@@ -208,11 +297,18 @@ def _persist_order(con, order):
     )
 
 
-def save_order(path, order, accounting_update=None, expected_order=None):
-    """Insert or update one locally persisted paper order state."""
-    con=connect(path)
-    try:
+def save_order(path, order, accounting_update=None, expected_order=None, con=None):
+    """Insert or update one locally persisted paper order state.
+
+    When ``con`` is supplied, the caller owns the transaction and this function
+    must not commit on its own -- it only performs its mutations on ``con`` so
+    that they are committed or rolled back together with the rest of the cycle.
+    """
+    owns = con is None
+    if owns:
+        con=connect(path)
         con.execute("BEGIN IMMEDIATE")
+    try:
         if expected_order is not None:
             current=con.execute(
                 "SELECT status,executed_qty,remaining_qty FROM orders "
@@ -231,16 +327,24 @@ def save_order(path, order, accounting_update=None, expected_order=None):
         _persist_order(con, order)
         if accounting_update is not None:
             _apply_accounting_update(con, accounting_update)
-        con.commit()
+        if owns:
+            con.commit()
     except:
-        con.rollback()
+        if owns:
+            con.rollback()
         raise
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
-def save_order_submission(path, planned, submitted, opened, accounting_update=None):
-    """Persist one complete paper-order submission in a single transaction."""
+def save_order_submission(path, planned, submitted, opened, accounting_update=None, con=None):
+    """Persist one complete paper-order submission in a single transaction.
+
+    When ``con`` is supplied, the caller owns the transaction and this function
+    must not commit on its own -- it only performs its mutations on ``con`` so
+    that they are committed or rolled back together with the rest of the cycle.
+    """
     if (
         planned.state.value != "PLANNED"
         or submitted.state.value != "SUBMITTED"
@@ -250,9 +354,11 @@ def save_order_submission(path, planned, submitted, opened, accounting_update=No
     ):
         raise OrderSubmissionError("Invalid paper-order submission sequence")
 
-    con=connect(path)
-    try:
+    owns = con is None
+    if owns:
+        con=connect(path)
         con.execute("BEGIN IMMEDIATE")
+    try:
         existing = con.execute(
             "SELECT 1 FROM orders WHERE client_order_id=?",
             (planned.intent.client_order_id,),
@@ -266,27 +372,37 @@ def save_order_submission(path, planned, submitted, opened, accounting_update=No
         _persist_order(con, opened)
         if accounting_update is not None:
             _apply_accounting_update(con, accounting_update)
-        con.commit()
+        if owns:
+            con.commit()
     except Exception as exc:
-        con.rollback()
+        if owns:
+            con.rollback()
         if isinstance(exc, OrderSubmissionError):
             raise
         raise OrderSubmissionError(
             f"Paper-order submission failed for {planned.intent.client_order_id}"
         ) from exc
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
 class FillIdentityMismatch(RuntimeError):
     """Raised when a fill ID is reused with different fill semantics."""
 
 
-def save_paper_fill(path, old_order, new_order, fill, accounting_update=None):
-    """Atomically update one paper order and insert its fill event."""
-    con=connect(path)
-    try:
+def save_paper_fill(path, old_order, new_order, fill, accounting_update=None, con=None):
+    """Atomically update one paper order and insert its fill event.
+
+    When ``con`` is supplied, the caller owns the transaction and this function
+    must not commit on its own -- it only performs its mutations on ``con`` so
+    that they are committed or rolled back together with the rest of the cycle.
+    """
+    owns = con is None
+    if owns:
+        con=connect(path)
         con.execute("BEGIN IMMEDIATE")
+    try:
         existing = con.execute(
             "SELECT trade_id,order_id,symbol,side,price,quantity "
             "FROM fills WHERE trade_id=?",
@@ -305,7 +421,11 @@ def save_paper_fill(path, old_order, new_order, fill, accounting_update=None):
                 raise FillIdentityMismatch(
                     f"Fill identity {fill.fill_id!r} was already used with different semantics"
                 )
-            con.commit()
+            # Idempotent replay: nothing was mutated, so the caller keeps
+            # ownership of the transaction.  A standalone call still commits
+            # its (no-op) transaction so the call contract is unchanged.
+            if owns:
+                con.commit()
             return False
 
         current = con.execute(
@@ -349,18 +469,27 @@ def save_paper_fill(path, old_order, new_order, fill, accounting_update=None):
         )
         if accounting_update is not None:
             _apply_accounting_update(con, accounting_update)
-        con.commit()
+        if owns:
+            con.commit()
         return True
     except:
-        con.rollback()
+        if owns:
+            con.rollback()
         raise
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
-def get_fill(path, fill_id):
-    """Return one persisted paper-fill event, if present."""
-    con=connect(path)
+def get_fill(path, fill_id, con=None):
+    """Return one persisted paper-fill event, if present.
+
+    When ``con`` is supplied the caller owns the transaction and this function
+    reads from that connection so it sees uncommitted cycle state.
+    """
+    owns = con is None
+    if owns:
+        con=connect(path)
     try:
         row=con.execute(
             "SELECT trade_id,order_id,symbol,side,price,quantity,fee,fee_asset,event_time,"
@@ -370,7 +499,8 @@ def get_fill(path, fill_id):
         ).fetchone()
         return None if row is None else dict(row)
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
 class PaperAccountingEventMismatch(RuntimeError):
@@ -415,11 +545,17 @@ def ensure_paper_account_state(path, state):
         con.close()
 
 
-def get_paper_account_state(path):
-    """Return the current persisted paper account state."""
-    con=connect(path)
+def get_paper_account_state(path, con=None):
+    """Return the current persisted paper account state.
+
+    When ``con`` is supplied the caller owns the transaction and this function
+    reads from that connection so it sees uncommitted cycle state.
+    """
+    owns = con is None
+    if owns:
+        con = connect(path)
     try:
-        row=con.execute(
+        row = con.execute(
             "SELECT base_asset,quote_asset,base_free,base_reserved,quote_free,"
             "quote_reserved,average_cost,realized_pnl,total_fees,updated_at "
             "FROM paper_account_state WHERE id=1"
@@ -439,14 +575,21 @@ def get_paper_account_state(path):
             "updated_at": datetime.fromisoformat(row["updated_at"]),
         }
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
-def get_paper_reservation(path, client_order_id):
-    """Return one persisted paper reservation, if present."""
-    con=connect(path)
+def get_paper_reservation(path, client_order_id, con=None):
+    """Return one persisted paper reservation, if present.
+
+    When ``con`` is supplied the caller owns the transaction and this function
+    reads from that connection so it sees uncommitted cycle state.
+    """
+    owns = con is None
+    if owns:
+        con = connect(path)
     try:
-        row=con.execute(
+        row = con.execute(
             "SELECT client_order_id,side,asset,original_amount,remaining_amount,"
             "created_at,updated_at FROM paper_reservations WHERE client_order_id=?",
             (client_order_id,),
@@ -463,7 +606,8 @@ def get_paper_reservation(path, client_order_id):
             "updated_at": datetime.fromisoformat(row["updated_at"]),
         }
     finally:
-        con.close()
+        if owns:
+            con.close()
 
 
 def _apply_accounting_update(con, update):
@@ -569,9 +713,15 @@ def _apply_accounting_update(con, update):
     )
     return True
 
-def get_order(path, client_order_id):
-    """Return a persisted order row, if present; it is local state, not exchange truth."""
-    con=connect(path)
+def get_order(path, client_order_id, con=None):
+    """Return a persisted order row, if present; it is local state, not exchange truth.
+
+    When ``con`` is supplied the caller owns the transaction and this function
+    reads from that connection so it sees uncommitted cycle state.
+    """
+    owns = con is None
+    if owns:
+        con=connect(path)
     try:
         row=con.execute(
             "SELECT client_order_id,symbol,side,order_type,grid_index,price,quantity,"
@@ -580,7 +730,8 @@ def get_order(path, client_order_id):
             (client_order_id,),
         ).fetchone()
         return None if row is None else dict(row)
-    finally: con.close()
+    finally:
+        if owns: con.close()
 
 def record_equity(path,equity_quote,drawdown_pct):
     con=connect(path)

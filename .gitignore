@@ -16,3 +16,7 @@ logs/*.jsonl
 
 # CodeBuddy download artifacts — not part of the project
 .codebuddy/skills/Downloads/
+
+# Runtime / validation artifacts
+data/
+validation/__pycache__/
