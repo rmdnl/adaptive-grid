@@ -212,23 +212,59 @@ boundaries; no trading-logic changes)
 
 Commits: see "Commit hashes" below.
 
+## Milestone 4 — Roadmap H final audit (commit this milestone)
+
+Full-scope audit of the now-complete safe roadmap (F-H1, F-H2, G, E, H).
+
+- **Security / secret scan** — no hardcoded secrets in tracked files; `.env`
+  untracked; `.venv` / DB / logs / caches untracked. The only
+  credential-bearing file is `tests/test_phase8b_account_credential.py`,
+  which contains redaction fixtures, not real secrets.
+- **Configuration / default audit** — `config.yaml` defaults hold every
+  invariant: `mode=testnet`, `dry_run=true`, `allow_live_execution=false`,
+  `step_pct=0.006`, `hard_min_net_pct=0.003`,
+  `max_equity_drawdown_pct=0.02`, `range_break_buffer_pct=0.01`.
+  `main()` raises if `dry_run` is ever false.
+- **Risk-invariant audit** — verified in source: `equity_dd_kill` /
+  `range_break_kill` / `strict_order_price_gate` are all wired into the
+  combined risk decision; the kill latch is an absolute veto on new order
+  placement (`main.py` `kill_now_active` gate) and survives restart; the
+  minimum-net / step enforcement is enforced fail-closed in
+  `config_loader.py`.
+- **Test audit** — 42 test files, 990 `def test_*` functions (plus
+  parametrized cases); **1093 passed, 0 failed**.
+- **Live-execution audit** — no production path enables live trading;
+  `ExchangeEventApplier.place_order()` and the paper cycle both place no
+  live orders; no withdrawal permission anywhere.
+- **Changelog + limitations** — `CHANGES.md` (milestone history) and
+  `LIMITATIONS.md` (hard invariants, known limitations, blocked decisions,
+  definition-of-done status) added.
+
+Outcome: the safe roadmap is complete. Every remaining capability (a live
+user-data stream, live execution) is deliberately out of scope because it is
+a human-authorization decision, not an autonomous coding task.
+
 ## Commit hashes
 
 - `288349d` feat: persist equity-drawdown kill-switch reference across restarts (PATCH 1 / F-H1)
 - `1311b03` docs: add autonomous run report; correct README test-count target
 - `72bb9a4` feat: F-H2 fail-closed cancel-on-kill + explicit reference reset
 - `ef2d3a9` feat: Roadmap G operational resilience (health/shutdown/restart-recovery)
-- (this milestone) `feat: Roadmap E deterministic exchange-event applier + REST reconciliation seam`
+- `d7005fa` feat: Roadmap E deterministic exchange-event applier + REST seam
+- (this milestone) `docs: Roadmap H final audit + changelog + limitations report`
 
 ## Remaining tasks (next safe milestones, not yet started)
 
-DONE in this run: F-H2 cancel-on-kill + explicit reference reset; Roadmap G
-(health / status / graceful shutdown / restart-recovery hardening); Roadmap E
-(deterministic exchange-event applier + REST reconciliation seam + tests).
+NONE remaining on the safe roadmap. Roadmap H (final audit) is complete this
+run; every safe milestone (F-H1, F-H2, Roadmap G, Roadmap E, Roadmap H) is
+done. The only remaining work — enabling live trading or a live exchange
+event stream — requires explicit human authorization and is therefore out of
+scope for autonomous work.
 
-1. **Roadmap H final audit** — secret scan, configuration/default audit,
-   risk-invariant audit, test audit, changelog / documentation, final
-   repository audit.  (The remaining safe roadmap item.)
+1. **(Blocked on human authorization)** A live Binance user-data stream /
+   REST cancel-fetach implementation to populate the Roadmap E
+   `RestReconciler` seam.  Not built: enabling live trading is a safety
+   invariant, not a coding task, and must be explicitly authorized.
 
 ## Known limitations
 
