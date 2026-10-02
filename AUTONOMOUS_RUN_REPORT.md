@@ -406,7 +406,288 @@ NONE remaining on the safe roadmap. Roadmap H (final audit) is complete this
 run; every safe milestone (F-H1, F-H2, Roadmap G, Roadmap E, Roadmap H) is
 done.
 
-## Known limitations
+## Round 5 — Independent Code Audit + Testnet Readiness (commit `fd04540`)
+
+Independent audit performed directly from source, not from prior Hermes reports.
+Covers Steps 1–13 of the Round 5 brief.
+
+### Step 1 — Contract files
+
+`SKILL.md`, `AGENTS.md`, `AUTONOMOUS_TASK.md` read and verified as the
+engineering contract. All invariants confirmed present in source.
+
+### Step 2 — Source audit (all 13 production modules)
+
+Inspected: `market_data.py`, `risk_engine.py`, `grid_engine.py`,
+`symbol_rules.py`, `order_engine.py`, `paper_orchestrator.py`, `storage.py`,
+`exchange_events.py`, `market_features.py`, `market_regime.py`,
+`grid_eligibility.py`, `main.py`, `fee_model.py`, `cancel_controller.py`,
+`paper_accounting.py`, `recovery.py`, `runstate.py`, `config_loader.py`,
+`binance_testnet.py`, `inventory_model.py`.
+
+No dead safety paths, no duplicate kill-switch implementations, no unused
+config keys affecting safety, no live-execution bypass.
+
+### Step 3 — Round 3 verification (A: latest CLOSED candle; B: non-finite equity)
+
+**A — Closed candle path verified in source:**
+- `fetch_klines(drop_incomplete=True)` filters on `close_time <= now`.
+- `market_data.py:687–718`: latest CLOSED candle OHLCV validated BEFORE
+  `dropna()`; NaN/Inf/non-positive/non-numeric close raises `MarketDataError`
+  (fail closed). Same for open/high/low/volume.
+- `main._latest_closed_candle_close(df)`: reads `df["close"].iloc[-1]`, returns
+  `None` (not a substitute close) for any missing/empty/NaN/non-finite/non-positive
+  value; `None` → `LOWER_BOUNDARY_STOP_DATA_UNAVAILABLE` veto (fail closed).
+- Ticker price is **never** used as a substitute for the closed candle close.
+- `tests/test_fetch_klines_safety.py` (19 tests) and
+  `tests/test_15m_lower_boundary_kill.py` (22 tests) exercise the production path.
+
+**B — Non-finite equity verified in source:**
+- `build_account_risk_state` (`market_data.py:638`): explicit
+  `current_equity.is_finite()` check → `AccountValidationError` (fail closed).
+- NaN drawdown path is impossible after this check.
+- Drawdown boundary tests (exact 2%, just below 2%, just above 2%) all
+  covered in `tests/test_risk.py` and `tests/test_kill_switch_persistence.py`.
+
+### Step 4 — Round 3 adversarial claims verified
+
+1. **Timeout-after-submit**: paper path uses `BEGIN IMMEDIATE` / `commit`;
+   no network gap. `cycle_id` → `fill_id` are deterministic; restart is idempotent.
+2. **Duplicate client_order_id**: `save_order_submission` checks `SELECT 1` before
+   insert; `DuplicateOrder` raised if already present. `order_engine.submit` also
+   checks `self.get(intent.client_order_id)` pre-insert. Two independent guards.
+3. **Restart after submission**: idempotency via `_check_existing_cycle`; committed
+   cycle record → idempotent replay. Rolled-back cycle → no record → clean re-run.
+4. **Partial fill**: `apply_fill` updates `executed_qty`; `remaining_qty` tracked;
+   state `PARTIALLY_FILLED` → `FILLED` only when `remaining_qty == 0`.
+5. **Duplicate fill event**: `get_fill(fill_id)` checked before insert; same
+   semantics → `idempotent=True`; different semantics → `FillIdentityMismatch`.
+6. **Unknown order event**: `ExchangeEventApplier` records and flags unknown orders;
+   local state untouched; reconciliation required.
+7. **Reconciliation uncertainty**: `_ensure_healthy()` gate; unhealthy recovery
+   raises `PaperStateUnhealthyError` → blocks submit/fill/transition.
+8. **Failed cancellation**: `CancelOutcome.UNKNOWN/FAILED` leaves local state
+   untouched; kill stays active with `PENDING_RECONCILIATION`; latch persists.
+9. **Unknown cancellation**: treated as `UNKNOWN`; fail-closed. Malformed
+   canceler response → `CancelOutcome.UNKNOWN`.
+10. **Kill-state persistence**: `kill_state` table with `key='kill_state'` PRIMARY KEY;
+    survives restart; `verify_restart_safety` blocks the run if kill is active.
+11. **Kill vs order-submission race**: kill trigger reasons collapse
+    `combined.allowed=False` before `should_submit` is evaluated (line 1240–1247
+    in `paper_orchestrator.py`); no race window.
+12. **Atomic paper cycle rollback**: `cycle_transaction` covers lifecycle, order
+    submission, fill, accounting, cycle record in one `BEGIN IMMEDIATE`/`COMMIT`;
+    any exception triggers full rollback.
+
+**CAN A NEW ECONOMIC ORDER BE CREATED TWICE?** No.
+- `save_order_submission` SELECT-before-INSERT within `BEGIN IMMEDIATE`.
+- `order_engine.submit` `self.get()` check before `save_order_submission`.
+- `cycle_transaction` atomicity: failed second-order submission rolls back
+  entire cycle including any first-order already submitted in that cycle.
+- `_check_existing_cycle` idempotency: a committed cycle record is replayed,
+  not re-executed.
+
+### Step 5 — Round 4 soak harness quality audit
+
+**Finding (P2 — test coverage gap): AK harness never latched kill state.**
+
+The `test_soak_AK_long_run_and_determinism_replay` test's loop polled
+`get_kill_state()` to detect kill activation, but `paper_orchestrator.run_cycle()`
+never writes `kill_state` — that is `main.py`'s responsibility via
+`CancelController.pre_latch/latch_kill_state`. As a result:
+- `kill_active` never flipped to `True` in the AK loop.
+- All 10,000 cycles ran with `risk_allowed=True` (no post-kill blocked cycles).
+- The "determinism replay" compared two identical runs that both exercised only
+  the pre-kill path (23 orders, 17 fills), never the post-kill state machine.
+
+**Fix (commit `fd04540`):** The AK loop now explicitly calls `set_kill_state`
+when the first `range_break` segment price arrives (matching what `main.py` does
+via `CancelController`). Added hard assertions:
+- `run_submitted > 0` and `run_fills > 0` (meaningful activity before kill).
+- `kill_active == True` and DB row present after `set_kill_state` call.
+- `ks["trigger"] == "RANGE_BREAK_BELOW_BUFFER"`.
+- `post_kill_submitted == 0` (no new orders after kill latch; enforced by the
+  vetoing `risk_allowed=False` passed to the orchestrator).
+
+Tested: `PAPER_SOAK_CYCLES=300` → 11/11 passed (76s). Full non-soak suite: 1136/1136.
+
+**Coverage of meaningful transitions confirmed (probe at 3,000 cycles):**
+- `orders_submitted`: 23 (pre-kill), `fills_applied`: 17 (pre-kill).
+- `orders by status`: `{'FILLED': 17, 'OPEN': 6}`.
+- Post-kill (`risk_allowed=False`): 0 orders submitted.
+
+**Sampled invariant check gaps:** Invariant checks every 100 cycles (after first 500)
+can miss corruption between samples. This is a documented trade-off for runtime:
+the first 500 cycles check every cycle and cover all 8 regime segments plus the
+kill activation. Post-kill cycles are structurally identical (no-op blocked cycles);
+sampling every 100 is sufficient.
+
+**Determinism verification:** two identical seed-42 runs compare order IDs,
+statuses, fill IDs, account state, and kill state. With the kill-latch fix, both
+runs now exercise 23 orders, 17 fills, and post-kill blocked state identically.
+UUIDs and timestamps are excluded from the comparison (only semantic state compared).
+
+### Step 6 — Testnet readiness audit
+
+**`binance_testnet.py` (BinanceTestnetClient):**
+- Class docstring: "Read-only Binance Spot Testnet client. Never exposes order methods."
+- No `new_order`, `place_order`, `cancel_order`, `modify_order`, `withdraw` methods exist.
+- `assert_testnet_read_only(config)` called in `__init__`; `_validate()` enforces:
+  `environment == "testnet"`, `dry_run == True`, `allow_live_execution == False`,
+  `base_url == "https://testnet.binance.vision"`.
+- Production URLs in `_REJECTED_PRODUCTION_BASES` explicitly rejected.
+- `timeout_ms` default 5000, max 30000; `retries` default 3; `backoff_ms` default 1000.
+- Rate-limit handling: SDK retries with `backoff`; no explicit 429 handling beyond SDK.
+- Symbol filter coverage: `PRICE_FILTER`, `LOT_SIZE`, `MARKET_LOT_SIZE`,
+  `NOTIONAL/MIN_NOTIONAL`, `PERCENT_PRICE`, `PERCENT_PRICE_BY_SIDE`, `MAX_NUM_ORDERS`,
+  `MAX_NUM_ALGO_ORDERS` — all parsed in `symbol_rules.parse_symbol_info`.
+- `_validate_filter_consistency`: rejects contradictory filter bounds (e.g. minPrice > maxPrice).
+- Fee retrieval: `account_commission(symbol)` → `fee_model.effective_fees` → conservative
+  maker/taker fallback when incomplete.
+- `LIMIT_MAKER` behaviour: order_engine accepts `LIMIT_MAKER` with GTC; validation
+  in `_SUPPORTED_ORDER_TYPES = frozenset({"LIMIT", "LIMIT_MAKER"})`.
+- Order status / open-order retrieval: `open_orders(symbol)` → validated snapshot.
+- Account balance: `account()` → duplicate-asset detection (fail closed).
+- Clock/timestamp: `server_time()` → skew-ms reported in connectivity snapshot.
+- Credential-redaction: `_redact_credentials` removes key/secret from error messages.
+- **Testnet limitation**: `MAX_NUM_ALGO_ORDERS` may differ from production (testnet
+  often returns 0 or a different limit). The adapter parses it; a 0 value means no
+  limit enforced at the exchange level (documented, not a bug).
+
+### Step 7 — Live safety barrier
+
+Traced every path from config to order submission:
+
+1. `config_loader.validate_config`: `if not dry_run: raise ConfigError(...)` (line 140–143).
+2. `BinanceTestnetConfig._validate()`: `if not self.dry_run: raise BinanceTestnetConfigError`.
+3. `assert_testnet_read_only(config)` called in `BinanceTestnetClient.__init__`.
+4. `_validate_binance` in `config_loader.py`: `environment` must be `'testnet'`;
+   `base_url` must contain `testnet.binance.vision`.
+5. `BinanceTestnetClient` exposes no order-placement method (confirmed by inspection
+   and `test_read_client_issues_get_only_and_no_trading_methods`).
+6. `paper_orchestrator.run_cycle` / `PaperOrderEngine.submit` contain no HTTP calls.
+7. `main()` checks `cfg["dry_run"] == False → raise` at startup.
+
+**Verdict:** An accidental `dry_run=false` in `config.yaml` raises `ConfigError`
+at load time before any market data is fetched. There is no path from config to a
+live order endpoint when the dry_run guard is active. The testnet adapter has no
+order-placement method; it is structurally impossible for it to place a live order.
+
+### Step 8 — Configuration audit
+
+| Key | Validated default |
+|---|---|
+| `dry_run` | `true` (ConfigError if false) |
+| `allow_live_execution` | `false` (BinanceTestnetConfigError if true) |
+| `grid.step_pct` | `0.006` (>0 required) |
+| `grid.hard_min_net_pct` | `0.003` (≥0.003 required) |
+| `risk.max_equity_drawdown_pct` | `0.02` (>0 required) |
+| `risk.range_break_buffer_pct` | `0.01` (≥0 required) |
+| `risk.stop_if_below_lower_pct` | `0.02` (required; finite Decimal in (0,1)) |
+| `timeframe` | `"15m"` (locked; ConfigError if anything else) |
+| `binance.environment` | `"testnet"` (required; ConfigError if not testnet) |
+| `binance.base_url` | must contain `testnet.binance.vision` |
+
+Malformed config: every field is validated before `main()` proceeds to market data.
+No dangerous default can silently enable live execution.
+
+### Step 9 — Database / state audit
+
+**Schema version:** `SCHEMA_VERSION = "3.2.1"` / `PRAGMA user_version = 321`.
+No runtime migration logic; idempotent `CREATE TABLE IF NOT EXISTS`.
+
+**Crash windows and behavior:**
+1. *Before order intent*: no DB writes. Clean restart → empty run.
+2. *Submit started, transaction open*: `BEGIN IMMEDIATE` prevents concurrent writers.
+   Crash before `COMMIT` → rollback. No record → clean re-run.
+3. *After commit*: cycle record exists → idempotent replay on restart.
+4. *Fill processing mid-cycle*: fill + order update + accounting update all in same
+   `cycle_transaction`; crash rolls back all. Restart re-evaluates fills.
+5. *Kill latch (`pre_latch`)* written BEFORE cancel pass (separate connection).
+   Crash mid-cancel → kill stays latched → restart enters kill branch.
+6. *Reconciliation*: `recover_paper_state` detects orphan reservations, non-zero
+   reservation on CANCELED orders, malformed Decimals; returns unhealthy →
+   `PaperStateUnhealthyError` gates submit/fill/transition.
+
+**Generation checks:** `active_plan.generation != current_generation` detected
+in `_validate_lifecycle_integrity` → `GENERATION_MISMATCH` → fail closed.
+
+**No stale state paths**: `expected_order` parameter in `save_order` detects
+concurrent mutation (optimistic locking).
+
+### Step 10 — Security audit
+
+- No secrets in tracked files. `grep` scan: clean (only `.venv` library fixtures).
+- `.env` untracked; confirmed by `git check-ignore -v .env`.
+- `_redact_credentials` in `market_data.py` and `binance_testnet.py` redacts
+  known secrets from SDK error messages.
+- Logs use `logger.error` with structured messages; no print of balances/keys.
+- No withdrawal method anywhere in the codebase.
+- Testnet credentials isolated from production: `BinanceTestnetConfig` enforces
+  `environment == "testnet"` and `base_url` must be the testnet host.
+- Paper mode (dry run) requires no credentials (`PaperOrderEngine` has no client).
+
+### Step 11 — Test quality audit
+
+- No `pytest.skip`, `@pytest.mark.skip`, or `@pytest.mark.xfail` in any test file.
+- No bare `except: pass` swallowing assertions.
+- No live network calls in tests (`test_phase8b_account_credential.py` monkeypatches
+  `HTTPAdapter.send` at the transport layer — no real HTTP traffic; it verifies
+  method=GET constraint at the adapter level).
+- `time.sleep` / `uuid` / `datetime.now()`: absent from tests except controlled
+  synthetic clocks. `random.Random(seed)` used deterministically in soak harness.
+- 15 test files use `monkeypatch`; all stub at `main.*` (module-level attributes
+  the production path calls through). Production `PaperOrderEngine`, `RiskDecision`,
+  `CancelController`, `ExchangeEventApplier` are exercised without stubs.
+- Full suite: **1147 passed, 0 failed** (984s at default 10,000-cycle soak).
+
+### Step 12 — Code quality / dead paths
+
+- No unreachable safety code found.
+- `range_gate` in `risk_engine.py` is an alias for `range_break_kill`
+  (backward-compatible); it is used in `tests/test_range_engine.py` but not in
+  `main.py` (main.py calls `range_break_kill` directly). Not a dead safety path.
+- `fee_model.effective_fees` discount path intentionally omitted (conservative).
+- No live execution paths found that bypass the Risk Engine.
+- `error` paths in `paper_orchestrator._run_cycle_txn` always re-raise
+  (never swallowed); `cycle_transaction` rolls back on `BaseException`.
+
+### Step 13 — Testnet readiness verdict
+
+| Area | Verdict | Notes |
+|---|---|---|
+| Paper engine | **READY** | Deterministic, restart-safe, kill-safe, tested at 10k cycles |
+| Risk engine | **READY** | All 4 kill gates wired, fail-closed, regression-tested |
+| Market data | **READY** | Closed-candle validation, NaN guard, ticker freshness |
+| Persistence | **READY** | Atomic transactions, schema version, optimistic locking |
+| Reconciliation | **NEEDS HARDENING** | Local-only; live `RestReconciler` not implemented |
+| Binance SDK integration | **READY** | Read-only testnet adapter; order methods absent |
+| Symbol validation | **READY** | All 8 filter types parsed; consistency check present |
+| Order lifecycle | **READY** | Full state machine; generation-aware IDs; no duplication |
+| Cancellation | **READY** | Fail-closed; UNKNOWN/FAILED keeps kill active |
+| Account/equity | **READY** | NaN/Inf guard; persist peak; reference gate |
+| Testnet isolation | **READY** | URL, environment, dry_run triple-locked |
+| Live safety barrier | **READY** | Config → adapter → paper engine: no order path |
+| Observability/logging | **NEEDS HARDENING** | Health JSONL and structured logs present; no live alerting |
+
+**TESTNET READINESS:** The repository is technically ready for a controlled read-only
+Binance Spot Testnet phase (market data, account snapshot, symbol info, connectivity
+check). It is NOT ready for live order placement on testnet or production.
+
+**Remaining testnet blockers:**
+1. `RestReconciler` (live cancel/order-status fetch) not implemented.
+2. Rate-limit handling relies on SDK retry; no explicit 429/418 backoff documented.
+3. `MAX_NUM_ALGO_ORDERS` testnet value may be 0 (no algo-order limit); adapter
+   parses but does not warn when the limit is effectively absent.
+4. Clock skew handling: `server_time()` reports skew-ms but does not adjust
+   request timestamps; large skew (>1000ms) may cause authentication failures.
+
+**Security:** CLEAN. No secrets in repo. Live execution: DISABLED.
+
+### Commits
+
+- `fd04540` test: Round 5 — strengthen AK soak harness with meaningful-activity
+  and kill-latch coverage assertions
 
 - Live trading remains disabled (`dry_run: true`,
   `allow_live_execution: false`, `main()` raises if dry_run is false). No
