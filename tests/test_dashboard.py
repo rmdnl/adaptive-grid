@@ -178,8 +178,10 @@ def test_root_html(server):
     assert "LIVE DISABLED" in html
     assert "KILL SWITCH OFF" in html
     # per-cycle grid/market state renders even when every cycle is BLOCKED
-    assert "GRID_BLOCKED" in html
-    assert "NET_PROFIT_BELOW_HARD_MIN" in html
+    # machine codes are now human-readable: "Blocked" instead of "GRID_BLOCKED"
+    assert "Blocked" in html
+    # machine codes translated to human: "Net profit per grid below the 0.30% minimum"
+    assert "Net profit per grid below the 0.30% minimum" in html
     assert "765.88" in html            # current price from last_price
     assert "765.23" in html            # lower from last_range
     assert "MARKET FILTERED" in html   # human-friendly market badge
@@ -208,8 +210,7 @@ def test_tabbed_layout_and_penting_filter(server):
     assert 'id="penting-toggle"' in html
     assert "penting-only" in html            # CSS rule that hides details
     assert "localStorage" in html            # remembers the user's choice
-    # detail lines / blocks are tagged so the "penting saja" filter hides them
-    assert "class='kvcode detail'" in html   # raw machine-code sub-lines
+    # detail blocks are tagged so the "penting saja" filter hides them
     assert "detail-block" in html            # detail section headings
     # the CSS/JS chrome must not leak any credential material
     for secret in ("api_key", "api_secret", "BINANCE_API_KEY",

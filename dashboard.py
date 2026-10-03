@@ -452,10 +452,9 @@ _STATUS = {
 }
 
 
-def _kvline(human: str, raw: str) -> str:
-    """A human line plus a muted raw-code line (hidden in 'penting saja')."""
-    return (f"<div class='kvline'>{_esc(human)}</div>"
-            f"<div class='kvcode detail'>{_esc(raw)}</div>")
+def _kvline(human: str) -> str:
+    """A human line (no raw code)."""
+    return f"<div class='kvline'>{_esc(human)}</div>"
 
 
 def _human_code(code: str) -> str:
@@ -483,9 +482,7 @@ def _human_reasons(raw: Any) -> str:
       * "PREFIX:GRID_BLOCKED:CODE1|CODE2"
 
     Each '|' / ',' separated reason becomes one human line (the leaf code,
-    the last ':' segment, translated).  The exact raw string is kept in a
-    small muted line beneath — hidden in "penting saja" mode but still in the
-    DOM and always in the JSON API.  No data is invented or altered.
+    the last ':' segment, translated).  No raw code is shown.
     """
     if raw is None:
         return "N/A"
@@ -501,7 +498,6 @@ def _human_reasons(raw: Any) -> str:
         lines.append(f"<div class='kvline'>{_esc(_human_code(leaf))}</div>")
     if not lines:
         return _esc(_fmt(text))
-    lines.append(f"<div class='kvcode detail'>{_esc(text)}</div>")
     return "".join(lines)
 
 
@@ -529,11 +525,11 @@ def _human(value: Any) -> str:
     # Known machine values: show the human word, with the raw code kept in a
     # muted sub-line (consistent with reason lists; hidden in "penting saja").
     if text in _REGIME:
-        return _kvline(_REGIME[text], text)
+        return _kvline(_REGIME[text])
     if text in _STATUS:
-        return _kvline(_STATUS[text], text)
+        return _kvline(_STATUS[text])
     if text in _REASONS:
-        return _kvline(_REASONS[text], text)
+        return _kvline(_REASONS[text])
     # Reason-looking values: module prefix (e.g. "RANGE:...", "GRID:...") or
     # any machine-code list (contains '|' / comma-joined UPPER_SNAKE codes).
     prefix = text.split(":", 1)[0].upper() if ":" in text else ""
@@ -872,8 +868,8 @@ def render_html(snap: dict[str, Any]) -> str:
 {card("Realized PnL", account.get("realized_pnl"), "after fees")}
 {card("Total fees", account.get("total_fees"))}
 {card("Open orders", len(open_orders))}
-{card("Harga terakhir", grid_detail.get("current_price"),
-      f"{env.get('symbol')} &middot; range {_fmt(grid_detail.get('lower_price'))} &ndash; {_fmt(grid_detail.get('upper_price'))}")}
+{card("Harga terakhir", grid_detail.get("current_price"))}
+    {card("Range", f"{_fmt(grid_detail.get('lower_price'))} &ndash; {_fmt(grid_detail.get('upper_price'))}")}
 </div>
 
 <div class="toolbar">
