@@ -879,6 +879,90 @@ python scripts/testnet_order_path_check.py --verify-cid AGTV-BNBUSDT-...
 
 ---
 
+# 🧭 Phase 8: Bounded Continuous Testnet Cycle
+
+**Purpose:** Repeat the verified Round 7 order path as a *bounded,
+controlled cycle* — market data → indicators → range → grid → risk veto →
+order intents → LIMIT_MAKER placement (testnet only) → authoritative
+reconciliation → verified cancellation → cleanup proof.
+
+**This is NOT live trading and NOT a 24/7 loop.**  Cycles are bounded
+(1–100 per run), each cycle ends flat (verified cancel of still-open
+orders), and the production `main()` cycle remains paper-only.
+
+## What was added
+
+- **`testnet_cycle.py`** — `TestnetCycleRunner` + `CycleLedger`:
+  - Reuses the EXACT production math read-only (`indicators`, `auto_range`,
+    `build_geometric_grid`, `validate_quantized_order_plan`) and the EXACT
+    `risk_engine` gates: range-break kill (±1%), 15m candle-close
+    lower-boundary kill, 2% equity-drawdown kill against a persisted
+    high-water reference, market filter (ADX/ATR/BB/volume), open-order
+    capacity, per-cell minimum net profit (0.30%), and the strict
+    price-inside-range gate.  The Risk Engine remains the authoritative
+    veto — nothing is re-implemented or bypassed.
+  - Separate SQLite ledger (`data/testnet_cycle.sqlite3`, user_version 800;
+    the paper DB is never touched or migrated): runs, orders (state machine
+    `INTENT → SUBMITTED_UNKNOWN → OPEN/PARTIALLY_FILLED →
+    FILLED/CANCELED/REJECTED`, plus `PENDING_RECONCILIATION`), an event
+    journal (full observability), the persistent kill latch, and the
+    reference-equity high-water mark.
+  - Restart recovery: a fresh process reconciles every non-terminal ledger
+    order against the exchange BEFORE new cycles; anything unresolvable
+    stays `PENDING_RECONCILIATION` and blocks placement (fail closed).
+  - Kill path: latch persists FIRST, then fail-closed cancel-on-kill;
+    restart enters the kill branch (no new orders, recovery/cleanup only).
+  - Deterministic clientOrderIds (`AGTC-<SYMBOL>-<run>-<cycle>-<seq>`,
+    never reused); lost submission acks are resolved by clientOrderId and
+    never resubmitted; ambiguous cancels settle only via authoritative
+    re-query (§5).
+  - Cleanup proof: reconcile → cancel only confirmed-open own orders →
+    re-resolve → PROVE zero own open orders and zero non-terminal ledger
+    orders; anything unprovable FAILS with the exact ids.  Foreign orders
+    (other namespaces) are never touched; their presence refuses placement.
+- **`scripts/testnet_cycle_check.py`** — gated CLI:
+  - `--mode rehearsal` (default): full cycle, zero writes.
+  - `--mode orders`: requires `TESTNET_ORDERS_ENABLED=true`; bounded cycles
+    with real testnet LIMIT_MAKER orders (per-order quote size from config,
+    default 25 USDT), each cycle ends flat.
+  - `--cleanup-only`, `--status`; SIGINT/SIGTERM stop at safe boundaries;
+    exit 0 only when the run completed AND cleanup proved zero open orders.
+
+## Verified on Binance Spot Testnet (2026-10-03)
+
+```text
+rehearsal cycle (BNBUSDT, read-only)      PASS  (range veto recorded, exit 0)
+orders cycle (SOLUSDT, 2 cycles)          PASS  (4 real orders placed, all
+                                                canceled verified, cleanup ok)
+restart run (fresh process, same ledger)  PASS  (recovered, 2 more orders,
+                                                cleanup ok)
+cleanup-only proof                        PASS  (0 own open orders, 0 unresolved)
+symbol probes                             ETH/BTC vetoed (width/quality),
+                                                DOGE vetoed (volume) — gates
+                                                authoritative on live data
+```
+
+## Operator commands
+
+```bash
+# Read-only rehearsal (no gate needed, no orders).
+python scripts/testnet_cycle_check.py --mode rehearsal --cycles 2
+
+# Bounded orders cycle (requires TESTNET_ORDERS_ENABLED=true).
+TESTNET_ORDERS_ENABLED=true python scripts/testnet_cycle_check.py \
+    --mode orders --symbol SOLUSDT --cycles 2 --interval 5
+
+# End-of-run cleanup proof / status.
+TESTNET_ORDERS_ENABLED=true python scripts/testnet_cycle_check.py \
+    --mode orders --cleanup-only
+python scripts/testnet_cycle_check.py --status
+```
+
+Live trading remains disabled.  `DRY_RUN=true`, `ALLOW_LIVE_EXECUTION=false`,
+`main()` paper-only — unchanged.
+
+---
+
 # 🗂️ Struktur project
 
 ```text

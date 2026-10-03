@@ -73,14 +73,24 @@
    when `dry_run=false`); wiring real orders into the trading cycle is a
    future, separately-authorized task. There is still no user-data
    websocket; event reconciliation against a live stream remains a seam.
-3. **`open_orders` reconciliation is advisory.** `open_orders_available_gate`
-   blocks the plan whenever open-order state cannot be VERIFIED (UNKNOWN
-   status). The F-H2 cancel path reconciles LOCAL paper-order + reservation
-   state; the Round 7 exchange-side cancel executor is available to the
-   testnet phase but is not yet wired into the paper kill path.
+3. **`open_orders` reconciliation is advisory for the paper path.**
+   `open_orders_available_gate` blocks the plan whenever open-order state
+   cannot be VERIFIED (UNKNOWN status). The F-H2 cancel path reconciles
+   LOCAL paper-order + reservation state.  The Round 7/8 exchange-side
+   reconciler + cancel executor are wired into the bounded TESTNET cycle
+   harness (`testnet_cycle.py`), which reconciles every order against the
+   exchange and proves zero open orders at cleanup; the paper kill path is
+   unchanged.
 4. **The kill-state release and reference-reset commands are paper-only** and
    refuse to run when the config is not explicitly `dry_run=true` with
-   `allow_live_execution=false`.
+   `allow_live_execution=false`.  The cycle harness has its OWN persistent
+   kill latch (`cycle_kill_state` in the cycle ledger; identical semantics —
+   2% drawdown, range-break, 15m lower-boundary — via the same risk_engine
+   gates).  There is deliberately NO automatic reset and currently NO
+   dedicated release command for the cycle latch: releasing it requires an
+   explicit, auditable operator action on the ledger DB.  A release command
+   mirroring `scripts/release_kill_state.py` (reason + actor + audit row) is
+   the obvious future increment.
 5. **No guaranteed profitability.** Grid trading has real market risk
    (trend, extreme volatility, slippage, fee changes, partial fills, API
    failures, inventory stuck). No formula in this repository removes market

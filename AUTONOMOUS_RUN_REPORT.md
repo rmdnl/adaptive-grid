@@ -820,3 +820,166 @@ that was cleaned up by the script's best-effort cancel pass (final state:
   (state machine exists; `main()` remains paper-only by invariant).
 - User-data websocket event stream (Roadmap E seam is ready for it).
 - Live trading enablement (explicit human sign-off required).
+
+---
+
+# Round 8 — Continuous TESTNET cycle hardening (2026-10-03)
+
+## Audit before coding (what Round 7 left open)
+
+Round 7 delivered a verified *one-shot* order path (place → resolve →
+reconcile → cancel → cleanup inside a single script run).  Missing for a
+controlled *continuous* cycle:
+
+1. No cycle loop: no repeated market-data → range/grid → risk → order →
+   reconcile → cleanup stages.
+2. No persistent cycle ledger: a restart mid-run leaves no durable local
+   record of placed orders/cids beyond the exchange itself.
+3. No kill latch for the cycle path (the paper kill_state lives in the paper
+   DB and is bound to the paper engine).
+4. No end-of-run cleanup PROOF (zero unintended open orders) or
+   foreign-order handling (orders on the account outside our namespace).
+5. No graceful-shutdown integration for the cycle loop.
+6. No restart recovery pass that reconciles non-terminal orders from prior
+   runs before new cycles.
+
+## Implementation plan (written before coding)
+
+New module `testnet_cycle.py` — touches NO production path (main.py,
+config.yaml, paper DB, PaperOrderEngine stay untouched):
+
+- `TestnetCycleConfig` (frozen, validated fail-closed): symbol, bounded
+  max_cycles (1..100), poll interval, per-cycle order cap, per-order quote
+  size, ledger path; strategy/risk parameters sourced ONLY from the
+  validated `config_loader.load_config()` dict (step 0.006, hard_min 0.003,
+  min_cells 6, drawdown 2%, range-break buffer 1%, 15m lower-boundary stop
+  2%, market filter) — single source of truth, no re-declared constants.
+- `CycleLedger` (separate SQLite file, `data/testnet_cycle.sqlite3`,
+  gitignored; PRAGMA user_version 800; no migration of any existing DB):
+  `cycle_runs`, `cycle_orders` (cid PK, state machine INTENT →
+  SUBMITTED_UNKNOWN → OPEN/PARTIALLY_FILLED → FILLED/CANCELED/REJECTED,
+  plus PENDING_RECONCILIATION), `cycle_events` (observability journal),
+  `cycle_kill_state` (persistent latch), `cycle_bot_state` (reference
+  equity high-water mark).
+- `TestnetCycleRunner`:
+  - REUSES the production grid/risk math read-only: `fetch_klines` +
+    `indicators.enrich` + `auto_range` + `build_geometric_grid` +
+    `validate_quantized_order_plan` (min-net + filters enforced) and the
+    EXACT `risk_engine` gates (`range_break_kill`,
+    `lower_boundary_15m_kill`, `equity_dd_kill` vs persisted HWM,
+    `equity_reference_gate`, `market_gate`, `open_orders_gate`,
+    `profit gate`, `strict_order_price_gate`).  No re-implemented risk
+    logic; the Risk Engine stays the authoritative veto.
+  - `preflight`: clock-skew sync (fail closed beyond bound), symbol rules,
+    foreign-open-order refusal (fail-closed before any placement), kill
+    check.
+  - `run_cycle`: gates → intents (lowest allowed BUY cells INSIDE the
+    effective range, quantity re-checked against free quote balance) →
+    placement (deterministic cid `AGTC-...`, never reused) →
+    per-order settlement (ack / deterministic rejection / UNKNOWN resolved
+    by clientOrderId — never resubmitted) → reconciliation pass (authoritative
+    snapshot corrects local state; fills from executedQty) → cycle-end
+    verified cancellation of still-open orders.
+  - `recover()`: startup reconciliation of non-terminal ledger orders from
+    prior runs; unresolvable → PENDING_RECONCILIATION and placement stays
+    blocked (fail closed).
+  - `cleanup()`: reconcile → cancel only confirmed-open own orders →
+    re-resolve → prove zero own open orders and zero non-terminal ledger
+    orders; anything unprovable → FAIL with exact ids.  Foreign orders are
+    never touched and reported.
+  - Kill path: latch FIRST (persisted, survives restart), then fail-closed
+    cancel-on-kill; no new orders while latched; restart enters kill branch.
+  - ShutdownCoordinator consulted at cycle boundaries (graceful stop;
+    cleanup always runs).
+- `scripts/testnet_cycle_check.py`: gated CLI (`--mode rehearsal|orders`,
+  orders requires `TESTNET_ORDERS_ENABLED=true`; `--cleanup-only`,
+  `--status`), bounded cycles, JSON/human output.
+- `tests/test_testnet_cycle.py`: deterministic fake-exchange tests covering
+  the 25 required scenarios (reusing Round 7 executor-contract tests where
+  they already cover cancellation timeout / connection failure / lost
+  submission ACK / duplicate-cid semantics at the client level).
+
+Safety boundary: `DRY_RUN=true`, `ALLOW_LIVE_EXECUTION=false`,
+`main()` paper-only, `TESTNET_ORDERS_ENABLED` default false — unchanged.
+
+## Results
+
+(appended after implementation and verification)
+
+## Results (Round 8)
+
+### Deterministic tests
+
+`tests/test_testnet_cycle.py` — 39 deterministic fake-exchange tests over
+the REAL production math (calibrated candle fixture: ADX 23.3, ATR 1.8%,
+BB 5.0%, range approved q≈83, 8-cell grid, net 0.352%/cell) covering all
+25 required scenarios:
+
+fresh start; existing open orders (own → recovered, foreign → placement
+refused); restart while orders open / after confirmed fill / with UNKNOWN
+state / while kill latched; kill during active cycle (latch + cancel-on-kill
+persisted); cancellation timeout (lost ack settled by authoritative
+re-query) and connection failure (order stays unresolved, never claimed
+canceled); lost submission ack (resolved by clientOrderId, exactly one
+POST, never resubmitted); duplicate order prevention (ledger-level cid
+refusal + exchange -2010 handling); stale local state corrected from the
+authoritative snapshot (CANCELED and FILLED corrections with fill qty);
+no new order after kill; no order outside range (strict gate vetoes a
+cell priced above the upper bound; all placed prices proven inside the
+effective range); risk veto (real market_gate block); insufficient balance
+(fail-closed before submission); rate-limit response (bounded 3-attempt
+budget, no blind retry, preflight and cycle paths); clock skew beyond
+bound (fail closed); network interruption mid-cycle (fail closed, state
+persisted) and recovery; graceful shutdown at safe boundary (cycle 1
+completes, cycle 2 never starts, cleanup runs); persistence survives
+restart (orders/events/HWM/kill intact, HWM never lowered); rehearsal mode
+makes zero write calls + static proof that main.py and the paper modules
+never import the cycle/order modules; locked invariants cannot be loosened
+via cycle config (hard_min ≥ 0.003, drawdown == 0.02, buffer == 0.01,
+bounded cycles/orders).
+
+### Live Binance Spot Testnet verification (2026-10-03)
+
+- Rehearsal cycle (BNBUSDT, read-only): real candles → range veto recorded
+  (width ~1.8% < 3% minimum) → zero writes → cleanup ok → exit 0.
+- Symbol probes (read-only): ETHUSDT vetoed (5 cells < 6), BTCUSDT vetoed
+  (quality), DOGEUSDT vetoed (volume spike) — gates authoritative on live
+  data; SOLUSDT / ADAUSDT / LINKUSDT / XRPUSDT legitimately passed the full
+  stack.
+- Orders cycle (SOLUSDT, 2 cycles): 4 real LIMIT_MAKER orders placed
+  (~25 USDT each, deterministic cids AGTC-SOLUSDT-…), all inside the
+  effective range (117.328–122.24, quality 82.48), risk PASS, each cycle
+  ended flat via verified cancellation; cleanup proved zero own open
+  orders; exit 0.
+- Restart run (fresh process, same ledger): recovered prior terminal
+  orders, placed 2 more orders, cycle-end cancel + cleanup ok; exit 0.
+- cleanup-only proof: `{"ok": true, "canceled": [], "unresolved": [],
+  "foreign": []}` — zero open own orders, zero unresolved.
+- Ungated `--mode orders` invocation refused (fail-closed gate verified).
+
+### Round 8 testnet order accounting
+
+| Metric | Value |
+|---|---|
+| Orders created | 6 (4 + 2 across two runs) |
+| Filled | 0 |
+| Canceled (verified) | 6 |
+| UNKNOWN / PENDING_RECONCILIATION | 0 |
+| Final open-order count (proven) | 0 |
+| Foreign orders touched | 0 |
+
+### Safety boundary (unchanged)
+
+`DRY_RUN=true`; `ALLOW_LIVE_EXECUTION=false`; `main()` paper-only and still
+raises on `dry_run=false`; `TESTNET_ORDERS_ENABLED` default false; no
+production endpoint constructible; Risk Engine veto over every order; no
+secrets in code, logs, events, or the ledger.
+
+### Remaining (future increments, not blockers)
+
+- Operator release command for the cycle kill latch (mirroring
+  `release_kill_state.py`) — documented in LIMITATIONS.
+- Fill-event accounting for orders that FILL while the cycle runs (status
+  is tracked and reconciled; PnL accounting remains the paper engine's
+  domain until a separately authorized execution wiring).
+- User-data websocket event stream (Roadmap E seam ready).
