@@ -673,11 +673,9 @@ def main() -> int:
     if binance_env == "live":
         api_key = os.getenv("BINANCE_LIVE_API_KEY", "")
         api_secret = os.getenv("BINANCE_LIVE_API_SECRET", "")
-        base_url = cfg["binance"]["live"]["base_url"]
     else:
         api_key = os.getenv("BINANCE_TESTNET_API_KEY", "")
         api_secret = os.getenv("BINANCE_TESTNET_API_SECRET", "")
-        base_url = cfg["binance"]["testnet"]["base_url"]
     
     # Setup logging
     log_path = cfg["logging"]["log_path"]
@@ -694,7 +692,7 @@ def main() -> int:
         logger.addHandler(fh)
     
     # Create client
-    client = make_client(binance_env, api_key, api_secret, base_url)
+    client = make_client(binance_env, api_key, api_secret)
     
     # Get symbols
     symbols = cfg["_parsed_symbols"]
