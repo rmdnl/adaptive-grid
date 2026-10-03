@@ -20,3 +20,11 @@ logs/*.jsonl
 # Runtime / validation artifacts
 data/
 validation/__pycache__/
+
+# Internal AI/autonomous-coding artifacts — local only, not part of the repo
+AGENTS.md
+SKILL.md
+AUTONOMOUS_TASK.md
+AUTONOMOUS_RUN_REPORT.md
+FINAL_INTEGRATION_AUDIT.md
+VALIDATION_REPORT.md
