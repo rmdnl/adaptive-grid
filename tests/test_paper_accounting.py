@@ -111,13 +111,26 @@ def _fill(engine, order, fill_id, market_price, quantity, **kwargs):
 def test_valid_paper_configuration():
     cfg = {
         "environment": {"mode": "testnet", "dry_run": True, "allow_live_execution": False},
-        "symbol": "BNBUSDT",
-        "timeframe": "15m",
-        "grid": {"step_pct": 0.006, "hard_min_net_pct": 0.003, "preferred_net_max_pct": 0.004, "min_cells": 6, "max_levels": 40},
-        "range": {"mode": "auto", "lower_price": 0, "upper_price": 0},
+        "symbols": "BNBUSDT",
+        "timeframe": "4h",
+        "grid": {
+            "mode_by_symbol": {"BNBUSDT": "arithmetic"},
+            "step_pct": 0.006,
+            "hard_min_net_pct": 0.003,
+            "preferred_net_max_pct": 0.004,
+            "min_cells": 6,
+            "max_levels": 40,
+            "min_gross_profit_pct": 0.005,
+        },
+        "range": {"mode": "auto", "lower_price": 0, "upper_price": 0, "lookback": 200, "buffer_pct": 0.01, "auto": {}},
+        "strategy": {
+            "entry": {"adx_max": 20, "rsi_max": 35, "bb_percent_b_max": 0, "volume_oscillator_min": 0},
+            "exit": {"rsi_min": 70, "adx_min": 25, "bb_percent_b_min": 1, "zscore_threshold": 2.5},
+            "cooldown_hours": 3,
+        },
         "fees": {"maker_fee_fallback": 0.001, "taker_fee_fallback": 0.001, "slippage_roundtrip_pct": 0.0005},
         "paper": {"initial_base_balance": 2, "initial_quote_balance": 1000, "maker_fee": 0.001, "taker_fee": 0.001, "fee_asset": "USDT"},
-        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02},
+        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02, "daily_profit_lock_pct": 0.01, "cooldown_minutes": 30},
         "execution": {"max_open_orders": 40, "order_quote_size": 25},
     }
 
@@ -127,12 +140,25 @@ def test_valid_paper_configuration():
 def test_missing_paper_configuration_fails_closed():
     cfg = {
         "environment": {"mode": "testnet", "dry_run": True, "allow_live_execution": False},
-        "symbol": "BNBUSDT",
-        "timeframe": "15m",
-        "grid": {"step_pct": 0.006, "hard_min_net_pct": 0.003, "preferred_net_max_pct": 0.004, "min_cells": 6, "max_levels": 40},
-        "range": {"mode": "auto", "lower_price": 0, "upper_price": 0},
+        "symbols": "BNBUSDT",
+        "timeframe": "4h",
+        "grid": {
+            "mode_by_symbol": {"BNBUSDT": "arithmetic"},
+            "step_pct": 0.006,
+            "hard_min_net_pct": 0.003,
+            "preferred_net_max_pct": 0.004,
+            "min_cells": 6,
+            "max_levels": 40,
+            "min_gross_profit_pct": 0.005,
+        },
+        "range": {"mode": "auto", "lower_price": 0, "upper_price": 0, "lookback": 200, "buffer_pct": 0.01, "auto": {}},
+        "strategy": {
+            "entry": {"adx_max": 20, "rsi_max": 35, "bb_percent_b_max": 0, "volume_oscillator_min": 0},
+            "exit": {"rsi_min": 70, "adx_min": 25, "bb_percent_b_min": 1, "zscore_threshold": 2.5},
+            "cooldown_hours": 3,
+        },
         "fees": {"maker_fee_fallback": 0.001, "taker_fee_fallback": 0.001, "slippage_roundtrip_pct": 0.0005},
-        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02},
+        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02, "daily_profit_lock_pct": 0.01, "cooldown_minutes": 30},
         "execution": {"max_open_orders": 40, "order_quote_size": 25},
     }
 
@@ -144,18 +170,31 @@ def test_missing_paper_configuration_fails_closed():
 def test_invalid_paper_balance_fails_closed(field):
     cfg = {
         "environment": {"mode": "testnet", "dry_run": True, "allow_live_execution": False},
-        "symbol": "BNBUSDT",
-        "timeframe": "15m",
-        "grid": {"step_pct": 0.006, "hard_min_net_pct": 0.003, "preferred_net_max_pct": 0.004, "min_cells": 6, "max_levels": 40},
-        "range": {"mode": "auto", "lower_price": 0, "upper_price": 0},
+        "symbols": "BNBUSDT",
+        "timeframe": "4h",
+        "grid": {
+            "mode_by_symbol": {"BNBUSDT": "arithmetic"},
+            "step_pct": 0.006,
+            "hard_min_net_pct": 0.003,
+            "preferred_net_max_pct": 0.004,
+            "min_cells": 6,
+            "max_levels": 40,
+            "min_gross_profit_pct": 0.005,
+        },
+        "range": {"mode": "auto", "lower_price": 0, "upper_price": 0, "lookback": 200, "buffer_pct": 0.01, "auto": {}},
+        "strategy": {
+            "entry": {"adx_max": 20, "rsi_max": 35, "bb_percent_b_max": 0, "volume_oscillator_min": 0},
+            "exit": {"rsi_min": 70, "adx_min": 25, "bb_percent_b_min": 1, "zscore_threshold": 2.5},
+            "cooldown_hours": 3,
+        },
         "fees": {"maker_fee_fallback": 0.001, "taker_fee_fallback": 0.001, "slippage_roundtrip_pct": 0.0005},
         "paper": {"initial_base_balance": 2, "initial_quote_balance": 1000, "maker_fee": 0.001, "taker_fee": 0.001, "fee_asset": "USDT"},
-        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02},
+        "risk": {"max_equity_drawdown_pct": 0.02, "range_break_buffer_pct": 0.01, "stop_if_below_lower_pct": 0.02, "daily_profit_lock_pct": 0.01, "cooldown_minutes": 30},
         "execution": {"max_open_orders": 40, "order_quote_size": 25},
     }
     cfg["paper"][field] = -1
 
-    with pytest.raises(ConfigError, match=field):
+    with pytest.raises(ConfigError, match=f"paper\\.{field}"):
         validate_config(cfg)
 
 

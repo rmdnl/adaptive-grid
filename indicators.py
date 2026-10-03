@@ -88,6 +88,41 @@ def volume_ratio(df, length=20):
     baseline = volume_baseline(df, length)
     return df["volume"] / baseline.replace(0, np.nan)
 
+def volume_oscillator(df, short_period=5, long_period=10):
+    """Volume Oscillator: (Short MA - Long MA) / Long MA * 100
+    
+    Positive values indicate increasing volume trend (bullish volume)
+    Negative values indicate decreasing volume trend (bearish volume)
+    """
+    _require_columns(df, ("volume",))
+    if short_period >= long_period:
+        raise ValueError("short_period must be < long_period")
+    if short_period <= 0 or long_period <= 0:
+        raise ValueError("periods must be > 0")
+    
+    short_ma = df["volume"].rolling(short_period).mean()
+    long_ma = df["volume"].rolling(long_period).mean()
+    
+    # Avoid division by zero
+    osc = (short_ma - long_ma) / long_ma.replace(0, np.nan) * 100
+    return osc
+
+def z_score(df, length=20):
+    """Z-Score of close price: (close - mean) / std over lookback period
+    
+    Values > 2.5 or < -2.5 indicate extreme price deviation (statistical outlier)
+    """
+    _require_columns(df, ("close",))
+    if length <= 0:
+        raise ValueError("length must be > 0")
+    
+    rolling_mean = df["close"].rolling(length).mean()
+    rolling_std = df["close"].rolling(length).std(ddof=0)
+    
+    # Avoid division by zero
+    z = (df["close"] - rolling_mean) / rolling_std.replace(0, np.nan)
+    return z
+
 def enrich(df):
     if df.empty:
         raise ValueError("Empty market data")
@@ -98,10 +133,12 @@ def enrich(df):
     out["bb_width"] = bb_width(out)
     out["volume_ratio"] = volume_ratio(out)
     out["rsi"] = rsi(out)
+    out["volume_oscillator"] = volume_oscillator(out, short_period=5, long_period=10)
+    out["z_score"] = z_score(out, length=20)
     return out
 
 def latest_valid_row(df):
-    required = ["close", "atr_pct", "adx", "bb_width", "volume_ratio"]
+    required = ["close", "atr_pct", "adx", "bb_width", "volume_ratio", "rsi", "volume_oscillator", "z_score"]
     valid = df.dropna(subset=required)
     if valid.empty:
         raise ValueError("No fully valid indicator row available")

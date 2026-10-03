@@ -58,6 +58,9 @@ def make_features_for_quality(
         penetration_count=0,
         spread=Decimal("0.03"),
         spread_pct=Decimal(spread_pct),
+        rsi=Decimal("50"),
+        volume_oscillator=Decimal("0.5"),
+        z_score=Decimal("0"),
     )
 
 

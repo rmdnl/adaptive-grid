@@ -45,6 +45,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
@@ -79,14 +80,19 @@ def dashboard_settings() -> dict[str, Any]:
         cfg = config_loader.load_config()
         config_loader.validate_config(cfg)
         env = cfg["environment"]
+        symbols_raw = cfg.get("symbols", "")
+        if symbols_raw:
+            symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+        else:
+            symbols = [str(cfg.get("symbol", "N/A"))]
         bot = {
             "mode": str(env.get("mode", "N/A")),
             "dry_run": bool(env.get("dry_run", False)),
             "allow_live_execution": bool(env.get("allow_live_execution", False)),
-            "symbol": str(cfg.get("symbol", "N/A")),
+            "symbols": ", ".join(symbols),
             "timeframe": str(cfg.get("timeframe", "N/A")),
             "max_drawdown_pct": str(cfg["risk"]["max_equity_drawdown_pct"]),
-            "grid_step_pct": str(cfg["grid"]["step_pct"]),
+            "grid_step_pct": str(cfg["grid"].get("step_pct", cfg["grid"].get("min_gross_profit_pct", "N/A"))),
             "hard_min_net_pct": str(cfg["grid"]["hard_min_net_pct"]),
             "config_error": None,
         }
@@ -119,6 +125,12 @@ def _maybe(con: Optional[sqlite3.Connection], fn, default):
         return default
 
 
+def _symbol_db_path(base_path: str, symbol: str) -> str:
+    """Generate per-symbol database path."""
+    base = Path(base_path)
+    return str(base.parent / f"{base.stem}_{symbol}{base.suffix}")
+
+
 def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
     """Assemble the full read-only status snapshot.
 
@@ -126,14 +138,88 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
     its own section (``None``), never the whole response.  Nothing here
     can mutate the database (``mode=ro`` connection).
     """
-    con: Optional[sqlite3.Connection] = None
-    db_error: Optional[str] = None
-    try:
-        con = _connect_readonly(db_path)
-        con.execute("SELECT 1")
-    except (sqlite3.Error, OSError) as exc:
-        db_error = type(exc).__name__
+    # Parse symbols
+    symbols_raw = bot.get("symbols", "")
+    if symbols_raw:
+        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+    else:
+        symbols = [bot.get("symbol", "N/A")]
 
+    # Read from each symbol's database
+    per_symbol_data = {}
+    main_con: Optional[sqlite3.Connection] = None
+    main_db_error: Optional[str] = None
+    try:
+        main_con = _connect_readonly(db_path)
+        main_con.execute("SELECT 1")
+    except (sqlite3.Error, OSError) as exc:
+        main_db_error = type(exc).__name__
+
+    def _read_symbol_db(symbol: str) -> dict[str, Any]:
+        """Read data from a symbol's database."""
+        sym_db = _symbol_db_path(db_path, symbol)
+        sym_con: Optional[sqlite3.Connection] = None
+        sym_error: Optional[str] = None
+        try:
+            sym_con = _connect_readonly(sym_db)
+            sym_con.execute("SELECT 1")
+        except (sqlite3.Error, OSError):
+            return {"db_healthy": False}
+        
+        data = {"db_healthy": True}
+        
+        def _rows(c, sql, args=()):
+            return [dict(r) for r in c.execute(sql, args).fetchall()]
+        
+        def _state_json(c, key: str):
+            rows = _rows(c, "SELECT value FROM bot_state WHERE key = ?", (key,))
+            if not rows:
+                return None
+            try:
+                return json.loads(rows[0]["value"])
+            except (ValueError, TypeError):
+                return None
+        
+        def _state_raw(c, key: str):
+            rows = _rows(c, "SELECT value FROM bot_state WHERE key = ?", (key,))
+            return rows[0]["value"] if rows else None
+        
+        # Read key state values
+        data["last_price"] = _state_raw(sym_con, "last_price")
+        data["last_range"] = _state_json(sym_con, "last_range")
+        data["last_risk_decision"] = _state_json(sym_con, "last_risk_decision")
+        data["last_adaptive_plan"] = _state_json(sym_con, "last_adaptive_plan")
+        data["last_market_intelligence"] = _state_json(sym_con, "last_market_intelligence")
+        data["last_account_risk"] = _state_json(sym_con, "last_account_risk")
+        data["paper_reference_equity"] = _state_raw(sym_con, "paper_reference_equity")
+        
+        # Read recent cycles
+        rows = _rows(sym_con, "SELECT cycle_id, candle_index, symbol, plan_decision,"
+                            " orders_submitted, fills_applied, success, is_idempotent,"
+                            " recovery_healthy, blocked_reason, error, metadata,"
+                            " created_at FROM paper_orch_cycles"
+                            " ORDER BY created_at DESC LIMIT ?", (_RECENT_LIMIT,))
+        for row in rows:
+            if row.get("metadata"):
+                try:
+                    row["metadata"] = json.loads(row["metadata"])
+                except (ValueError, TypeError):
+                    row["metadata"] = None
+        data["latest_cycles"] = rows
+        
+        # Read open orders
+        data["open_orders"] = _rows(sym_con, "SELECT client_order_id, exchange_order_id, symbol, side,"
+                              " grid_index, price, quantity, executed_qty, remaining_qty,"
+                              " status, order_type, created_at, updated_at FROM orders"
+                              " WHERE status IN ('NEW','PARTIALLY_FILLED')"
+                              " ORDER BY created_at DESC LIMIT ?", (_RECENT_LIMIT,))
+        
+        if sym_con:
+            sym_con.close()
+        
+        return data
+
+    # Read main database for overall status
     def _kill(c):
         row = _rows(c, "SELECT active, trigger_reason, activated_at, "
                        "open_order_count, cancel_status, note "
@@ -222,12 +308,17 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
         row = c.execute("PRAGMA user_version").fetchone()
         return row[0] if row else None
 
+    # Read per-symbol data
+    per_symbol_data = {}
+    for sym in symbols:
+        per_symbol_data[sym] = _read_symbol_db(sym)
+
     snapshot: dict[str, Any] = {
         "dashboard": {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "db_path_configured": db_path,
-            "db_healthy": con is not None,
-            "db_error": db_error,
+            "db_healthy": main_con is not None,
+            "db_error": main_db_error,
             "read_only": True,
             "auth": "none (public by design; read-only by construction)",
         },
@@ -237,46 +328,47 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
             "allow_live_execution": bot.get("allow_live_execution", None),
             "live_execution_disabled": (bot.get("allow_live_execution") is False
                                         and bot.get("dry_run") is True),
-            "symbol": bot.get("symbol", "N/A"),
+            "symbols": bot.get("symbols", "N/A"),
             "timeframe": bot.get("timeframe", "N/A"),
             "config_error": bot.get("config_error"),
         },
-        "runtime": _maybe(con, _run_state, None),
+        "runtime": _maybe(main_con, _run_state, None),
         "risk": {
-            "kill_state": _maybe(con, _kill, None),
-            "reference_equity": _maybe(con, _reference_equity, None),
-            "equity_latest": _maybe(con, _equity_latest, None),
+            "kill_state": _maybe(main_con, _kill, None),
+            "reference_equity": _maybe(main_con, _reference_equity, None),
+            "equity_latest": _maybe(main_con, _equity_latest, None),
             "max_drawdown_pct": bot.get("max_drawdown_pct", "N/A"),
-            "risk_events": _maybe(con, _risk_events, []),
+            "risk_events": _maybe(main_con, _risk_events, []),
             "last_risk_decision": _maybe(
-                con, _state_json("last_risk_decision"), None),
+                main_con, _state_json("last_risk_decision"), None),
             "last_account_risk": _maybe(
-                con, _state_json("last_account_risk"), None),
+                main_con, _state_json("last_account_risk"), None),
         },
-        "account": _maybe(con, _account, None),
+        "account": _maybe(main_con, _account, None),
         "grid": {
             "grid_step_pct": bot.get("grid_step_pct", "N/A"),
             "hard_min_net_pct": bot.get("hard_min_net_pct", "N/A"),
-            "latest_cycles": _maybe(con, _last_cycles, []),
-            "last_price": _maybe(con, _state_raw("last_price"), None),
-            "last_range": _maybe(con, _state_json("last_range"), None),
-            "last_symbol": _maybe(con, _state_raw("last_symbol"), None),
+            "latest_cycles": _maybe(main_con, _last_cycles, []),
+            "last_price": _maybe(main_con, _state_raw("last_price"), None),
+            "last_range": _maybe(main_con, _state_json("last_range"), None),
+            "last_symbol": _maybe(main_con, _state_raw("last_symbol"), None),
             "last_adaptive_plan": _maybe(
-                con, _state_json("last_adaptive_plan"), None),
+                main_con, _state_json("last_adaptive_plan"), None),
             "last_active_plan": _maybe(
-                con, _state_json("last_active_plan"), None),
+                main_con, _state_json("last_active_plan"), None),
             "last_market_intelligence": _maybe(
-                con, _state_json("last_market_intelligence"), None),
+                main_con, _state_json("last_market_intelligence"), None),
+            "per_symbol": per_symbol_data,
         },
         "orders": {
-            "open": _maybe(con, _orders_open, []),
-            "recent": _maybe(con, _orders_recent, []),
+            "open": _maybe(main_con, _orders_open, []),
+            "recent": _maybe(main_con, _orders_recent, []),
         },
-        "fills": _maybe(con, _fills, []),
-        "database": {"schema_user_version": _maybe(con, _schema_version, None)},
+        "fills": _maybe(main_con, _fills, []),
+        "database": {"schema_user_version": _maybe(main_con, _schema_version, None)},
     }
-    if con is not None:
-        con.close()
+    if main_con is not None:
+        main_con.close()
     return snapshot
 
 
@@ -432,6 +524,8 @@ _DIAGNOSTIC_LABELS = {
     "atr_pct_too_low": "ATR too low flag",
     "regime_reason": "Regime reason",
     "error": "Error",
+    "volume_oscillator": "Volume Oscillator (5,10)",
+    "z_score": "Z-Score (20)",
 }
 
 
@@ -613,91 +707,636 @@ _WRAP_COLUMNS = {"reason", "blocked_reason", "filter reasons", "plan reasons",
 
 
 # ---------------------------------------------------------------------------
-# Dashboard chrome (dark, mobile-friendly). Plain strings so they can be
-# interpolated into the f-string body without brace-escaping.
+# Dashboard chrome (retrofuturism theme, mobile-friendly).
 # ---------------------------------------------------------------------------
 _DASH_CSS = """
-:root { color-scheme: dark; }
+:root {
+  color-scheme: dark;
+  --bg-deep: #05080c;
+  --bg-panel: #0a0f1a;
+  --bg-panel-hover: #0d1424;
+  --border-dim: #1a2338;
+  --border-bright: #2a3f6e;
+  --fg-primary: #e8f4fd;
+  --fg-muted: #6b8aaa;
+  --fg-dim: #3d5a8a;
+  --accent-cyan: #00ffff;
+  --accent-cyan-dim: #00cccc;
+  --accent-magenta: #ff00ff;
+  --accent-magenta-dim: #cc00cc;
+  --accent-amber: #ffbf00;
+  --accent-amber-dim: #cc9900;
+  --accent-green: #00ff88;
+  --accent-green-dim: #00cc6e;
+  --accent-red: #ff3366;
+  --accent-red-dim: #cc2952;
+  --glow-cyan: rgba(0, 255, 255, 0.4);
+  --glow-magenta: rgba(255, 0, 255, 0.3);
+  --glow-amber: rgba(255, 191, 0, 0.3);
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Monaco', 'Consolas', monospace;
+  --font-ui: 'Space Grotesk', 'Orbitron', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
 * { box-sizing: border-box; }
-body { margin:0; background:#0d1117; color:#e6edf3; font-family:
-  -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; }
-main { max-width:1080px; margin:0 auto; padding:14px 14px 32px; }
-h1 { font-size:1.4rem; margin:6px 0 2px; }
-.sub { color:#8b949e; margin:0 0 14px; font-size:.9rem; }
-.badges { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
-.badge { padding:4px 10px; border-radius:999px; font-size:.78rem;
-  font-weight:600; border:1px solid transparent; white-space:nowrap; }
-.green { background:#0f2d1d; color:#3fb950; border-color:#1d4527; }
-.yellow { background:#332a0d; color:#d29922; border-color:#574413; }
-.red { background:#3d1114; color:#f85149; border-color:#67282c; }
-.cards { display:grid; gap:10px; grid-template-columns:
-  repeat(auto-fit, minmax(150px, 1fr)); }
-.card { background:#161b22; border:1px solid #30363d; border-radius:10px;
-  padding:12px 14px; }
-.cardlabel { color:#8b949e; font-size:.72rem; text-transform:uppercase;
-  letter-spacing:.06em; }
-.cardvalue { font-size:1.3rem; font-weight:600; margin-top:4px;
-  word-break:break-word; }
-.cardsub { color:#8b949e; font-size:.72rem; margin-top:2px;
-  word-break:break-word; }
-.toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px;
-  margin:16px 0 6px; }
-.tabs { display:flex; flex-wrap:wrap; gap:6px; }
-.tab { background:#161b22; color:#c9d1d9; border:1px solid #30363d;
-  border-radius:8px; padding:6px 12px; font-size:.85rem; cursor:pointer;
-  font-family:inherit; }
-.tab:hover { border-color:#8b949e; }
-.tab[aria-selected="true"] { background:#1f6feb22; color:#58a6ff;
-  border-color:#1f6feb; }
-.penting { margin-left:auto; display:flex; align-items:center; gap:6px;
-  font-size:.8rem; color:#8b949e; cursor:pointer; user-select:none; }
-.penting input { accent-color:#1f6feb; }
-.tabpane { display:none; }
-.tabpane.active { display:block; }
-section.block { margin:18px 0; }
-h2 { font-size:1rem; margin:18px 0 8px; color:#8b949e;
-  text-transform:uppercase; letter-spacing:.06em; }
-h3 { font-size:.9rem; margin:14px 0 6px; color:#c9d1d9; }
-.tablewrap { overflow-x:auto; background:#161b22; border:1px solid #30363d;
-  border-radius:10px; margin:8px 0; }
-table { border-collapse:collapse; width:100%; font-size:.85rem; }
-th, td { padding:7px 10px; text-align:left; border-bottom:1px solid #21262d; }
-th { color:#8b949e; font-weight:600; background:#161b22; white-space:nowrap; }
-td { white-space:nowrap; }
-td.wrap { white-space:normal; word-break:break-word; max-width:38ch; }
-tr:last-child td { border-bottom:none; }
-table.numalign td.num, table.numalign th.num { text-align:right;
-  font-variant-numeric:tabular-nums; }
-.muted { color:#8b949e; padding:0 4px; }
-.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  font-size:.85em; color:#c9d1d9; }
-.foot { color:#8b949e; font-size:.75rem; margin-top:24px; line-height:1.5; }
-/* key/value lists (replaces the confusing "field | value" tables) */
-.kvlist { background:#161b22; border:1px solid #30363d; border-radius:10px;
-  overflow-x:auto; }
-.kvrow { display:grid; grid-template-columns:150px 1fr; gap:0 14px;
-  padding:9px 14px; border-bottom:1px solid #21262d; align-items:baseline; }
-.kvrow:last-child { border-bottom:none; }
-.kvlabel { color:#8b949e; font-size:.82rem; }
-.kvvalue { color:#e6edf3; font-size:.9rem; font-weight:500;
-  word-break:break-word; min-width:0; }
-.kvline { color:#e6edf3; }
-.kvcode { color:#8b949e; font-size:.74rem; margin-top:3px;
-  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  word-break:break-word; }
-/* "penting saja" mode hides detail rows/blocks + the raw-code sub-lines */
-body.penting-only tr.detail { display:none; }
-body.penting-only .detail-block { display:none; }
-body.penting-only .kvcode { display:none; }
-/* mobile: stack cards 2-up, smaller cards, scrollable tables */
+
+@keyframes scanline {
+  0% { transform: translateY(-100%); opacity: 0.03; }
+  100% { transform: translateY(100vh); opacity: 0.03; }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+@keyframes blink-caret {
+  0%, 50% { border-color: var(--accent-cyan); }
+  51%, 100% { border-color: transparent; }
+}
+
+@keyframes grid-shift {
+  0% { background-position: 0 0; }
+  100% { background-position: 60px 60px; }
+}
+
+body {
+  margin: 0;
+  background: var(--bg-deep);
+  color: var(--fg-primary);
+  font-family: var(--font-ui);
+  line-height: 1.5;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* Retro grid background */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--border-dim) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border-dim) 1px, transparent 1px);
+  background-size: 60px 60px;
+  animation: grid-shift 20s linear infinite;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.4;
+}
+
+/* Scanline overlay */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 255, 255, 0.02) 2px,
+    rgba(0, 255, 255, 0.02) 4px
+  );
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.5;
+}
+
+main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px 16px 40px;
+  position: relative;
+  z-index: 2;
+}
+
+/* Header */
+header.dash-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border-dim);
+  position: relative;
+}
+
+header.dash-header::after {
+  content: "";
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background: linear-gradient(90deg,
+    transparent,
+    var(--accent-cyan) 20%,
+    var(--accent-magenta) 50%,
+    var(--accent-amber) 80%,
+    transparent
+  );
+  animation: pulse-glow 3s ease-in-out infinite;
+}
+
+.logo-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.logo {
+  font-family: var(--font-mono);
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  color: var(--accent-cyan);
+  text-shadow: 0 0 20px var(--glow-cyan), 0 0 40px var(--glow-cyan);
+  position: relative;
+}
+
+.logo::before {
+  content: "[ ";
+  color: var(--accent-magenta);
+  text-shadow: 0 0 15px var(--glow-magenta);
+}
+.logo::after {
+  content: " ]";
+  color: var(--accent-magenta);
+  text-shadow: 0 0 15px var(--glow-magenta);
+}
+
+.subtitle {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--fg-muted);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.status-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+/* Badges - retro pill style */
+.badge {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid;
+  white-space: nowrap;
+  position: relative;
+  overflow: hidden;
+}
+
+.badge::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: inherit;
+  opacity: 0.15;
+  filter: blur(8px);
+  pointer-events: none;
+}
+
+.badge-green {
+  background: rgba(0, 255, 136, 0.12);
+  color: var(--accent-green);
+  border-color: var(--accent-green-dim);
+  box-shadow: 0 0 12px rgba(0, 255, 136, 0.2), inset 0 0 12px rgba(0, 255, 136, 0.1);
+}
+
+.badge-yellow {
+  background: rgba(255, 191, 0, 0.12);
+  color: var(--accent-amber);
+  border-color: var(--accent-amber-dim);
+  box-shadow: 0 0 12px rgba(255, 191, 0, 0.2), inset 0 0 12px rgba(255, 191, 0, 0.1);
+}
+
+.badge-red {
+  background: rgba(255, 51, 102, 0.12);
+  color: var(--accent-red);
+  border-color: var(--accent-red-dim);
+  box-shadow: 0 0 12px rgba(255, 51, 102, 0.2), inset 0 0 12px rgba(255, 51, 102, 0.1);
+}
+
+.badge-cyan {
+  background: rgba(0, 255, 255, 0.12);
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan-dim);
+  box-shadow: 0 0 12px rgba(0, 255, 255, 0.2), inset 0 0 12px rgba(0, 255, 255, 0.1);
+}
+
+.badge-magenta {
+  background: rgba(255, 0, 255, 0.12);
+  color: var(--accent-magenta);
+  border-color: var(--accent-magenta-dim);
+  box-shadow: 0 0 12px rgba(255, 0, 255, 0.2), inset 0 0 12px rgba(255, 0, 255, 0.1);
+}
+
+.badge-dim {
+  background: rgba(61, 90, 138, 0.3);
+  color: var(--fg-dim);
+  border-color: var(--border-dim);
+}
+
+/* Cards Grid */
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.card {
+  background: linear-gradient(145deg, var(--bg-panel), var(--bg-panel-hover));
+  border: 1px solid var(--border-dim);
+  border-radius: 8px;
+  padding: 16px 18px;
+  position: relative;
+  transition: border-color 0.3s, box-shadow 0.3s, transform 0.2s;
+}
+
+.card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-magenta), var(--accent-amber));
+  opacity: 0;
+  transition: opacity 0.3s;
+  border-radius: 8px 8px 0 0;
+}
+
+.card:hover {
+  border-color: var(--border-bright);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 0 20px var(--glow-cyan);
+}
+
+.card:hover::before {
+  opacity: 1;
+}
+
+.card-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin-bottom: 8px;
+}
+
+.card-value {
+  font-family: var(--font-mono);
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--fg-primary);
+  word-break: break-word;
+  line-height: 1.3;
+}
+
+.card-sub {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--fg-muted);
+  margin-top: 4px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.card-sub.accent { color: var(--accent-cyan); }
+.card-sub.warn { color: var(--accent-amber); }
+.card-sub.danger { color: var(--accent-red); }
+.card-sub.success { color: var(--accent-green); }
+
+/* Symbol Cards */
+.symbols-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+  margin: 20px 0;
+}
+
+.symbol-card {
+  border-left: 3px solid var(--accent-cyan);
+  background: linear-gradient(145deg, rgba(0, 255, 255, 0.03), var(--bg-panel));
+}
+
+.symbol-card:nth-child(2n) { border-left-color: var(--accent-magenta); }
+.symbol-card:nth-child(3n) { border-left-color: var(--accent-amber); }
+.symbol-card:nth-child(4n) { border-left-color: var(--accent-green); }
+
+.symbol-card .card-value { font-size: 1.1rem; }
+.symbol-card .card-sub { font-size: 0.58rem; margin-top: 3px; }
+
+/* Toolbar & Tabs */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 24px 0 12px;
+  padding: 12px 16px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-dim);
+  border-radius: 8px;
+  position: relative;
+}
+
+.toolbar::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tab {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px solid var(--border-dim);
+  border-radius: 4px;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+  overflow: hidden;
+}
+
+.tab::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-magenta));
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.tab:hover {
+  color: var(--fg-primary);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 16px var(--glow-cyan);
+}
+
+.tab[aria-selected="true"] {
+  color: var(--bg-deep);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 20px var(--glow-cyan), inset 0 0 20px rgba(0, 255, 255, 0.2);
+}
+
+.tab[aria-selected="true"]::before {
+  opacity: 1;
+}
+
+.tab[aria-selected="true"] span { position: relative; z-index: 1; }
+
+.penting-toggle {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--fg-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.penting-toggle input {
+  accent-color: var(--accent-cyan);
+  width: 14px;
+  height: 14px;
+}
+
+.penting-toggle:hover { color: var(--accent-cyan); }
+
+/* Tab Panes */
+.tabpane { display: none; }
+.tabpane.active { display: block; animation: fade-in 0.3s ease; }
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+section.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-dim);
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 16px;
+  position: relative;
+}
+
+section.panel::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
+}
+
+.panel-title {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+  margin: 0 0 16px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-dim);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.panel-title::before {
+  content: ">";
+  color: var(--accent-magenta);
+  animation: blink-caret 1s infinite;
+}
+
+.panel-title .count {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--fg-dim);
+  background: rgba(0, 255, 255, 0.1);
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border-dim);
+}
+
+/* Key/Value Lists */
+.kvlist {
+  display: grid;
+  gap: 0;
+}
+
+.kvrow {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 0 20px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-dim);
+  align-items: baseline;
+  transition: background 0.2s;
+}
+
+.kvrow:last-child { border-bottom: none; }
+
+.kvrow:hover { background: rgba(0, 255, 255, 0.03); }
+
+.kvlabel {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--fg-muted);
+  letter-spacing: 0.04em;
+}
+
+.kvvalue {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--fg-primary);
+  word-break: break-word;
+  min-width: 0;
+}
+
+/* Reason lines */
+.kvline {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--fg-primary);
+  line-height: 1.6;
+  padding: 4px 0;
+}
+
+.kvline .reason-code {
+  color: var(--fg-dim);
+  font-size: 0.6rem;
+  margin-left: 8px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.kvline:hover .reason-code { opacity: 1; }
+
+/* Tables */
+.tablewrap {
+  overflow-x: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-dim);
+  border-radius: 8px;
+  margin: 12px 0;
+}
+
+table { border-collapse: collapse; width: 100%; font-size: 0.78rem; }
+
+th, td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-dim);
+  font-family: var(--font-mono);
+}
+
+th {
+  color: var(--accent-cyan);
+  font-weight: 600;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: rgba(0, 255, 255, 0.05);
+  white-space: nowrap;
+}
+
+td {
+  color: var(--fg-primary);
+  white-space: nowrap;
+}
+
+td.wrap { white-space: normal; word-break: break-word; max-width: 40ch; }
+
+tr:last-child td { border-bottom: none; }
+
+tr:hover td { background: rgba(0, 255, 255, 0.04); }
+
+tr.detail { display: table-row; }
+
+table.numalign td.num, table.numalign th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Footer */
+.foot {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--fg-dim);
+  margin-top: 32px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-dim);
+  text-align: center;
+  line-height: 1.8;
+}
+
+.foot a { color: var(--accent-cyan); text-decoration: none; border-bottom: 1px dotted var(--accent-cyan); }
+.foot a:hover { color: var(--accent-magenta); border-bottom-color: var(--accent-magenta); text-shadow: 0 0 8px var(--glow-magenta); }
+
+/* Mobile */
 @media (max-width: 640px) {
-  main { padding:10px 10px 28px; }
-  .cards { grid-template-columns:repeat(2, 1fr); gap:8px; }
-  .cardvalue { font-size:1.05rem; }
-  .card { padding:9px 11px; }
-  .tab { padding:5px 9px; font-size:.8rem; }
-  table { font-size:.8rem; }
-  th, td { padding:6px 8px; }
+  main { padding: 14px 10px 32px; }
+  .logo { font-size: 1.2rem; }
+  .cards-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .card { padding: 12px 12px; }
+  .card-value { font-size: 1rem; }
+  .card-label { font-size: 0.55rem; }
+  .symbols-grid { grid-template-columns: 1fr; }
+  .symbol-card .card-value { font-size: 1rem; }
+  .tab { padding: 6px 10px; font-size: 0.62rem; }
+  .toolbar { padding: 10px 12px; }
+  .kvrow { grid-template-columns: 140px 1fr; padding: 10px 12px; font-size: 0.8rem; }
+  .kvlabel { font-size: 0.62rem; }
+  th, td { padding: 8px 8px; font-size: 0.7rem; }
+  section.panel { padding: 14px; }
+  .panel-title { font-size: 0.62rem; }
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+  body::before { animation: none; }
+  body::after { animation: none; }
+}
+
+/* High contrast mode tweaks */
+@media (prefers-contrast: high) {
+  :root {
+    --border-dim: #3a4f78;
+    --fg-muted: #9bc4e8;
+  }
 }
 """
 
@@ -725,6 +1364,15 @@ _DASH_JS = """
       catch (e) {}
     });
   }
+  // Add hover effect for kvrow reason codes
+  document.querySelectorAll('.kvline').forEach(function(line) {
+    line.addEventListener('mouseenter', function() {
+      this.querySelectorAll('.reason-code').forEach(function(c) { c.style.opacity = '1'; });
+    });
+    line.addEventListener('mouseleave', function() {
+      this.querySelectorAll('.reason-code').forEach(function(c) { c.style.opacity = '0'; });
+    });
+  });
 })();
 """
 
@@ -750,22 +1398,21 @@ def render_html(snap: dict[str, Any]) -> str:
 
     env_ok = env.get("live_execution_disabled") is True
     mode = str(env.get("mode") or "N/A").upper()
-    mode_cls = "green" if mode == "TESTNET" else "yellow"
-    env_badge = _badge(f"{mode} / {'PAPER' if env.get('dry_run') else 'LIVE!'}",
-                       mode_cls)
-    dry_badge = (_badge("DRY RUN", "green") if env.get("dry_run")
-                 else _badge("DRY RUN OFF", "red"))
-    live_badge = (_badge("LIVE DISABLED", "green") if env_ok
-                  else _badge("LIVE FLAG ON", "red"))
+    mode_cls = "badge-green" if mode == "TESTNET" else "badge-yellow"
+    env_badge = _badge(f"{mode} / {'PAPER' if env.get('dry_run') else 'LIVE!'}", mode_cls)
+    dry_badge = (_badge("DRY RUN", "badge-green") if env.get("dry_run")
+                 else _badge("DRY RUN OFF", "badge-red"))
+    live_badge = (_badge("LIVE DISABLED", "badge-green") if env_ok
+                  else _badge("LIVE FLAG ON", "badge-red"))
     kill_active = bool(kill.get("active"))
-    kill_badge = (_badge("KILL SWITCH ACTIVE", "red") if kill_active
-                  else _badge("KILL SWITCH OFF", "green"))
-    db_badge = (_badge("DB OK", "green") if dash.get("db_healthy")
-                else _badge("DB UNAVAILABLE", "red"))
+    kill_badge = (_badge("KILL ACTIVE", "badge-red") if kill_active
+                  else _badge("KILL OFF", "badge-green"))
+    db_badge = (_badge("DB OK", "badge-green") if dash.get("db_healthy")
+                else _badge("DB UNAVAILABLE", "badge-red"))
     run_phase = str(run_state.get("phase") or "N/A")
-    run_badge = (_badge(f"RUNTIME {run_phase}", "green")
+    run_badge = (_badge(f"RUNTIME {run_phase}", "badge-green")
                  if run_phase == "COMPLETED" else
-                 _badge(f"RUNTIME {run_phase}", "yellow"))
+                 _badge(f"RUNTIME {run_phase}", "badge-yellow"))
 
     grid_state = snap["grid"]
     adaptive_plan = grid_state.get("last_adaptive_plan") or {}
@@ -777,27 +1424,27 @@ def render_html(snap: dict[str, Any]) -> str:
     plan_reason = str(adaptive_plan.get("reason")
                       or risk_decision.get("reason") or "")
     plan_allowed = "ALLOW" in plan_decision.upper()
-    grid_badge = (_badge("GRID OK", "green") if plan_allowed
-                  else _badge("GRID BLOCKED", "yellow"))
+    grid_badge = (_badge("GRID ALLOWED", "badge-green") if plan_allowed
+                  else _badge("GRID BLOCKED", "badge-yellow"))
     risk_allowed = bool(risk_decision.get("allowed"))
-    risk_badge = (_badge("RISK PASS", "green") if risk_allowed
-                  else _badge("RISK BLOCKED", "yellow"))
+    risk_badge = (_badge("RISK PASS", "badge-green") if risk_allowed
+                  else _badge("RISK BLOCKED", "badge-yellow"))
     intel_status = str(market_intel.get("status") or "N/A")
-    intel_badge = (_badge("MARKET OK", "green")
+    intel_badge = (_badge("MARKET OK", "badge-green")
                    if market_intel.get("allowed") is True
-                   else _badge("MARKET FILTERED", "yellow"))
+                   else _badge("MARKET FILTERED", "badge-yellow"))
     last_range = grid_state.get("last_range") or {}
     last_price = grid_state.get("last_price")
 
     def card(label: str, value: Any, sub: str = "") -> str:
-        sub_html = f'<div class="cardsub">{_esc(sub)}</div>' if sub else ""
-        return (f'<div class="card"><div class="cardlabel">{_esc(label)}</div>'
-                f'<div class="cardvalue">{_esc(_fmt(value))}</div>{sub_html}</div>')
+        sub_html = f'<div class="card-sub">{_esc(sub)}</div>' if sub else ""
+        return (f'<div class="card"><div class="card-label">{_esc(label)}</div>'
+                f'<div class="card-value">{_esc(_fmt(value))}</div>{sub_html}</div>')
 
     def card_pct(label: str, value: Any, sub: str = "") -> str:
-        sub_html = f'<div class="cardsub">{_esc(sub)}</div>' if sub else ""
-        return (f'<div class="card"><div class="cardlabel">{_esc(label)}</div>'
-                f'<div class="cardvalue">{_pct(value)}</div>{sub_html}</div>')
+        sub_html = f'<div class="card-sub">{_esc(sub)}</div>' if sub else ""
+        return (f'<div class="card"><div class="card-label">{_esc(label)}</div>'
+                f'<div class="card-value">{_pct(value)}</div>{sub_html}</div>')
 
     open_orders = snap["orders"].get("open") or []
     quote_free = account.get("quote_free")
@@ -848,6 +1495,42 @@ def render_html(snap: dict[str, Any]) -> str:
                                 ("market_regime", metadata)),
     }
 
+    # Build multi-symbol cards
+    symbols_raw = env.get("symbols", "")
+    if symbols_raw:
+        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+    else:
+        symbols = [env.get("symbol", "N/A")]
+    
+    # Get per-symbol data from grid_state
+    per_symbol_data = grid_state.get("per_symbol") or {}
+    
+    # Build symbol cards
+    symbol_cards = []
+    for sym in symbols:
+        sym_data = per_symbol_data.get(sym, {})
+        sym_price = sym_data.get("current_price") or (last_price if sym == symbols[0] else "N/A")
+        sym_lower = sym_data.get("lower_price") or (grid_detail.get("lower_price") if sym == symbols[0] else "N/A")
+        sym_upper = sym_data.get("upper_price") or (grid_detail.get("upper_price") if sym == symbols[0] else "N/A")
+        sym_cells = sym_data.get("grid_cells") or (grid_detail.get("grid_cells") if sym == symbols[0] else "N/A")
+        sym_step = sym_data.get("grid_step") or (grid_detail.get("grid_step") if sym == symbols[0] else "N/A")
+        sym_net = sym_data.get("net_pct") or (grid_detail.get("net_pct") if sym == symbols[0] else "N/A")
+        sym_regime = sym_data.get("market_regime") or (grid_detail.get("market_regime") if sym == symbols[0] else "N/A")
+        sym_vol_osc = sym_data.get("volume_oscillator") or "N/A"
+        sym_zscore = sym_data.get("z_score") or "N/A"
+        
+        symbol_cards.append(f"""
+        <div class="card symbol-card">
+            <div class="card-label">{_esc(sym)}</div>
+            <div class="card-value">{_esc(_fmt(sym_price))}</div>
+            <div class="card-sub">Range: {_fmt(sym_lower)} \u2013 {_fmt(sym_upper)}</div>
+            <div class="card-sub">Grid: {_fmt(sym_cells)} cells @ {_pct(sym_step)}</div>
+            <div class="card-sub">Net/grid: {_pct(sym_net)} | Regime: {_human(sym_regime)}</div>
+            <div class="card-sub">VolOsc: {_fmt(sym_vol_osc)} | Z-Score: {_fmt(sym_zscore)}</div>
+        </div>""")
+    
+    symbol_cards_html = "".join(symbol_cards)
+
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -856,125 +1539,152 @@ def render_html(snap: dict[str, Any]) -> str:
 <title>adaptive-grid dashboard</title>
 <style>{_DASH_CSS}</style></head>
 <body><main>
-<h1>ADAPTIVE GRID</h1>
-<p class="sub">Binance Spot Grid Monitor &middot; {_esc(env.get("symbol"))} &middot;
-{_esc(env.get("timeframe"))} &middot; read-only &middot; waktu Indonesia (WIB)</p>
-<div class="badges">{env_badge} {dry_badge} {live_badge} {run_badge}
-{grid_badge} {risk_badge} {intel_badge} {kill_badge} {db_badge}</div>
+<header class="dash-header">
+  <div class="logo-block">
+    <div class="logo">ADAPTIVE GRID</div>
+    <div class="subtitle">Binance Spot Grid Monitor</div>
+  </div>
+  <div class="status-badges">{env_badge} {dry_badge} {live_badge} {run_badge}
+  {grid_badge} {risk_badge} {intel_badge} {kill_badge} {db_badge}</div>
+</header>
 
-<div class="cards">
+<div class="cards-grid">
 {card("Equity", equity_val, f"ref {_fmt(risk.get('reference_equity'))}")}
 {card_pct("Drawdown", drawdown, f"limit {_pct(risk.get('max_drawdown_pct'))}")}
 {card("Realized PnL", account.get("realized_pnl"), "after fees")}
 {card("Total fees", account.get("total_fees"))}
 {card("Open orders", len(open_orders))}
-{card("Harga terakhir", grid_detail.get("current_price"))}
-    {card("Range", f"{_fmt(grid_detail.get('lower_price'))} &ndash; {_fmt(grid_detail.get('upper_price'))}")}
+</div>
+
+<div class="symbols-grid">
+{symbol_cards_html}
 </div>
 
 <div class="toolbar">
 <nav class="tabs" role="tablist">
-<button class="tab" role="tab" data-tab="tab-general" aria-selected="true">General</button>
-<button class="tab" role="tab" data-tab="tab-risk" aria-selected="false">Risk</button>
-<button class="tab" role="tab" data-tab="tab-grid" aria-selected="false">Grid</button>
-<button class="tab" role="tab" data-tab="tab-market" aria-selected="false">Market</button>
-<button class="tab" role="tab" data-tab="tab-orders" aria-selected="false">Orders &amp; Fills</button>
-<button class="tab" role="tab" data-tab="tab-system" aria-selected="false">System</button>
+<button class="tab" role="tab" data-tab="tab-general" aria-selected="true"><span>General</span></button>
+<button class="tab" role="tab" data-tab="tab-risk" aria-selected="false"><span>Risk</span></button>
+<button class="tab" role="tab" data-tab="tab-grid" aria-selected="false"><span>Grid</span></button>
+<button class="tab" role="tab" data-tab="tab-market" aria-selected="false"><span>Market</span></button>
+<button class="tab" role="tab" data-tab="tab-orders" aria-selected="false"><span>Orders & Fills</span></button>
+<button class="tab" role="tab" data-tab="tab-system" aria-selected="false"><span>System</span></button>
 </nav>
-<label class="penting"><input type="checkbox" id="penting-toggle">penting saja</label>
+<label class="penting-toggle"><input type="checkbox" id="penting-toggle"><span>penting saja</span></label>
 </div>
 
 <section class="tabpane active" id="tab-general" role="tabpanel">
-<h2>Ringkasan</h2>
-{_kv([
-    ("Risk decision", "PASS" if risk_allowed else "BLOCKED"),
-    ("Plan decision", _human(plan_decision)),
-    ("Plan reasons", _human(plan_reason)),
-    ("Market filter", _human(intel_status)),
-])}
-<h2 class="detail-block">Recent cycles</h2>
-{_table(["cycle_id", "candle_index", "plan", "orders", "fills", "success",
-         "blocked_reason", "at"], cycle_rows)}
+<div class="panel">
+  <h2 class="panel-title">Ringkasan</h2>
+  {_kv([
+      ("Risk decision", "PASS" if risk_allowed else "BLOCKED"),
+      ("Plan decision", _human(plan_decision)),
+      ("Plan reasons", _human(plan_reason)),
+      ("Market filter", _human(intel_status)),
+  ])}
+</div>
+<div class="panel">
+  <h2 class="panel-title">Recent cycles <span class="count">{len(cycle_rows)}</span></h2>
+  {_table(["cycle_id", "candle_index", "plan", "orders", "fills", "success",
+           "blocked_reason", "at"], [dict(r, **{"class": "detail"}) for r in cycle_rows])}
+</div>
 </section>
 
 <section class="tabpane" id="tab-risk" role="tabpanel">
-<h2>Risk</h2>
-{_kv([
-    ("Kill switch", _yn(kill.get("active", False))),
-    ("Kill trigger", _human(kill.get("trigger_reason") or "")),
-    ("Activated at", _wib(kill.get("activated_at"))),
-    ("Cancel status", _yn(kill.get("cancel_status")) if kill.get("cancel_status") is not None else "N/A"),
-    ("Reference equity", _fmt(risk.get("reference_equity"))),
-    ("Current drawdown", _pct(drawdown)),
-    ("Drawdown limit", _pct(risk.get("max_drawdown_pct"))),
-])}
-<h3 class="detail-block">Recent risk events</h3>
-{_table(["ts", "allowed", "reason"], risk.get("risk_events") or [])}
+<div class="panel">
+  <h2 class="panel-title">Risk</h2>
+  {_kv([
+      ("Kill switch", _yn(kill.get("active", False))),
+      ("Kill trigger", _human(kill.get("trigger_reason") or "")),
+      ("Activated at", _wib(kill.get("activated_at"))),
+      ("Cancel status", _yn(kill.get("cancel_status")) if kill.get("cancel_status") is not None else "N/A"),
+      ("Reference equity", _fmt(risk.get("reference_equity"))),
+      ("Current drawdown", _pct(drawdown)),
+      ("Drawdown limit", _pct(risk.get("max_drawdown_pct"))),
+  ])}
+</div>
+<div class="panel">
+  <h2 class="panel-title">Recent risk events <span class="count">{(len(risk.get("risk_events") or []))}</span></h2>
+  {_table(["ts", "allowed", "reason"], [dict(r, **{"class": "detail"}) for r in (risk.get("risk_events") or [])])}
+</div>
 </section>
 
 <section class="tabpane" id="tab-grid" role="tabpanel">
-<h2>Grid</h2>
-{_kv([
-    ("Grid step", _pct(grid_detail.get("grid_step") or snap["grid"].get("grid_step_pct"))),
-    ("Min net profit / grid", _pct(snap["grid"].get("hard_min_net_pct"))),
-    ("Lower price", _fmt(grid_detail.get("lower_price"))),
-    ("Upper price", _fmt(grid_detail.get("upper_price"))),
-    ("Effective upper", _fmt(grid_detail.get("effective_upper"))),
-    ("Grid cells", _fmt(grid_detail.get("grid_cells"))),
-    ("Net profit / grid (est.)", _pct(grid_detail.get("net_pct"))),
-    ("Current price", _fmt(grid_detail.get("current_price"))),
-    ("Plan decision", _human(plan_decision)),
-    ("Plan reasons", _human(plan_reason)),
-])}
+<div class="panel">
+  <h2 class="panel-title">Grid</h2>
+  {_kv([
+      ("Grid step", _pct(grid_detail.get("grid_step") or snap["grid"].get("grid_step_pct"))),
+      ("Min net profit / grid", _pct(snap["grid"].get("hard_min_net_pct"))),
+      ("Lower price", _fmt(grid_detail.get("lower_price"))),
+      ("Upper price", _fmt(grid_detail.get("upper_price"))),
+      ("Effective upper", _fmt(grid_detail.get("effective_upper"))),
+      ("Grid cells", _fmt(grid_detail.get("grid_cells"))),
+      ("Net profit / grid (est.)", _pct(grid_detail.get("net_pct"))),
+      ("Current price", _fmt(grid_detail.get("current_price"))),
+      ("Plan decision", _human(plan_decision)),
+      ("Plan reasons", _human(plan_reason)),
+  ])}
+</div>
 </section>
 
 <section class="tabpane" id="tab-market" role="tabpanel">
-<h2>Market</h2>
-{_kv([
-    ("Market regime", _human(grid_detail.get("market_regime")) if grid_detail.get("market_regime") else "N/A"),
-    ("Range quality", _fmt(grid_detail.get("range_quality"))),
-    ("Filter status", _human(intel_status) if intel_status else "N/A"),
-    ("Filter allowed", _yn(market_intel.get("allowed"))),
-    ("Filter reasons", _human(", ".join(market_intel.get("reasons") or [])) if market_intel.get("reasons") else None),
-] + [
-    (_diag_label(k), _fmt(v))
-    for k, v in sorted(diag.items()) if not isinstance(v, (dict, list))
-])}
+<div class="panel">
+  <h2 class="panel-title">Market</h2>
+  {_kv([
+      ("Market regime", _human(grid_detail.get("market_regime")) if grid_detail.get("market_regime") else "N/A"),
+      ("Range quality", _fmt(grid_detail.get("range_quality"))),
+      ("Filter status", _human(intel_status) if intel_status else "N/A"),
+      ("Filter allowed", _yn(market_intel.get("allowed"))),
+      ("Filter reasons", _human(", ".join(market_intel.get("reasons") or [])) if market_intel.get("reasons") else None),
+      ("Volume Oscillator (5,10)", _fmt(diag.get("volume_oscillator")) if diag.get("volume_oscillator") is not None else "N/A"),
+      ("Z-Score (20)", _fmt(diag.get("z_score")) if diag.get("z_score") is not None else "N/A"),
+  ] + [
+      (_diag_label(k), _fmt(v))
+      for k, v in sorted(diag.items()) if not isinstance(v, (dict, list))
+  ])}
+</div>
 </section>
 
 <section class="tabpane" id="tab-orders" role="tabpanel">
-<h2>Open orders ({len(open_orders)})</h2>
-{_table(["client_order_id", "side", "grid_index", "price", "quantity",
-         "executed_qty", "remaining_qty", "status", "type", "created_at"],
-        open_orders)}
-<h2>Recent orders</h2>
-{_table(["client_order_id", "side", "grid_index", "price", "quantity",
-         "executed_qty", "remaining_qty", "status", "created_at"],
-        snap["orders"].get("recent") or [])}
-<h2>Recent fills</h2>
-{_table(["event_time", "side", "price", "quantity", "fee", "fee_asset",
-         "resulting_state", "symbol"],
-        snap["fills"] or [])}
+<div class="panel">
+  <h2 class="panel-title">Open orders <span class="count">{len(open_orders)}</span></h2>
+  {_table(["client_order_id", "side", "grid_index", "price", "quantity",
+           "executed_qty", "remaining_qty", "status", "type", "created_at"],
+          open_orders)}
+</div>
+<div class="panel">
+  <h2 class="panel-title">Recent orders</h2>
+  {_table(["client_order_id", "side", "grid_index", "price", "quantity",
+           "executed_qty", "remaining_qty", "status", "created_at"],
+          snap["orders"].get("recent") or [])}
+</div>
+<div class="panel">
+  <h2 class="panel-title">Recent fills</h2>
+  {_table(["event_time", "side", "price", "quantity", "fee", "fee_asset",
+           "resulting_state", "symbol"],
+          snap["fills"] or [])}
+</div>
 </section>
 
 <section class="tabpane" id="tab-system" role="tabpanel">
-<h2>System</h2>
-{_kv([
-    ("Dashboard time", _wib(dash.get("generated_at_utc"))),
-    ("Database healthy", _yn(dash.get("db_healthy"))),
-    ("Database error", _human(dash.get("db_error") or "")),
-    ("Schema user_version", _fmt((snap.get("database") or {}).get("schema_user_version"))),
-    ("Last run id", _fmt(run_state.get("run_id"))),
-    ("Last run phase", _human(run_state.get("phase") or "")),
-    ("Last run risk allowed", _yn(run_state.get("risk_allowed"))),
-    ("Open orders at last run", _fmt(run_state.get("open_orders"))),
-    ("Read-only", _yn(dash.get("read_only"))),
-])}
+<div class="panel">
+  <h2 class="panel-title">System</h2>
+  {_kv([
+      ("Dashboard time", _wib(dash.get("generated_at_utc"))),
+      ("Database healthy", _yn(dash.get("db_healthy"))),
+      ("Database error", _human(dash.get("db_error") or "")),
+      ("Schema user_version", _fmt((snap.get("database") or {}).get("schema_user_version"))),
+      ("Last run id", _fmt(run_state.get("run_id"))),
+      ("Last run phase", _human(run_state.get("phase") or "")),
+      ("Last run risk allowed", _yn(run_state.get("risk_allowed"))),
+      ("Open orders at last run", _fmt(run_state.get("open_orders"))),
+      ("Read-only", _yn(dash.get("read_only"))),
+  ])}
+</div>
 </section>
-<p class="foot">Public read-only monitor &middot; no authentication by design
-&middot; this dashboard cannot place, cancel, or modify orders, cannot change
-risk or configuration, and cannot release the kill switch &middot; page
-auto-refreshes every 12s &middot; API: <code>/api/status</code>,
+<p class="foot">Public read-only monitor \u00b7 no authentication by design
+\u00b7 this dashboard cannot place, cancel, or modify orders, cannot change
+risk or configuration, and cannot release the kill switch \u00b7 page
+auto-refreshes every 12s \u00b7 API: <code>/api/status</code>,
 <code>/healthz</code></p>
 <script>{_DASH_JS}</script>
 </main></body></html>"""

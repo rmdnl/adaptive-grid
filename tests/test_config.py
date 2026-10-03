@@ -10,14 +10,18 @@ def _base_config():
     """Minimal valid config for grid trading."""
     return {
         "environment": {"mode": "testnet", "dry_run": True, "allow_live_execution": False},
-        "symbol": "BTCUSDT",
-        "timeframe": "15m",
+        "symbols": "BTCUSDT",
+        "timeframe": "4h",
         "grid": {
+            "mode_by_symbol": {
+                "BTCUSDT": "arithmetic"
+            },
             "step_pct": Decimal("0.006"),
-            "min_cells": 3,
-            "max_levels": 10,
+            "min_cells": 6,
+            "max_levels": 40,
             "hard_min_net_pct": Decimal("0.003"),
-            "preferred_net_max_pct": Decimal("0.005"),
+            "preferred_net_max_pct": Decimal("0.004"),
+            "min_gross_profit_pct": Decimal("0.005"),
         },
         "range": {
             "mode": "manual",
@@ -26,6 +30,21 @@ def _base_config():
             "lookback": 200,
             "buffer_pct": Decimal("0.01"),
             "auto": {},
+        },
+        "strategy": {
+            "entry": {
+                "adx_max": Decimal("20"),
+                "rsi_max": Decimal("35"),
+                "bb_percent_b_max": Decimal("0"),
+                "volume_oscillator_min": Decimal("0"),
+            },
+            "exit": {
+                "rsi_min": Decimal("70"),
+                "adx_min": Decimal("25"),
+                "bb_percent_b_min": Decimal("1"),
+                "zscore_threshold": Decimal("2.5"),
+            },
+            "cooldown_hours": 3,
         },
         "market_filter": {
             "adx_max": Decimal("28"),
@@ -89,9 +108,9 @@ def _planner_section(**overrides):
 
 def _intelligence_section():
     return {
-        "timeframe": "15m",
+        "timeframe": "4h",
         "min_candles": 60,
-        "max_candle_age_seconds": 3600,
+        "max_candle_age_seconds": 5400,
         "atr_period": 14,
         "adx_period": 14,
         "bb_length": 20,

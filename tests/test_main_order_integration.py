@@ -57,6 +57,8 @@ def _latest_row():
         "bb_width": Decimal("0.001"),
         "volume_ratio": Decimal("1.0"),
         "rsi": Decimal("50"),
+        "volume_oscillator": Decimal("0.5"),  # Positive to pass entry check
+        "z_score": Decimal("0"),  # Neutral to pass exit check
     }
 
 
@@ -103,10 +105,14 @@ def _config(tmp_path, dry_run=True):
             "dry_run": dry_run,
             "allow_live_execution": False,
         },
-        "symbol": "BNBUSDT",
-        "timeframe": "15m",
+        "symbols": "BNBUSDT",
+        "timeframe": "4h",
         "grid": {
-            "step_pct": Decimal("0.006"),
+            "mode_by_symbol": {
+                "BNBUSDT": "arithmetic"
+            },
+            "step_pct": Decimal("0.006"),  # Legacy field for main.py compatibility
+            "min_gross_profit_pct": Decimal("0.005"),
             "hard_min_net_pct": Decimal("0.003"),
             "preferred_net_max_pct": Decimal("0.004"),
             "min_cells": 6,
@@ -119,6 +125,21 @@ def _config(tmp_path, dry_run=True):
             "lookback": 200,
             "buffer_pct": Decimal("0.01"),
             "auto": {},
+        },
+        "strategy": {
+            "entry": {
+                "adx_max": Decimal("20"),
+                "rsi_max": Decimal("35"),
+                "bb_percent_b_max": Decimal("0"),
+                "volume_oscillator_min": Decimal("0"),
+            },
+            "exit": {
+                "rsi_min": Decimal("70"),
+                "adx_min": Decimal("25"),
+                "bb_percent_b_min": Decimal("1"),
+                "zscore_threshold": Decimal("2.5"),
+            },
+            "cooldown_hours": 3,
         },
         "market_filter": {
             "adx_max": Decimal("28"),

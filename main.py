@@ -412,7 +412,11 @@ def main():
               "Fix or manually reconcile, then re-run.")
         return 1
 
-    mode=cfg["environment"]["mode"]; symbol=cfg["symbol"]
+    mode=cfg["environment"]["mode"]; 
+    symbols = cfg.get("symbols", "")
+    symbol = symbols.split(",")[0].strip() if symbols else cfg.get("symbol", "")
+    if not symbol:
+        raise ConfigError("No symbol configured (symbols or symbol)")
     client=make_client(mode, os.getenv("BINANCE_API_KEY",""), os.getenv("BINANCE_API_SECRET",""))
 
     symbol_info=fetch_symbol_info(client,symbol)

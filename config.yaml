@@ -3,11 +3,22 @@ environment:
   dry_run: true
   allow_live_execution: false
 
-symbol: BNBUSDT
-timeframe: 15m
+# Multi-symbol configuration (comma-separated, e.g., "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT")
+# Can also be set via SYMBOLS env var
+symbols: "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT"
+timeframe: "4h"
 
 grid:
-  step_pct: 0.006
+  # Arithmetic for BTC/ETH/BNB, Geometric for SOL
+  mode_by_symbol:
+    BTCUSDT: "arithmetic"
+    ETHUSDT: "arithmetic"
+    SOLUSDT: "geometric"
+    BNBUSDT: "arithmetic"
+  # Grid step = 1x ATR(14) percentage (dynamic per symbol)
+  # Minimum gross profit per grid = 0.5% (fee 0.1% maker + 0.1% taker + slippage)
+  min_gross_profit_pct: 0.005
+  # Minimum net profit per grid = 0.3% (after fees)
   hard_min_net_pct: 0.003
   preferred_net_max_pct: 0.004
   min_cells: 6
@@ -27,30 +38,40 @@ range:
     min_quality_score: 65
     require_price_inside: true
 
+# Auto-entry / Auto-exit strategy configuration
+strategy:
+  # Auto-entry: Bot ONLY starts grid if ALL conditions met (AND logic)
+  entry:
+    adx_max: 20                    # ADX(14) < 20 (sideways market)
+    rsi_max: 35                    # RSI(14) < 35 (oversold)
+    bb_percent_b_max: 0.0          # %B <= 0 (price at/below lower Bollinger Band)
+    volume_oscillator_min: 0.0     # Volume Oscillator(5,10) > 0 (volume expanding)
+  # Auto-exit: Bot MUST exit if ANY condition met (OR logic)
+  exit:
+    rsi_min: 70                    # RSI(14) >= 70 (overbought)
+    adx_min: 25                    # ADX(14) > 25 (strong trend breakout)
+    bb_percent_b_min: 1.0          # %B > 1 (price above upper Bollinger Band)
+    zscore_threshold: 2.5          # |Z-Score(20)| > 2.5 (extreme deviation)
+  # Cooldown after auto-exit
+  cooldown_hours: 3                # Hours to wait before new auto-entry allowed
+
 market_filter:
   adx_max: 28
   atr_pct_max: 0.025
   bb_width_max: 0.06
   volume_spike_max: 2.5
 
-# Phase 5A: adaptive grid planner.
-# Converts market intelligence into a validated candidate grid plan.
-# Uses candle-index-based cooldown (not wall-clock time) and hysteresis
-# to avoid unnecessary reconfigurations.
 adaptive_planner:
   cooldown_candles: 4
   hysteresis:
-    range_change_pct: 0.02       # 2% range shift triggers reconfiguration
-    step_change_pct: 0.10        # 10% step change triggers reconfiguration
-    grid_count_change: 3         # ±3 cells triggers reconfiguration
-    quality_degradation: 5       # score drops by 5 triggers reconfiguration
-    regime_change: true          # any regime change triggers reconfiguration
+    range_change_pct: 0.02
+    step_change_pct: 0.10
+    grid_count_change: 3
+    quality_degradation: 5
+    regime_change: true
 
-# Phase 4: read-only market regime + liquidity intelligence.
-# This block only filters whether the existing fixed-range grid may run. It
-# never widens/shrinks the configured range and never predicts price.
 market_intelligence:
-  timeframe: 15m
+  timeframe: "4h"
   min_candles: 60
   max_candle_age_seconds: 5400
   atr_period: 14
@@ -101,9 +122,6 @@ risk:
   range_break_buffer_pct: 0.01
   daily_profit_lock_pct: 0.01
   cooldown_minutes: 30
-  # Dedicated 15m candle-close lower-boundary stop (independent of the
-  # current-price range-break buffer above).  Kills when the latest CLOSED
-  # 15m candle close <= LOWER_PRICE * (1 - stop_if_below_lower_pct).
   stop_if_below_lower_pct: 0.02
 
 logging:
@@ -111,23 +129,23 @@ logging:
   log_path: ./logs/grid_bot.log
   csv_path: ./logs/trades.csv
 
-# Round 10: continuous runtime (orchestration only — it repeatedly invokes
-# the existing authoritative single-cycle main() entrypoint; it places no
-# orders and holds no trading logic of its own).  Cadence: one cycle per NEW
-# closed candle of `timeframe`, paced by interval_seconds; interval retry
-# after a cycle refused.  interval_seconds < timeframe keeps candle-aligned
-# operation (15m timeframe ⇒ default 60s is candle-aligned).
 runtime:
   enabled: true
   interval_seconds: 60
   boundary_grace_seconds: 15
 
-# Phase 6A: Binance Spot Testnet read-only adapter.
-# Credentials come from environment variables (BINANCE_API_KEY, BINANCE_API_SECRET).
-# This block only configures transport/safety — never credentials.
 binance:
-  environment: testnet
-  base_url: https://testnet.binance.vision
-  timeout_ms: 5000
-  retries: 3
-  backoff_ms: 1000
+  # Testnet configuration
+  testnet:
+    environment: testnet
+    base_url: https://testnet.binance.vision
+    timeout_ms: 5000
+    retries: 3
+    backoff_ms: 1000
+  # Live configuration (credentials from .env)
+  live:
+    environment: live
+    base_url: https://api.binance.com
+    timeout_ms: 5000
+    retries: 3
+    backoff_ms: 1000

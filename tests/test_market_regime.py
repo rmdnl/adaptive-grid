@@ -50,6 +50,9 @@ def make_features(
         penetration_count=0,
         spread=Decimal("0.02"),
         spread_pct=Decimal("0.0002"),
+        rsi=Decimal("50"),
+        volume_oscillator=Decimal("0.5"),
+        z_score=Decimal("0"),
     )
 
 

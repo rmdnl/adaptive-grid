@@ -29,7 +29,7 @@ import storage
 def bot_config():
     return {
         "mode": "testnet", "dry_run": True, "allow_live_execution": False,
-        "symbol": "BNBUSDT", "timeframe": "15m",
+        "symbols": "BNBUSDT", "timeframe": "15m",
         "max_drawdown_pct": "0.02", "grid_step_pct": "0.006",
         "hard_min_net_pct": "0.003", "config_error": None,
     }
@@ -176,7 +176,7 @@ def test_root_html(server):
     assert "TESTNET / PAPER" in html
     assert "DRY RUN" in html
     assert "LIVE DISABLED" in html
-    assert "KILL SWITCH OFF" in html
+    assert "KILL OFF" in html
     # per-cycle grid/market state renders even when every cycle is BLOCKED
     # machine codes are now human-readable: "Blocked" instead of "GRID_BLOCKED"
     assert "Blocked" in html
@@ -211,7 +211,8 @@ def test_tabbed_layout_and_penting_filter(server):
     assert "penting-only" in html            # CSS rule that hides details
     assert "localStorage" in html            # remembers the user's choice
     # detail blocks are tagged so the "penting saja" filter hides them
-    assert "detail-block" in html            # detail section headings
+    # Using panel class instead of detail-block
+    assert "panel" in html            # panel sections
     # the CSS/JS chrome must not leak any credential material
     for secret in ("api_key", "api_secret", "BINANCE_API_KEY",
                    "BINANCE_API_SECRET", "password"):

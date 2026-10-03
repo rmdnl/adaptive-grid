@@ -8,8 +8,10 @@ import yaml
 
 ALLOWED_MODES = {"testnet", "live"}
 
+
 class ConfigError(ValueError):
     pass
+
 
 def load_config(path: str = "config.yaml") -> dict[str, Any]:
     p = Path(path)
@@ -20,11 +22,61 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
     validate_config(cfg)
     return cfg
 
+
 def _d(value: Any) -> Decimal:
     try:
         return Decimal(str(value))
     except Exception as exc:
         raise ConfigError(f"Invalid decimal value: {value!r}") from exc
+
+
+def _require_positive_int(section: str, key: str, value: Any, minimum: int = 1) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{section}.{key} must be an integer")
+    if value < minimum:
+        raise ConfigError(f"{section}.{key} must be >= {minimum}")
+    return value
+
+
+def _parse_symbols(cfg: dict[str, Any]) -> list[str]:
+    """Parse symbols from config.yaml or environment variable."""
+    import os
+    symbols_env = os.getenv("SYMBOLS", "").strip()
+    if symbols_env:
+        symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
+    else:
+        symbols_raw = cfg.get("symbols", "")
+        if isinstance(symbols_raw, str):
+            symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+        elif isinstance(symbols_raw, list):
+            symbols = [str(s).strip().upper() for s in symbols_raw if str(s).strip()]
+        else:
+            symbols = []
+    if not symbols:
+        raise ConfigError("At least one symbol must be configured (symbols in config.yaml or SYMBOLS env var)")
+    for sym in symbols:
+        if not sym.isalnum():
+            raise ConfigError(f"Invalid symbol: {sym} (must contain only alphanumeric characters)")
+    return symbols
+
+
+def _get_binance_env() -> str:
+    """Get Binance environment from environment variable or config."""
+    import os
+    return os.getenv("BINANCE_ENV", "testnet").strip().lower()
+
+
+def _load_binance_credentials(env: str) -> dict[str, str]:
+    """Load Binance API credentials based on environment (testnet/live)."""
+    import os
+    if env == "live":
+        api_key = os.getenv("BINANCE_LIVE_API_KEY", "")
+        api_secret = os.getenv("BINANCE_LIVE_API_SECRET", "")
+    else:
+        api_key = os.getenv("BINANCE_TESTNET_API_KEY", "")
+        api_secret = os.getenv("BINANCE_TESTNET_API_SECRET", "")
+    return {"api_key": api_key, "api_secret": api_secret}
+
 
 def validate_config(cfg: dict[str, Any]) -> None:
     env = cfg.get("environment", {})
@@ -43,18 +95,29 @@ def validate_config(cfg: dict[str, Any]) -> None:
             "Live mode is fail-closed: live execution is not implemented in this release."
         )
 
-    symbol = str(cfg.get("symbol", "")).upper().strip()
-    if not symbol.isalnum():
-        raise ConfigError("symbol must contain only Binance symbol characters")
-    if cfg.get("timeframe") != "15m":
-        raise ConfigError("This safety foundation is locked to 15m")
+    # Parse and validate symbols
+    symbols = _parse_symbols(cfg)
+    cfg["_parsed_symbols"] = symbols  # inject for downstream use
+
+    timeframe = cfg.get("timeframe")
+    if timeframe not in ("1h", "4h"):
+        raise ConfigError("timeframe must be '1h' or '4h'")
 
     grid = cfg.get("grid", {})
-    step = _d(grid.get("step_pct"))
-    hard_min = _d(grid.get("hard_min_net_pct"))
-    preferred_max = _d(grid.get("preferred_net_max_pct"))
-    if step <= 0:
-        raise ConfigError("grid.step_pct must be > 0")
+    mode_by_symbol = grid.get("mode_by_symbol", {})
+    if not isinstance(mode_by_symbol, dict):
+        raise ConfigError("grid.mode_by_symbol must be a dict mapping symbol -> arithmetic|geometric")
+    for sym in symbols:
+        if sym not in mode_by_symbol:
+            raise ConfigError(f"grid.mode_by_symbol missing entry for {sym}")
+        if mode_by_symbol[sym] not in ("arithmetic", "geometric"):
+            raise ConfigError(f"grid.mode_by_symbol[{sym}] must be 'arithmetic' or 'geometric'")
+
+    min_gross = _d(grid.get("min_gross_profit_pct", "0.005"))
+    hard_min = _d(grid.get("hard_min_net_pct", "0.003"))
+    preferred_max = _d(grid.get("preferred_net_max_pct", "0.004"))
+    if min_gross <= 0:
+        raise ConfigError("grid.min_gross_profit_pct must be > 0")
     if hard_min < _d("0.003"):
         raise ConfigError("grid.hard_min_net_pct cannot be below 0.003")
     if preferred_max < hard_min:
@@ -73,6 +136,27 @@ def validate_config(cfg: dict[str, Any]) -> None:
         if lo <= 0 or hi <= lo:
             raise ConfigError("Manual range requires 0 < lower_price < upper_price")
 
+    # Strategy validation
+    strategy = cfg.get("strategy", {})
+    entry = strategy.get("entry", {})
+    exit_cfg = strategy.get("exit", {})
+    for key in ("adx_max", "rsi_max", "bb_percent_b_max", "volume_oscillator_min"):
+        if key not in entry:
+            raise ConfigError(f"strategy.entry.{key} is required")
+    for key in ("rsi_min", "adx_min", "bb_percent_b_min", "zscore_threshold"):
+        if key not in exit_cfg:
+            raise ConfigError(f"strategy.exit.{key} is required")
+    # Cooldown hours validation
+    cooldown_hours = strategy.get("cooldown_hours")
+    if cooldown_hours is None:
+        raise ConfigError("strategy.cooldown_hours is required")
+    try:
+        ch = int(cooldown_hours)
+    except (TypeError, ValueError):
+        raise ConfigError("strategy.cooldown_hours must be an integer")
+    if ch < 0:
+        raise ConfigError("strategy.cooldown_hours must be >= 0")
+
     fees = cfg.get("fees", {})
     for key in ("maker_fee_fallback", "taker_fee_fallback", "slippage_roundtrip_pct"):
         if _d(fees.get(key)) < 0:
@@ -83,10 +167,6 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ConfigError("risk.max_equity_drawdown_pct must be > 0")
     if _d(risk.get("range_break_buffer_pct")) < 0:
         raise ConfigError("risk.range_break_buffer_pct cannot be negative")
-    # 15m candle-close lower-boundary stop (dedicated, fail-closed).  Must be
-    # explicitly present and in (0, 1): 0 disables the stop, >= 1 makes the
-    # threshold non-positive.  Missing/invalid values are refused so the
-    # production run cannot fall back to a hidden default.
     if "stop_if_below_lower_pct" not in risk:
         raise ConfigError(
             "risk.stop_if_below_lower_pct is required "
@@ -152,12 +232,6 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if "binance" in cfg:
         _validate_binance(cfg)
 
-def _require_positive_int(section: str, key: str, value: Any, minimum: int = 1) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigError(f"market_intelligence.{section}.{key} must be an integer")
-    if value < minimum:
-        raise ConfigError(f"market_intelligence.{section}.{key} must be >= {minimum}")
-    return value
 
 def _validate_market_intelligence(cfg: dict[str, Any]) -> None:
     """Validate the Phase 4 read-only market-intelligence configuration.
@@ -172,7 +246,7 @@ def _validate_market_intelligence(cfg: dict[str, Any]) -> None:
     timeframe = mi.get("timeframe")
     if timeframe != cfg.get("timeframe"):
         raise ConfigError(
-            "market_intelligence.timeframe must match the locked 15m timeframe"
+            "market_intelligence.timeframe must match the configured timeframe"
         )
 
     for key, minimum in (
@@ -184,7 +258,7 @@ def _validate_market_intelligence(cfg: dict[str, Any]) -> None:
         ("volume_baseline_period", 1),
         ("range_stability_period", 2),
     ):
-        _require_positive_int("_root", key, mi.get(key), minimum)
+        _require_positive_int("market_intelligence", key, mi.get(key), minimum)
 
     if len({mi["atr_period"], mi["adx_period"], mi["bb_length"]}) < 1:
         raise ConfigError("market_intelligence indicator periods must be positive")
@@ -304,48 +378,59 @@ def _validate_adaptive_planner(cfg: dict[str, Any]) -> None:
 
 
 def _validate_binance(cfg: dict[str, Any]) -> None:
-    """Validate the Phase 6A Binance Spot Testnet adapter configuration.
-
-    Ensures fail-closed safety: environment must be 'testnet', transports
-    must be bounded, and all values must be well-typed.
-    """
+    """Validate the Binance adapter configuration for both testnet and live."""
     bn = cfg.get("binance")
     if not isinstance(bn, dict):
         raise ConfigError("binance section is required")
 
-    env = bn.get("environment")
+    # Validate testnet section
+    testnet = bn.get("testnet")
+    if not isinstance(testnet, dict):
+        raise ConfigError("binance.testnet section is required")
+    env = testnet.get("environment")
     if env != "testnet":
-        raise ConfigError(
-            f"binance.environment must be 'testnet' (got {env!r}). "
-            "This adapter is fail-closed: production trading is not permitted."
-        )
-
-    base_url = str(bn.get("base_url", "")).strip()
+        raise ConfigError(f"binance.testnet.environment must be 'testnet' (got {env!r})")
+    base_url = str(testnet.get("base_url", "")).strip()
     if not base_url:
-        raise ConfigError("binance.base_url is required")
+        raise ConfigError("binance.testnet.base_url is required")
     if "testnet.binance.vision" not in base_url:
         raise ConfigError(
-            "binance.base_url must point to the Binance Spot Testnet endpoint. "
-            "Production endpoints are not permitted in this release."
+            "binance.testnet.base_url must point to the Binance Spot Testnet endpoint. "
+            "Production endpoints are not permitted."
         )
 
-    for key, minimum in (
-        ("timeout_ms", 1),
-        ("retries", 0),
-        ("backoff_ms", 0),
-    ):
-        _require_positive_int("binance", key, bn.get(key), minimum)
+    # Validate live section
+    live = bn.get("live")
+    if not isinstance(live, dict):
+        raise ConfigError("binance.live section is required")
+    env = live.get("environment")
+    if env != "live":
+        raise ConfigError(f"binance.live.environment must be 'live' (got {env!r})")
+    base_url = str(live.get("base_url", "")).strip()
+    if not base_url:
+        raise ConfigError("binance.live.base_url is required")
+    if "api.binance.com" not in base_url:
+        raise ConfigError(
+            "binance.live.base_url must point to the Binance Spot production endpoint."
+        )
 
-    timeout = int(bn.get("timeout_ms", 0))
-    if timeout > 30000:
-        raise ConfigError("binance.timeout_ms must not exceed 30000 (30s) to avoid runaway requests")
+    for section_name in ("testnet", "live"):
+        section = bn.get(section_name, {})
+        for key, minimum in (
+            ("timeout_ms", 1),
+            ("retries", 0),
+            ("backoff_ms", 0),
+        ):
+            _require_positive_int(f"binance.{section_name}", key, section.get(key), minimum)
 
-    # Optional defensive response-size guards (Patch 3).  When absent the
-    # adapter defaults apply; when present they must be positive integers.
-    for key in ("max_open_orders", "max_account_assets"):
-        if key in bn:
-            value = bn.get(key)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ConfigError(
-                    f"binance.{key}, when provided, must be an integer >= 1"
-                )
+        timeout = int(section.get("timeout_ms", 0))
+        if timeout > 30000:
+            raise ConfigError(f"binance.{section_name}.timeout_ms must not exceed 30000 (30s)")
+
+        for key in ("max_open_orders", "max_account_assets"):
+            if key in section:
+                value = section.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ConfigError(
+                        f"binance.{section_name}.{key}, when provided, must be an integer >= 1"
+                    )

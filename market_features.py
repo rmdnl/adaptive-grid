@@ -1,8 +1,8 @@
 """Deterministic Phase 4 Market Features Calculation.
 
 Calculates pure, deterministic market features (ATR, ADX, Bollinger Bands,
-volume baseline, price range stability, liquidity spread) using closed 15m
-candles and read-only market quotes.
+volume baseline, price range stability, liquidity spread, Volume Oscillator,
+Z-Score) using closed candles and read-only market quotes.
 
 Design Principles:
 - Fails closed on malformed, incomplete, non-monotonic or insufficient candle data.
@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from indicators import adx_components, atr, bollinger_bands, volume_baseline
+from indicators import adx_components, atr, bollinger_bands, volume_baseline, rsi, volume_oscillator, z_score
 from market_data import MarketQuote
 
 
@@ -155,7 +155,7 @@ def validate_candles(
 
 @dataclass(frozen=True)
 class MarketFeatures:
-    """Deterministic market features calculated from closed 15m candles."""
+    """Deterministic market features calculated from closed candles."""
 
     symbol: str
     close_price: Decimal
@@ -178,6 +178,9 @@ class MarketFeatures:
     penetration_count: int
     spread: Decimal | None
     spread_pct: Decimal | None
+    rsi: Decimal
+    volume_oscillator: Decimal
+    z_score: Decimal
 
 
 def calculate_market_features(
@@ -210,6 +213,9 @@ def calculate_market_features(
     6. Liquidity / Spread:
        spread = ask_price - bid_price
        spread_pct = spread / mid_price
+    7. RSI: Wilder RMA over 14 periods
+    8. Volume Oscillator: (Short MA - Long MA) / Long MA * 100 (periods 5, 10)
+    9. Z-Score: (close - mean) / std over 20 periods
     """
     mi = config.get("market_intelligence", config)
     min_candles = int(mi.get("min_candles", 60))
@@ -220,6 +226,9 @@ def calculate_market_features(
     bb_std_mult = float(mi.get("bb_std_mult", 2.0))
     vol_period = int(mi.get("volume_baseline_period", 20))
     stability_period = int(mi.get("range_stability_period", 20))
+    vol_osc_short = int(mi.get("volume_oscillator_short_period", 5))
+    vol_osc_long = int(mi.get("volume_oscillator_long_period", 10))
+    zscore_period = int(mi.get("zscore_period", 20))
 
     validated_df = validate_candles(
         df,
@@ -278,7 +287,28 @@ def calculate_market_features(
     else:
         vol_spike_ratio_dec = current_vol_dec / base_vol_dec
 
-    # 5. Range Stability metrics
+    # 5. RSI (period 14)
+    rsi_series = rsi(validated_df, length=adx_period)  # reuse adx_period (14) for RSI
+    valid_rsi = rsi_series.dropna()
+    if valid_rsi.empty:
+        raise InsufficientDataError("Unable to calculate RSI from supplied candle history")
+    rsi_dec = _to_decimal(round(valid_rsi.iloc[-1], 2), "rsi")
+
+    # 6. Volume Oscillator (short=5, long=10)
+    vol_osc_series = volume_oscillator(validated_df, short_period=vol_osc_short, long_period=vol_osc_long)
+    valid_vol_osc = vol_osc_series.dropna()
+    if valid_vol_osc.empty:
+        raise InsufficientDataError("Unable to calculate Volume Oscillator from supplied candle history")
+    vol_osc_dec = _to_decimal(round(valid_vol_osc.iloc[-1], 4), "volume_oscillator")
+
+    # 7. Z-Score (period 20)
+    zscore_series = z_score(validated_df, length=zscore_period)
+    valid_zscore = zscore_series.dropna()
+    if valid_zscore.empty:
+        raise InsufficientDataError("Unable to calculate Z-Score from supplied candle history")
+    zscore_dec = _to_decimal(round(valid_zscore.iloc[-1], 4), "z_score")
+
+    # 8. Range Stability metrics
     if len(validated_df) < stability_period:
         raise InsufficientDataError(
             f"Not enough candles for range stability: {len(validated_df)} < {stability_period}"
@@ -311,7 +341,7 @@ def calculate_market_features(
     containment_pct_dec = Decimal(contained_count) / Decimal(stability_period)
     penetration_count = stability_period - contained_count
 
-    # 6. Liquidity / Quote
+    # 9. Liquidity / Quote
     spread_dec: Decimal | None = None
     spread_pct_dec: Decimal | None = None
     if quote is not None:
@@ -344,4 +374,7 @@ def calculate_market_features(
         penetration_count=penetration_count,
         spread=spread_dec,
         spread_pct=spread_pct_dec,
+        rsi=rsi_dec,
+        volume_oscillator=vol_osc_dec,
+        z_score=zscore_dec,
     )

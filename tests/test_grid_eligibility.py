@@ -63,6 +63,9 @@ def make_features_eligibility(
         penetration_count=1,
         spread=Decimal("0.05") if spread_pct else None,
         spread_pct=Decimal(spread_pct) if spread_pct else None,
+        rsi=Decimal("50"),
+        volume_oscillator=Decimal("0.5"),
+        z_score=Decimal("0"),
     )
 
 
