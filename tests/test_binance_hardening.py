@@ -519,9 +519,25 @@ def test_load_config_rejects_ambiguous_bool(monkeypatch):
 
 def test_load_config_rejects_empty_api_key(monkeypatch):
     _set_env_basics(monkeypatch)
+    # Both credential-name schemes must be empty before the loader may
+    # reject: the canonical BINANCE_TESTNET_* names take precedence, the
+    # legacy BINANCE_API_* names are the fallback.
     monkeypatch.setenv("BINANCE_API_KEY", "")
+    monkeypatch.delenv("BINANCE_TESTNET_API_KEY", raising=False)
     with pytest.raises(BinanceTestnetConfigError):
         load_testnet_config_from_env()
+
+
+def test_load_config_accepts_canonical_credentials(monkeypatch):
+    """Canonical BINANCE_TESTNET_* names are sufficient on their own."""
+    _set_env_basics(monkeypatch)
+    monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+    monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+    monkeypatch.setenv("BINANCE_TESTNET_API_KEY", "k2")
+    monkeypatch.setenv("BINANCE_TESTNET_API_SECRET", "s2")
+    cfg = load_testnet_config_from_env()
+    assert cfg.environment == "testnet"
+    assert cfg.dry_run is True
 
 
 def test_load_config_rejects_missing_max_env_uses_default(monkeypatch):

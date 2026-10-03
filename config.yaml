@@ -110,6 +110,11 @@ execution:
   order_quote_size: 25
   total_quote_budget: 0
   max_inventory_pct: 0.70
+  # Testnet execution bridge (real orders) — double-gated, DEFAULT OFF.
+  # Mirroring risk-gated paper orders to real Binance Spot TESTNET
+  # LIMIT_MAKER orders requires BOTH this flag AND TESTNET_ORDERS_ENABLED=
+  # true in .env.  Live execution is not implemented and stays unreachable.
+  testnet_execution: false
 
 fees:
   maker_fee_fallback: 0.001

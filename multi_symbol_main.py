@@ -45,6 +45,11 @@ from dotenv import load_dotenv
 
 from cancel_controller import CancelController
 from config_loader import ConfigError, load_config, resolve_binance_credentials
+from execution_bridge import (
+    BridgeGate,
+    TestnetExecutionBridge,
+    build_bridge_from_env,
+)
 from fee_model import effective_fees
 from grid_engine import (
     GridMode,
@@ -253,6 +258,7 @@ class SymbolCycleRunner:
         client,
         logger: logging.Logger,
         shutdown: ShutdownCoordinator,
+        bridge: TestnetExecutionBridge | None = None,
     ):
         self.symbol = symbol
         self.cfg = cfg
@@ -260,6 +266,7 @@ class SymbolCycleRunner:
         self.client = client
         self.logger = logger
         self.shutdown = shutdown
+        self.bridge = bridge
         init_db(db_path)
 
     # -- config accessors ----------------------------------------------------
@@ -341,12 +348,17 @@ class SymbolCycleRunner:
                 (kill_prior or {}).get("trigger") or "KILL_STATE_RESTART_RECOVERY",
                 note="restart recovery",
             )
+            bridge_cancels = (
+                self.bridge.cancel_all_open("kill")
+                if self.bridge is not None else None
+            )
             record_risk_event(db_path, False, "KILL_STATE_ACTIVE", {
                 "symbol": self.symbol,
                 "trigger": (kill_prior or {}).get("trigger"),
                 "activated_at": (kill_prior or {}).get("activated_at"),
                 "cancel_status": report.overall_status,
                 "pending_orders": report.pending,
+                "bridge_cancels": bridge_cancels,
                 "note": "restart recovery: kill state remains active",
             })
             result["status"] = "KILL_ACTIVE"
@@ -649,6 +661,24 @@ class SymbolCycleRunner:
                                  cfg["execution"]["max_open_orders"]),
             ))
 
+        # -- testnet execution bridge (double-gated; no-op when disabled) --------
+        bridge_reconcile = None
+        unknown_remote = None
+        if self.bridge is not None:
+            # Authoritative status pass over mirrored real orders, then the
+            # fail-closed foreign-order guard: own-namespace orders resting
+            # on the exchange that the runtime did not submit block new
+            # mirroring until an operator resolves them.
+            bridge_reconcile = self.bridge.reconcile()
+            unknown_remote = self.bridge.unknown_remote_orders()
+            if unknown_remote:
+                decisions.append(RiskDecision(
+                    False, ("EXECUTION_UNKNOWN_REMOTE_ORDERS",)))
+                self.logger.warning(
+                    "UNKNOWN REMOTE ORDERS on %s: %s — mirroring blocked "
+                    "until resolved", self.symbol,
+                    [u["cid"] for u in unknown_remote])
+
         combined = combine(*decisions)
 
         # -- risk kills: latch the persisted kill state --------------------------------
@@ -659,12 +689,17 @@ class SymbolCycleRunner:
                 " | ".join(kill_triggers),
                 note=f"price={current_price} range={lower}->{grid_result.effective_upper}",
             )
+            bridge_cancels = (
+                self.bridge.cancel_all_open("kill")
+                if self.bridge is not None else None
+            )
             record_risk_event(db_path, False, " | ".join(kill_triggers), {
                 "symbol": self.symbol,
                 "price": str(current_price),
                 "range": [str(lower), str(grid_result.effective_upper)],
                 "cancel_status": report.overall_status,
                 "pending_orders": report.pending,
+                "bridge_cancels": bridge_cancels,
             })
             result["status"] = "KILL_TRIGGERED"
             result["kill_triggered"] = True
@@ -692,6 +727,8 @@ class SymbolCycleRunner:
             "min_net_pct": str(plan_validation.min_net_pct),
             "pre_quant_min_net_pct": str(pre_quant_validation.min_net_pct),
             "pre_quant_allowed": pre_quant_validation.allowed,
+            "bridge_reconcile": bridge_reconcile,
+            "unknown_remote": unknown_remote,
             "mi_eligibility": (
                 mi_decision.status.value if mi_decision is not None else None
             ),
@@ -762,6 +799,16 @@ class SymbolCycleRunner:
                 self.logger.warning(
                     "PAPER CYCLE INCOMPLETE for %s: blocked=%s error=%s",
                     self.symbol, cycle_result.blocked_reason, cycle_result.error)
+            # Bridge: mirror every risk-gated paper submission as a real
+            # testnet LIMIT_MAKER order (no-op when the bridge is disabled).
+            if self.bridge is not None and cycle_result.order_intents:
+                mirrored = [self.bridge.mirror_order(intent)
+                            for intent in cycle_result.order_intents]
+                result["bridge_mirrored"] = mirrored
+                placed = sum(1 for m in mirrored if m.get("mirrored"))
+                self.logger.info(
+                    "BRIDGE MIRROR for %s: %d/%d orders placed on testnet",
+                    self.symbol, placed, len(mirrored))
 
     # -- strategy exit ---------------------------------------------------------
     def _execute_strategy_exit(self, exit_decision, current_price, rules,
@@ -784,6 +831,14 @@ class SymbolCycleRunner:
         controller = CancelController(self.db_path, self.cfg, rules)
         cancel_report = controller.cancel_open_orders(
             actor="strategy_exit", trigger_note=reasons)
+        # Propagate the close-all to the real testnet orders (no-op when the
+        # bridge is disabled).  Real base inventory is deliberately NOT
+        # market-sold here (LIMIT_MAKER-only write surface) — it is reported
+        # for operator action instead.
+        bridge_cancels = (
+            self.bridge.cancel_all_open("strategy_exit")
+            if self.bridge is not None else None
+        )
 
         paper_state = get_paper_account_state(self.db_path)
         liquidation: dict[str, Any] = {"liquidated": False,
@@ -826,6 +881,7 @@ class SymbolCycleRunner:
             "liquidation": liquidation,
             "plan_closed": plan_closed,
             "already_flat": already_flat,
+            "bridge_cancels": bridge_cancels,
         })
         set_state(self.db_path, "last_risk_decision",
                   {"allowed": False, "reason": "AUTO_EXIT_LIQUIDATION"})
@@ -865,18 +921,24 @@ def _setup_logger(cfg: dict[str, Any]) -> logging.Logger:
     return logging.getLogger("adaptive_grid_multi")
 
 
-def run_once(cfg, logger, client, symbols, shutdown) -> int:
+def run_once(cfg, logger, client, symbols, shutdown,
+             bridges: dict[str, TestnetExecutionBridge | None] | None = None) -> int:
     """Run one pass over every configured symbol; returns a process exit code.
 
     A per-symbol failure is isolated: it is logged, persisted, and the loop
     continues with the remaining symbols.  The pass itself only fails (exit
     1) when shutdown was requested mid-pass.
+
+    ``bridges`` maps symbol → optional TestnetExecutionBridge (built once at
+    startup); when omitted, mirroring is disabled for every symbol.
     """
     base_db_path = cfg["logging"]["sqlite_path"]
+    bridges = bridges or {}
     logger.info(
         "=== Multi-Symbol Adaptive Grid pass started: mode=testnet "
-        "dry_run=%s symbols=%s timeframe=%s ===",
-        cfg["environment"]["dry_run"], symbols, cfg["timeframe"])
+        "dry_run=%s symbols=%s timeframe=%s testnet_execution=%s ===",
+        cfg["environment"]["dry_run"], symbols, cfg["timeframe"],
+        {s: ("ON" if bridges.get(s) is not None else "OFF") for s in symbols})
 
     all_results = []
     for symbol in symbols:
@@ -887,7 +949,7 @@ def run_once(cfg, logger, client, symbols, shutdown) -> int:
         Path(symbol_db).parent.mkdir(parents=True, exist_ok=True)
 
         runner = SymbolCycleRunner(symbol, cfg, symbol_db, client, logger,
-                                   shutdown)
+                                   shutdown, bridge=bridges.get(symbol))
         result = runner.run_cycle()
         all_results.append(result)
 
@@ -981,8 +1043,28 @@ def main(argv: list[str] | None = None) -> int:
     symbols = list(cfg["_parsed_symbols"])
     shutdown = ShutdownCoordinator()
 
+    # Testnet execution bridge (roadmap B): built once per symbol.  Enabled
+    # only when execution.testnet_execution=true AND TESTNET_ORDERS_ENABLED=
+    # true; otherwise a disabled no-op for every symbol.
+    base_db_path = cfg["logging"]["sqlite_path"]
+    bridges: dict[str, TestnetExecutionBridge | None] = {}
+    for symbol in symbols:
+        bridge, gate = build_bridge_from_env(
+            cfg, symbol, _symbol_db_path(base_db_path, symbol))
+        bridges[symbol] = bridge
+        if gate.enabled:
+            logger.warning(
+                "TESTNET EXECUTION BRIDGE ENABLED for %s: real LIMIT_MAKER "
+                "orders will be placed on Binance Spot TESTNET "
+                "(paper ledger remains the strategy ledger)", symbol)
+        else:
+            logger.info(
+                "Testnet execution bridge disabled for %s: %s",
+                symbol, " | ".join(gate.reasons))
+
     if args.once:
-        return run_once(cfg, logger, client, symbols, shutdown)
+        return run_once(cfg, logger, client, symbols, shutdown,
+                        bridges=bridges)
 
     try:
         runtime_cfg = load_runtime_config(cfg)
@@ -994,7 +1076,8 @@ def main(argv: list[str] | None = None) -> int:
                 runtime_cfg.boundary_grace_seconds)
     runtime = GridRuntime(
         runtime_cfg,
-        cycle=lambda: run_once(cfg, logger, client, symbols, shutdown),
+        cycle=lambda: run_once(cfg, logger, client, symbols, shutdown,
+                               bridges=bridges),
         shutdown=shutdown,
     )
     return runtime.run(max_cycles=args.max_cycles)

@@ -5,6 +5,52 @@ in DRY_RUN / paper mode. Live trading is not implemented and must not be
 enabled without explicit authorization. All changes below preserve that
 invariant.
 
+## Release line: v4.1.0 (gated testnet execution bridge — roadmap B)
+
+### Milestone: real-order mirroring for the multi-symbol runtime
+- `execution_bridge.py` (new) — the risk-gated paper cycle stays the decision
+  engine; a double-gated bridge mirrors its outcomes to REAL Binance Spot
+  TESTNET LIMIT_MAKER orders (same clientOrderId/price/quantity):
+  - **Double gate, default OFF**: requires BOTH
+    `execution.testnet_execution: true` (config, validated boolean) AND
+    `TESTNET_ORDERS_ENABLED=true` (.env).  Either alone leaves every bridge
+    method a recorded no-op.  The write client re-asserts the full testnet
+    adapter barrier; there is no live path.
+  - **Crash-safe placement**: a `PENDING_PLACE` row is persisted before the
+    POST; the POST is never retried (duplicate clientOrderId is rejected by
+    the exchange, verified −2010); a lost/ambiguous ack lands in `UNKNOWN`
+    and is settled only by authoritative re-query.
+  - **Own ledger, paper untouched**: real orders and fills live in the new
+    per-symbol `execution_orders` table (explicit state machine:
+    PENDING_PLACE → OPEN → FILLED/CANCELED/EXPIRED/REJECTED/UNKNOWN).  The
+    paper engine keeps its deterministic fills — exactly one writer per
+    ledger, no double accounting; divergence is reported, never silently
+    reconciled.
+  - **Cancel propagation**: strategy auto-exit and kill paths propagate the
+    close-all to real testnet orders; ambiguous cancels (−2011/−2013) are
+    settled only by authoritative re-query.  Real inventory is deliberately
+    never market-sold (LIMIT_MAKER-only write surface) — reported for
+    operator action instead.
+  - **Fail-closed unknown-remote guard**: any open exchange order the
+    runtime did not place blocks new mirroring until an operator resolves
+    it.
+  - **Per-cycle reconciliation**: authoritative status pass over every
+    non-terminal mirrored order before the gates run.
+- `multi_symbol_main.py` — bridges built once at startup per symbol with
+  gate-status logging; wired into the kill branch, the kill-trigger path,
+  the strategy-exit path, the pre-cycle gate stack, and post-cycle
+  mirroring.  Behavior is byte-identical when the bridge is disabled.
+- `config_loader.py` / `config.yaml` — optional, validated
+  `execution.testnet_execution` (default `false`).
+- Tests: `tests/test_execution_bridge.py` (22) — gate matrix, ledger state
+  machine, mirroring outcomes, lost-ack recovery, partial-fill progress,
+  cancel semantics, unknown-remote guard, real gate construction, runtime
+  wiring (mirror + fail-closed block).
+- Verification: bridge disabled run unchanged on testnet; bridge enabled
+  run against real testnet (reconciliation + guard clean, exchange open
+  orders 0, no placements — no entry conditions met); config reverted to
+  default OFF.
+
 ## Release line: v4.0.1 (multi-symbol audit + repair, testnet-verified)
 
 ### Milestone: multi-symbol audit and full repair (branch `hermes/autonomous`)

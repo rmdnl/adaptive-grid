@@ -228,6 +228,13 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ConfigError("execution.max_open_orders must be >= 1")
     if _d(execution.get("order_quote_size")) <= 0:
         raise ConfigError("execution.order_quote_size must be > 0")
+    # Optional double-gate flag for the testnet execution bridge (roadmap B).
+    # Default false: the runtime is paper-only unless BOTH this flag and the
+    # TESTNET_ORDERS_ENABLED environment gate are explicitly true — and even
+    # then only the Binance Spot TESTNET is reachable.
+    testnet_execution = execution.get("testnet_execution", False)
+    if not isinstance(testnet_execution, bool):
+        raise ConfigError("execution.testnet_execution must be a boolean")
 
     paper = cfg.get("paper", {})
     for required_key in (
