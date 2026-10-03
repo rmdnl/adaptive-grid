@@ -22,7 +22,7 @@ Type=simple
 User=adaptive-grid
 Group=adaptive-grid
 WorkingDirectory=/opt/adaptive-grid
-ExecStart=/opt/adaptive-grid/.venv/bin/python dashboard.py
+ExecStart=/opt/adaptive-grid/.venv/bin/python3 dashboard.py
 # The dashboard reads files only; an unexpected exit is restarted fresh.
 Restart=on-failure
 RestartSec=15s

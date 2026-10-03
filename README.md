@@ -1,15 +1,15 @@
-# 🤖 Adaptive Grid Bot v3.2.1
-### Binance Spot • Dry Run • Anti-Rekt Edition™ 🗿📉
+# 🤖 Adaptive Grid Bot v4.0.0
+### Binance Spot • Multi-Symbol • Retrofuturism Dashboard • Anti-Rekt Edition™ 🗿📉✨
 
-Selamat datang di bot grid yang **belum sok kaya**.
+Selamat datang di bot grid yang **belum sok kaya, tapi udah multi-symbol**.
 
-Bot ini dibuat buat Binance **SPOT**, bukan futures, bukan leverage, bukan margin, bukan jurus "all in karena feeling gue kuat". 😭
+Bot ini dibuat buat Binance **SPOT ONLY** — bukan futures, bukan leverage, bukan margin, bukan jurus "all in karena feeling gue kuat". 😭
 
 Misi utamanya:
 
 > **Jangan RUG dulu. Profit belakangan.**
 
-Kalau kondisi market jelek, grid jelek, fee terlalu gede, atau risk engine bilang **NOPE**, bot akan diem.
+Kalau kondisi market jelek, grid jelek, fee terlalu gede, atau risk engine bilang **NOPE**, bot akan diem. Dan sekarang dia bisa **ghosting 4 symbol sekaligus**.
 
 Dan iya, itu fitur. Bukan bug. 🗿
 
@@ -39,7 +39,7 @@ Dompet lu aman dari bot ini. Untuk sekarang. 😭
 
 ---
 
-# 🚨 STATUS v3.2.1
+# 🚨 STATUS v4.0.0
 
 ```text
 SPOT ONLY             ✅
@@ -55,13 +55,61 @@ RECONCILIATION        ❌
 PARTIAL FILL ENGINE   ❌
 CRASH RECOVERY        ❌
 USER DATA WEBSOCKET   ❌
+
+MULTI-SYMBOL          ✅   ← BARU! BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT
+AUTO-ENTRY/EXIT       ✅   ← BARU! Smart entry/exit pakai ADX + RSI + VolOsc + Z-Score
+COOLDOWN TIMER        ✅   ← BARU! 3 jam cooldown after auto-exit
+RETROFUTURISM UI      ✅   ← BARU! Dashboard yang nggak kelihatan basi
+WIB TIMEZONE          ✅   ← BARU! Waktu Indo, bukan UTC yang bikin pusing
 ```
 
 Artinya:
 
-**JANGAN nyalain live trading.**
+**JANGAN nyalain live trading.** (Masih sama, jangan di-skip ya 😭)
 
-### Account-risk state (Phase 2B + PATCH 1 F-H1 + F-H2)
+### Fitur Baru v4.0.0 — "The Glow Up" ✨
+
+**1. Multi-Symbol Support** 🎯
+Bot sekarang handle **4 symbol sekaligus**: `BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT`. Konfigurasi lewat `.env`:
+```bash
+SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT
+```
+Setiap symbol punya database SQLite sendiri (`grid_bot_BTCUSDT.sqlite3`, dll) — nggak ada cross-contamination.
+
+**2. Auto-Entry Strategy** 🚀
+Masuk grid cuma kalau **SEMUA** kondisi ini terpenuhi (AND logic):
+- `ADX(14) < 20` — market nggak trending keras
+- `RSI(14) < 35` **ATAU** `%B ≤ 0` — oversold atau di luar Bollinger bawah
+- `Volume Oscillator(5,10) > 0` — volume expanding, bukan shrinking
+
+**3. Auto-Exit Strategy** 🛑
+Keluar/close-all kalau **SALAH SATU** terpenuhi (OR logic):
+- `RSI(14) ≥ 70` — overbought
+- `ADX(14) > 25` — trend terlalu kuat buat grid
+- `%B > 1` — di luar Bollinger atas
+- `|Z-Score(20)| > 2.5` — **EMERGENCY EXIT**, fluktuasi ekstrem detected! 🚨
+
+**4. Cooldown Timer 3 Jam** ⏳
+After auto-exit, bot **nggak boleh entry baru selama 3 jam**. Disimpan di database, survive restart. Buat ngejar entry lagi setelah exit itu FOMO, dan FOMO itu enemy. 🗿
+
+**5. Grid Mode Per Symbol** ⚙️
+- **Arithmetic**: BTCUSDT, ETHUSDT, BNBUSDT (step tetap)
+- **Geometric**: SOLUSDT (step proporsional, cocok buat volatility tinggi)
+
+**6. Retrofuturism Dashboard** 🌈
+Dashboard di port 8080 sekarang:
+- Cyan/Magenta/Amber glow aesthetic
+- Scanline + animated grid background
+- Monospace font (JetBrains Mono) biar kelihatan "hacker"
+- Mobile-friendly, responsive
+- **WIB timezone (UTC+7)** — nggak perlu hitung manual
+- Human-friendly numbers: `405275.83` bukan `405275.8339338000000000`
+- Per-symbol cards dengan VolOsc & Z-Score
+- "Penting saja" toggle (disimpan di localStorage)
+
+---
+
+### Account-risk state (Phase 2B + PATCH 1 F-H1 + F-H2 + v4.0.0 Updates)
 
 Bot membaca saldo Spot base/quote secara read-only dan menilai equity dengan
 harga ticker terbaru. Referensi equity (peak / high-water mark) sekarang
@@ -486,31 +534,41 @@ Kita tidak membiarkan FOMO punya akses ke API key. 🔐
 
 ---
 
-# 🧮 Grid Engine
+# 🧮 Grid Engine v4.0
 
-Grid menggunakan **geometric grid**.
+Grid sekarang support **Dual Mode**:
 
-Default:
-
-```text
-step = 0.60%
+```yaml
+grid:
+  mode_by_symbol:
+    BTCUSDT: arithmetic
+    ETHUSDT: arithmetic
+    SOLUSDT: geometric
+    BNBUSDT: arithmetic
+  min_gross_profit_pct: 0.005    # 0.50% minimum gross
+  hard_min_net_pct: 0.003        # 0.30% minimum net (after fees)
+  min_cells: 6
+  max_levels: 50
 ```
 
-Setiap level dihitung:
-
+**Arithmetic (BTC/ETH/BNB)**: Step tetap
 ```text
-next_price = current_price × 1.006
+price[i] = lower × (1 + step × i)
 ```
 
-Semua cell dicek.
-
-Kalau satu cell saja:
-
+**Geometric (SOL)**: Step proporsional (lebih cocok buat volatility tinggi)
 ```text
-< 0.30%
+price[i] = lower × (1 + step)^i
 ```
 
-maka:
+**Dynamic Step Calculation** 🧠
+```text
+step_pct = MAX(ATR(14)%, min_gross_profit_pct)
+```
+
+Jadi step otomatis menyesuaikan volatility market, tapi nggak pernah di bawah 0.50% gross. Conservative banget. 🗿
+
+Semua cell dicek. Kalau satu cell saja net profit < 0.30% (after 0.1% maker + 0.1% taker + slippage):
 
 ```text
 GRID = BLOCKED
@@ -596,13 +654,19 @@ environment:
   allow_live_execution: false
 ```
 
-Jalankan:
+Jalankan (Single Symbol - Legacy):
 
 ```bash
 python main.py
 ```
 
-Alurnya:
+Jalankan (Multi-Symbol v4.0 - Recommended):
+
+```bash
+python multi_symbol_main.py
+```
+
+Alurnya (multi-symbol):
 
 ```text
 market data
@@ -638,10 +702,39 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Copy:
+Copy .env:
 
 ```bash
 cp .env.example .env
+```
+
+Isi `.env` (format baru v4.0):
+
+```bash
+# Mode & Safety
+BINANCE_ENV=testnet           # testnet atau live
+DRY_RUN=true                  # HARUS true
+ALLOW_LIVE_EXECUTION=false    # HARUS false
+
+# Multi-Symbol (override config.yaml kalau diisi)
+SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT
+
+# Testnet Credentials (dapetin di https://testnet.binance.vision/)
+BINANCE_TESTNET_API_KEY=your_testnet_key
+BINANCE_TESTNET_API_SECRET=your_testnet_secret
+
+# Live Credentials (HATI-HATI! Hanya untuk production yang sudah siap)
+# BINANCE_LIVE_API_KEY=your_live_key
+# BINANCE_LIVE_API_SECRET=your_live_secret
+
+# Optional: Transport tuning
+BINANCE_TIMEOUT_MS=5000
+BINANCE_RETRIES=3
+BINANCE_BACKOFF_MS=1000
+
+# Dashboard (optional)
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=8080
 ```
 
 API key wajib:
@@ -649,13 +742,12 @@ API key wajib:
 ```text
 READ       ✅
 WITHDRAW  ❌
+SPOT       ✅
 ```
 
-Saat order engine nanti dibuat, permission Spot Trading saja yang diperlukan.
+**Withdrawal jangan pernah dikasih.** Bot trading tidak perlu jadi bendahara. 🗿
 
-**Withdrawal jangan pernah dikasih.**
-
-Bot trading tidak perlu jadi bendahara. 🗿
+**Testnet & Live credentials DIPERLAKUKAN TERPISAH.** Jangan pernah reuse production secret di testnet. Serius. 😭
 
 ---
 
@@ -670,7 +762,7 @@ pytest -q
 Target:
 
 ```text
-1031 passed
+1369 passed
 ```
 
 Kalau test gagal:
@@ -712,28 +804,39 @@ Bukan mesin ramalan masa depan. 🔮
 
 ---
 
-# 📊 Contoh output
+# 📊 Contoh output (v4.0 Multi-Symbol)
 
 ```text
-Result:
-  Risk decision : PASS
-  Reason        : PASS
-  Price         : 650.1234
-  Range         : 620 -> 660
-  Grid cells    : 10
-  Net/grid      : 0.3487%
-  Range quality : 78.50/100
-  Fee source    : ACCOUNT_COMMISSION_CONSERVATIVE
-  Execution     : DRY RUN, no order placement
+╔═══════════════════════════════════════════════════════════╗
+║  ADAPTIVE GRID v4.0 — MULTI-SYMBOL CYCLE                   ║
+╠═══════════════════════════════════════════════════════════╣
+║  BTCUSDT  │  PASS  │  Range: 62,000 – 66,500  │  12 cells  ║
+║            │        │  Net/grid: 0.35%       │  VolOsc:+  ║
+║  ETHUSDT  │  BLOCK │  Range: 2,600 – 2,800  │  RSI<35    ║
+║            │        │  Net/grid: 0.28% ✗     │  VolOsc:-  ║
+║  SOLUSDT  │  PASS  │  Range: 140 – 165      │  15 cells  ║
+║            │  (Geo) │  Net/grid: 0.42%       │  Z-Sc:0.3  ║
+║  BNBUSDT  │  BLOCK │  Range: 580 – 620      │  ADX>25    ║
+║            │        │  Net/grid: 0.31%       │  Cooldown  ║
+╚═══════════════════════════════════════════════════════════╝
+
+BTCUSDT  AUTO-ENTRY ALLOWED
+ETHUSDT  AUTO-ENTRY BLOCKED: NET_PROFIT_BELOW_HARD_MIN | VOLUME_OSC_NEGATIVE
+SOLUSDT  AUTO-ENTRY ALLOWED
+BNBUSDT  AUTO-ENTRY BLOCKED: ADX_TOO_HIGH | COOLDOWN_ACTIVE (1h 23m left)
 ```
 
-Kalau kondisi jelek:
+Kalau kondisi jelek semua symbol:
 
 ```text
-Result:
-  Risk decision : BLOCK
-  Reason        : NET_PROFIT_BELOW_HARD_MIN
-                  | MARKET_FILTER_BLOCK:ADX
+Result (All Symbols):
+  BTCUSDT  : BLOCK | NET_PROFIT_BELOW_HARD_MIN
+  ETHUSDT  : BLOCK | MARKET_FILTER_BLOCK:ADX | VOLUME_OSC_NEGATIVE
+  SOLUSDT  : BLOCK | NET_PROFIT_BELOW_HARD_MIN
+  BNBUSDT  : BLOCK | COOLDOWN_ACTIVE | ADX_TOO_HIGH
+
+Action: ALL SYMBOLS BLOCKED
+       Bot: "Hari ini nggak trading. ☕📉🗿"
 ```
 
 Bot tidak memaksakan grid.
@@ -1049,12 +1152,24 @@ safety gate.
 
 ## Running manually (testnet/dry-run)
 
+**Multi-Symbol Bot (v4.0 - Recommended):**
 ```bash
-# continuous run (Ctrl-C for graceful shutdown)
-python runtime.py
+# single cycle untuk testing
+python3 multi_symbol_main.py
+
+# continuous run via runtime wrapper (Ctrl-C untuk graceful shutdown)
+python3 runtime.py
 
 # bounded observation (exits after N cycles)
-python runtime.py --max-cycles 2
+python3 runtime.py --max-cycles 2
+```
+
+**Dashboard (Retrofuturism Edition):**
+```bash
+# jalanin dashboard di port 8080
+python3 dashboard.py
+
+# atau via systemd (lihat section bawah)
 ```
 
 The runtime refuses to start unless `environment.dry_run=true`;
@@ -1065,30 +1180,60 @@ RUNTIME STOP / CYCLE UNEXPECTED EXCEPTION` to stdout and
 
 ## systemd (VPS)
 
-A unit template ships in `deploy/adaptive-grid.service`:
+**Multi-Symbol Bot (v4.0 - Recommended):**
+```bash
+sudo cp deploy/adaptive-grid-multi.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now adaptive-grid-multi.service
+systemctl status adaptive-grid-multi.service
+journalctl -u adaptive-grid-multi.service -f
+sudo systemctl stop adaptive-grid-multi.service
+```
 
+**Legacy Single-Symbol Bot:**
 ```bash
 sudo cp deploy/adaptive-grid.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now adaptive-grid.service   # start + enable
-systemctl status adaptive-grid.service              # health
-journalctl -u adaptive-grid.service -f              # live logs
-sudo systemctl stop adaptive-grid.service           # graceful SIGTERM stop
+sudo systemctl enable --now adaptive-grid.service
+systemctl status adaptive-grid.service
+journalctl -u adaptive-grid.service -f
+sudo systemctl stop adaptive-grid.service
 ```
 
-The unit runs as a dedicated non-root `adaptive-grid` user from
-`/opt/adaptive-grid` with `/opt/adaptive-grid/.venv/bin/python`, uses
+**Dashboard (Retrofuturism Edition):**
+```bash
+sudo cp deploy/adaptive-grid-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now adaptive-grid-dashboard.service
+systemctl status adaptive-grid-dashboard.service --no-pager
+sudo journalctl -u adaptive-grid-dashboard.service -f
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/api/status
+ss -lntp | grep ':8080'
+```
+
+All units run as a dedicated non-root `adaptive-grid` user from
+`/opt/adaptive-grid` with `/opt/adaptive-grid/.venv/bin/python`, use
 `network-online.target`, and `Restart=on-failure` — a graceful stop is not
 restarted, only an actual process failure is.
 
----
+The dashboard deliberately receives **no Binance credentials** — do not add
+an `EnvironmentFile` pointing at `.env` to its systemd unit.
 
-# 📊 Public Read-Only Dashboard (port 8080)
+# 📊 Public Read-Only Dashboard (port 8080) — **RETROFUTURISM EDITION** 🌈
 
 `dashboard.py` is a separate, independently-restartable monitor process
 (`adaptive-grid-dashboard.service`).  It reads the existing SQLite state
 database **read-only** (SQLite `mode=ro` at the connection level) and
-serves a dark, mobile-friendly HTML page that auto-refreshes every 12s.
+serves a **retrofuturism-themed**, mobile-friendly HTML page yang auto-refresh setiap 12s.
+
+**Vibe check**: Cyan/Magenta/Amber glow, scanline overlay, animated grid background, JetBrains Mono font — kelihatan kayak hacker movie 90an tapi modern. 😎
+
+**Multi-Symbol Ready**: Nampilin 4 symbol sekaligus (BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT) dalam card per-symbol dengan:
+- Harga, Range, Grid cells, Step %, Net/grid
+- Market Regime (Range/Trend Up/Down/Volatile)
+- Volume Oscillator (5,10) & Z-Score (20)
+- WIB Timezone (UTC+7) — nggak perlu mental math UTC
 
 **It is intentionally public and has NO authentication** (operator
 decision): security comes from a strictly read-only architecture — the
@@ -1097,6 +1242,12 @@ access, no Binance credentials, and cannot modify any state.  It cannot
 place/cancel/replace orders, cannot change risk or configuration, and
 cannot release the kill switch or reset the reference equity — those
 operations do not exist in the dashboard process.
+
+**Fitur UI Keren**:
+- "Penting Saja" toggle (disimpan di localStorage, survive refresh)
+- Responsive: 2-column mobile, auto-fit desktop
+- Human-friendly numbers: `405275.83` bukan `405275.8339338000000000`
+- Reduced motion & high contrast support
 
 ## Endpoints
 
@@ -1158,29 +1309,43 @@ a future production hardening, not a prerequisite.
 
 ---
 
-# 🗂️ Struktur project
+# 🗂️ Struktur project v4.0
 
 ```text
 adaptive-grid/
-├── main.py
-├── config.yaml
-├── config_loader.py
+├── main.py                    # Legacy single-symbol entrypoint
+├── multi_symbol_main.py       # NEW v4.0: Multi-symbol entrypoint 🎯
+├── strategy.py                # NEW v4.0: Auto-entry/exit logic (ADX+RSI+VolOsc+Z-Score)
+├── dashboard.py               # NEW v4.0: Retrofuturism dashboard (port 8080) 🌈
+├── runtime.py                 # Continuous daemon wrapper
+├── config.yaml                # Multi-symbol config (symbols, mode_by_symbol, strategy, etc)
+├── config_loader.py           # Validates & loads config + .env
 ├── market_data.py
 ├── binance_testnet.py
-├── indicators.py
+├── indicators.py              # Added: volume_oscillator, z_score
+├── market_features.py         # Computes market intelligence
 ├── range_engine.py
-├── grid_engine.py
+├── grid_engine.py             # Added: arithmetic/geometric, dynamic step
 ├── profit_model.py
 ├── fee_model.py
 ├── risk_engine.py
 ├── symbol_rules.py
 ├── storage.py
 ├── requirements.txt
-├── .env.example
+├── .env.example               # NEW: testnet/live creds, SYMBOLS, BINANCE_ENV
 ├── .gitignore
 ├── sample_output.txt
+├── deploy/
+│   ├── adaptive-grid.service          # Legacy single-symbol systemd
+│   ├── adaptive-grid-multi.service    # NEW v4.0: Multi-symbol systemd 🎯
+│   └── adaptive-grid-dashboard.service
 ├── scripts/
-│   └── testnet_readonly_check.py
+│   ├── testnet_readonly_check.py
+│   ├── testnet_order_path_check.py
+│   ├── testnet_cycle_check.py
+│   ├── reset_reference_equity.py
+│   ├── release_kill_state.py
+│   └── status_report.py
 └── tests/
     ├── test_config.py
     ├── test_grid.py
@@ -1191,8 +1356,20 @@ adaptive-grid/
     ├── test_storage.py
     ├── test_symbol_rules.py
     ├── test_fee.py
-    └── test_binance_testnet.py
+    ├── test_binance_testnet.py
+    ├── test_dashboard.py
+    ├── test_strategy.py
+    ├── test_multi_symbol.py
+    ├── test_market_regime.py
+    ├── test_grid_eligibility.py
+    ├── test_paper_accounting.py
+    ├── test_cancel_on_kill.py
+    ├── test_main_order_integration.py
+    ├── test_15m_lower_boundary_kill.py
+    └── test_range_quality.py
 ```
+
+**Test count: 1369 passed** ✅
 
 Yang tidak perlu masuk Git:
 
