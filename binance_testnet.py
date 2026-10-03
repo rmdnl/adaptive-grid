@@ -277,11 +277,36 @@ def load_testnet_config_from_env() -> BinanceTestnetConfig:
         "BINANCE_MAX_ACCOUNT_ASSETS", DEFAULT_MAX_ACCOUNT_ASSETS, 1
     )
 
+    def _credential(name_canonical: str, name_legacy: str) -> str:
+        """Canonical .env testnet credential, legacy name as fallback.
+
+        The canonical scheme is ``BINANCE_TESTNET_API_KEY`` /
+        ``BINANCE_TESTNET_API_SECRET`` (skill §17, .env.example).  The legacy
+        ``BINANCE_API_KEY`` / ``BINANCE_API_SECRET`` names are still accepted
+        so older operator environments keep working.  Fail-closed when
+        neither is present; values are never logged.
+        """
+        value = os.environ.get(name_canonical, "").strip()
+        if value:
+            return value
+        value = os.environ.get(name_legacy, "").strip()
+        if value:
+            return value
+        raise BinanceTestnetConfigError(
+            f"Environment variable {name_canonical} (or legacy "
+            f"{name_legacy}) is required"
+        )
+
     return BinanceTestnetConfig(
         environment=_env("BINANCE_ENV"),
-        base_url=_env("BINANCE_BASE_URL"),
-        api_key=_env("BINANCE_API_KEY"),
-        api_secret=_env("BINANCE_API_SECRET"),
+        # The base URL defaults to the approved testnet endpoint; the frozen
+        # config re-validates it, so an explicit production URL still fails
+        # closed.  This keeps the documented .env (which does not define
+        # BINANCE_BASE_URL) sufficient.
+        base_url=os.environ.get("BINANCE_BASE_URL", "").strip()
+        or _APPROVED_TESTNET_BASE,
+        api_key=_credential("BINANCE_TESTNET_API_KEY", "BINANCE_API_KEY"),
+        api_secret=_credential("BINANCE_TESTNET_API_SECRET", "BINANCE_API_SECRET"),
         dry_run=_strict_bool("DRY_RUN"),
         allow_live_execution=_strict_bool("ALLOW_LIVE_EXECUTION"),
         timeout_ms=timeout_ms,

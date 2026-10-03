@@ -36,6 +36,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from dotenv import load_dotenv
+
 from binance_testnet import (
     BinanceTestnetConfigError,
     BinanceTestnetError,
@@ -463,6 +465,7 @@ def run_order_path(symbol: str, as_json: bool) -> int:
 
 
 def main() -> int:
+    load_dotenv()
     parser = argparse.ArgumentParser(
         description="Testnet order-path verification (LIMIT_MAKER, gated)."
     )

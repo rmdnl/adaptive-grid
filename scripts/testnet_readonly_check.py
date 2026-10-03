@@ -13,6 +13,8 @@ from pathlib import Path
 # Ensure project root is importable when run as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from dotenv import load_dotenv
+
 from binance_testnet import (
     BinanceTestnetClient,
     BinanceTestnetConfigError,
@@ -21,6 +23,7 @@ from binance_testnet import (
 
 
 def main() -> int:
+    load_dotenv()
     # 1. Load + validate environment (fail-closed).
     try:
         config = load_testnet_config_from_env()

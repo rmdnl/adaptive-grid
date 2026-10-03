@@ -663,7 +663,14 @@ python main.py
 Jalankan (Multi-Symbol v4.0 - Recommended):
 
 ```bash
+# continuous runtime loop (default): one multi-symbol pass per closed candle
 python multi_symbol_main.py
+
+# single pass untuk testing (satu siklus penuh semua simbol, lalu exit)
+python multi_symbol_main.py --once
+
+# bounded observation (exit setelah N pass)
+python multi_symbol_main.py --max-cycles 2
 ```
 
 Alurnya (multi-symbol):
@@ -1154,13 +1161,20 @@ safety gate.
 
 **Multi-Symbol Bot (v4.0 - Recommended):**
 ```bash
-# single cycle untuk testing
+# continuous runtime loop (default): one multi-symbol pass per closed
+# candle of the configured timeframe; SIGTERM/SIGINT graceful shutdown
 python3 multi_symbol_main.py
 
-# continuous run via runtime wrapper (Ctrl-C untuk graceful shutdown)
-python3 runtime.py
+# single pass untuk testing (satu siklus penuh semua simbol, lalu exit)
+python3 multi_symbol_main.py --once
 
-# bounded observation (exits after N cycles)
+# bounded observation (exits after N passes)
+python3 multi_symbol_main.py --max-cycles 2
+```
+
+Single-symbol legacy wrapper (tetap berfungsi, memakai strategi lama):
+```bash
+python3 runtime.py            # continuous
 python3 runtime.py --max-cycles 2
 ```
 

@@ -24,6 +24,7 @@ from market_data import (
     MAX_TICKER_AGE_SECONDS,
     MarketDataError,
     build_account_risk_state,
+    fetch_15m_closed_close,
     fetch_account_commission,
     fetch_account_snapshot,
     fetch_book_ticker,
@@ -412,12 +413,16 @@ def main():
               "Fix or manually reconcile, then re-run.")
         return 1
 
-    mode=cfg["environment"]["mode"]; 
+    mode=cfg["environment"]["mode"]
     symbols = cfg.get("symbols", "")
     symbol = symbols.split(",")[0].strip() if symbols else cfg.get("symbol", "")
     if not symbol:
         raise ConfigError("No symbol configured (symbols or symbol)")
-    client=make_client(mode, os.getenv("BINANCE_API_KEY",""), os.getenv("BINANCE_API_SECRET",""))
+    # .env-only credential selection (shared fail-closed contract): testnet
+    # only, testnet credential pair required, LIVE credentials never read.
+    from config_loader import resolve_binance_credentials
+    mode, api_key, api_secret = resolve_binance_credentials(cfg)
+    client=make_client(mode, api_key, api_secret)
 
     symbol_info=fetch_symbol_info(client,symbol)
     rules=parse_symbol_info(symbol_info)
@@ -450,11 +455,12 @@ def main():
 
     df=fetch_klines(client,symbol,cfg["timeframe"],cfg["range"]["lookback"],drop_incomplete=True)
     enriched=enrich(df); last=latest_valid_row(enriched)
-    # 15m lower-boundary stop input: the close of the latest CLOSED 15m
-    # candle (df is fetched with drop_incomplete=True, so the last row is
-    # closed).  Computed ONCE here and fed to the risk gate; the ticker is
-    # deliberately not used as a substitute.  None => fail-closed veto.
-    last_closed_close = _latest_closed_candle_close(df)
+    # 15m lower-boundary stop input: the close of the latest CLOSED **15m**
+    # candle, fetched on its own fixed 15m interval — the strategy timeframe
+    # (1h/4h) must never be substituted, and neither is the ticker.  Any
+    # failure to obtain a valid closed 15m close yields None => fail-closed
+    # veto (LOWER_BOUNDARY_STOP_DATA_UNAVAILABLE).
+    last_closed_close = fetch_15m_closed_close(client, symbol)
     ticker=None; ticker_error=None
     try:
         ticker=fetch_ticker_price(client,symbol)

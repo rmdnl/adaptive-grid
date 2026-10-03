@@ -59,6 +59,9 @@ class LifecycleAction(str, Enum):
     ENTER_PENDING = "ENTER_PENDING"
     VALIDATE_PENDING = "VALIDATE_PENDING"
     READY_FOR_RECONFIG = "READY_FOR_RECONFIG"
+    # Strategy auto-exit / operator close: the active plan is closed and the
+    # lifecycle returns to NO_ACTIVE_GRID (audited, idempotent).
+    CLOSE = "CLOSE"
 
 
 class ValidationErrorCode(str, Enum):
@@ -83,14 +86,17 @@ _VALID_TRANSITIONS: dict[LifecycleState, dict[LifecycleAction, LifecycleState]] 
         LifecycleAction.KEEP_CURRENT: LifecycleState.ACTIVE,
         LifecycleAction.ENTER_PENDING: LifecycleState.RECONFIGURATION_PENDING,
         LifecycleAction.BLOCK: LifecycleState.BLOCKED,
+        LifecycleAction.CLOSE: LifecycleState.NO_ACTIVE_GRID,
     },
     LifecycleState.RECONFIGURATION_PENDING: {
         LifecycleAction.VALIDATE_PENDING: LifecycleState.READY_TO_RECONFIGURE,
         LifecycleAction.BLOCK: LifecycleState.BLOCKED,
+        LifecycleAction.CLOSE: LifecycleState.NO_ACTIVE_GRID,
     },
     LifecycleState.READY_TO_RECONFIGURE: {
         LifecycleAction.ACTIVATE: LifecycleState.ACTIVE,
         LifecycleAction.BLOCK: LifecycleState.BLOCKED,
+        LifecycleAction.CLOSE: LifecycleState.NO_ACTIVE_GRID,
     },
     LifecycleState.BLOCKED: {
         LifecycleAction.ACTIVATE: LifecycleState.ACTIVE,
@@ -1317,6 +1323,61 @@ class LifecycleManager:
             ) from exc
 
         return transition
+
+    def close_active_plan(self, reason: str,
+                          details: Optional[Dict[str, Any]] = None,
+                          con=None, prefix: str = "") -> bool:
+        """Close the active plan and return the lifecycle to NO_ACTIVE_GRID.
+
+        Used by the strategy auto-exit path (and available to operators): the
+        active plan is marked CLOSED, the global state transitions to
+        NO_ACTIVE_GRID via the audited ``CLOSE`` action, and a transition row
+        is recorded.  The transition is validated against
+        ``_VALID_TRANSITIONS`` (fail-closed) and the whole mutation runs in a
+        single transaction.
+
+        Idempotent: when the lifecycle is already NO_ACTIVE_GRID or BLOCKED
+        there is nothing to close and this returns ``False`` without writing.
+
+        Returns ``True`` when a plan was closed, ``False`` when no plan was
+        active.
+        """
+        if not reason or not str(reason).strip():
+            raise ValueError("close_active_plan requires a non-empty reason")
+
+        def block(c):
+            current_state = self.get_current_state(con=c, prefix=prefix)
+            if current_state in (LifecycleState.NO_ACTIVE_GRID,
+                                 LifecycleState.BLOCKED):
+                return False
+            active = self.get_active_plan(con=c, prefix=prefix)
+            plan_id = active.plan_id if active is not None else None
+            target_state = self._validate_transition(
+                current_state, LifecycleAction.CLOSE)
+            now = datetime.now(timezone.utc).isoformat()
+            if plan_id is not None:
+                c.execute(
+                    f"UPDATE {self._table('active_plans', prefix)} "
+                    "SET lifecycle_state = ?, updated_at = ? WHERE plan_id = ?",
+                    ("CLOSED", now, plan_id),
+                )
+            payload: Dict[str, Any] = {
+                "reason": str(reason).strip(),
+                "plan_id": plan_id,
+            }
+            if details:
+                payload.update(details)
+            transition = LifecycleTransition.create(
+                from_state=current_state,
+                to_state=target_state,
+                action=LifecycleAction.CLOSE,
+                details=payload,
+            )
+            self._record_transition(c, transition, prefix)
+            self._set_state_on(c, target_state, prefix)
+            return True
+
+        return self._run_on(con, prefix, block)
 
     def _validate_transition(self, from_state: LifecycleState,
                              action: LifecycleAction) -> LifecycleState:

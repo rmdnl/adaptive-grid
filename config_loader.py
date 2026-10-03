@@ -78,6 +78,44 @@ def _load_binance_credentials(env: str) -> dict[str, str]:
     return {"api_key": api_key, "api_secret": api_secret}
 
 
+def resolve_binance_credentials(cfg: dict[str, Any]) -> tuple[str, str, str]:
+    """Resolve the Binance environment and credentials from ``.env`` only.
+
+    Shared, fail-closed contract for every entrypoint:
+
+    - ``BINANCE_ENV`` must be exactly ``testnet``: live execution is not
+      implemented in this release and is never started autonomously.
+    - ``config.yaml`` ``environment.mode`` must agree (``testnet``).
+    - The TESTNET credential pair must be present; the bot refuses to start
+      without it because the account-aware risk gates (equity drawdown kill,
+      inventory guard) need authenticated read-only endpoints.
+    - LIVE credentials are never read here, not even when present in ``.env``.
+
+    Returns ``(env, api_key, api_secret)``; raises :class:`ConfigError` on
+    any violation.
+    """
+    import os
+    env = os.getenv("BINANCE_ENV", "testnet").strip().lower()
+    mode = str(cfg["environment"]["mode"]).strip().lower()
+    if env != "testnet":
+        raise ConfigError(
+            f"BINANCE_ENV must be 'testnet' (got {env!r}); live execution is "
+            "not implemented in this release"
+        )
+    if mode != "testnet":
+        raise ConfigError(
+            f"environment.mode must be 'testnet' (got {mode!r})"
+        )
+    api_key = os.getenv("BINANCE_TESTNET_API_KEY", "")
+    api_secret = os.getenv("BINANCE_TESTNET_API_SECRET", "")
+    if not api_key or not api_secret:
+        raise ConfigError(
+            "BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET must be "
+            "set in .env (testnet credentials are required)"
+        )
+    return env, api_key, api_secret
+
+
 def validate_config(cfg: dict[str, Any]) -> None:
     env = cfg.get("environment", {})
     mode = env.get("mode")

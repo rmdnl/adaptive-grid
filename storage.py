@@ -10,6 +10,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
+from paper_accounting import PaperAccountState, PaperAccountingUpdate
+
 SCHEMA_VERSION = "3.2.1"
 
 #: Schema alias used when a cycle transaction must span two SQLite files.  The
@@ -970,6 +972,177 @@ def get_paper_reservation(path, client_order_id, con=None):
             "created_at": datetime.fromisoformat(row["created_at"]),
             "updated_at": datetime.fromisoformat(row["updated_at"]),
         }
+    finally:
+        if owns:
+            con.close()
+
+
+def record_paper_liquidation(
+    path,
+    *,
+    event_id: str,
+    symbol: str,
+    price,
+    quantity,
+    taker_fee,
+    fee_asset: str,
+    reason: str,
+    now=None,
+    con=None,
+):
+    """Liquidate the free base inventory at a market price (strategy auto-exit).
+
+    Applies the same SELL accounting math as
+    ``PaperAccountingEngine.prepare_fill_accounting`` (gross proceeds, taker
+    fee, realized PnL against the average cost basis) directly to the
+    persisted paper account state.  The mutation runs in one transaction with
+    the same optimistic-concurrency check and event-idempotency guarantees as
+    every other accounting update; it is audited via a ``LIQUIDATION`` row in
+    ``paper_accounting_events``.
+
+    No order row is created on purpose: a liquidation is an accounting
+    operation, not a grid order — the paper order engine only supports
+    grid-identity LIMIT/LIMIT_MAKER orders.
+
+    Only ``base_free`` is sellable.  Residual ``base_reserved`` (which would
+    imply an un-reconciled open order) is never liquidated here; callers must
+    run the cancel pass first and re-attempt on the next cycle.
+
+    Returns a dict:
+      ``{"liquidated": True,  "idempotent": False, ...}`` when applied;
+      ``{"liquidated": True,  "idempotent": True,  ...}`` when this exact
+        event was already applied (same semantics);
+      ``{"liquidated": False, "reason": "NO_BASE_INVENTORY"}`` when there is
+        nothing to sell (the normal repeat-visit case after a first exit).
+    """
+    if not event_id or not str(event_id).strip():
+        raise ValueError("record_paper_liquidation requires a non-empty event_id")
+    if not reason or not str(reason).strip():
+        raise ValueError("record_paper_liquidation requires a non-empty reason")
+    sale_price = Decimal(str(price))
+    sale_quantity = Decimal(str(quantity))
+    fee_rate = Decimal(str(taker_fee))
+    if not sale_price.is_finite() or sale_price <= 0:
+        raise ValueError("liquidation price must be a finite positive decimal")
+    if not fee_rate.is_finite() or fee_rate < 0:
+        raise ValueError("taker fee must be a finite non-negative decimal")
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if getattr(now, "tzinfo", None) is None:
+        raise ValueError("liquidation timestamp must be timezone-aware")
+
+    owns = con is None
+    if owns:
+        con = connect(path)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT base_asset,quote_asset,base_free,base_reserved,quote_free,"
+            "quote_reserved,average_cost,realized_pnl,total_fees,updated_at "
+            "FROM paper_account_state WHERE id=1"
+        ).fetchone()
+        if row is None:
+            raise PaperAccountingStaleState("Paper accounting state is missing")
+        state = PaperAccountState(
+            base_asset=row["base_asset"],
+            quote_asset=row["quote_asset"],
+            base_free=Decimal(row["base_free"]),
+            base_reserved=Decimal(row["base_reserved"]),
+            quote_free=Decimal(row["quote_free"]),
+            quote_reserved=Decimal(row["quote_reserved"]),
+            average_cost=Decimal(row["average_cost"]),
+            realized_pnl=Decimal(row["realized_pnl"]),
+            total_fees=Decimal(row["total_fees"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+        fee_asset_upper = str(fee_asset).upper()
+        if fee_asset_upper not in {state.base_asset, state.quote_asset}:
+            raise ValueError(
+                f"Unsupported liquidation fee asset {fee_asset_upper!r}"
+            )
+        if sale_quantity <= 0 or sale_quantity > state.base_free:
+            con.commit()
+            return {
+                "liquidated": False,
+                "reason": "NO_BASE_INVENTORY",
+                "base_free": str(state.base_free),
+                "requested_quantity": str(sale_quantity),
+            }
+
+        gross_quote = sale_price * sale_quantity
+        if fee_asset_upper == state.quote_asset:
+            fee_amount = gross_quote * fee_rate
+            fee_quote_value = fee_amount
+            base_free_after = state.base_free - sale_quantity
+            quote_free_after = state.quote_free + (gross_quote - fee_amount)
+            economic_proceeds = gross_quote - fee_amount
+            cost_basis = sale_quantity * state.average_cost
+        else:
+            base_fee_amount = sale_quantity * fee_rate
+            fee_amount = base_fee_amount
+            fee_quote_value = base_fee_amount * sale_price
+            base_free_after = state.base_free - sale_quantity - base_fee_amount
+            if base_free_after < 0:
+                raise ValueError(
+                    "Base-asset liquidation fee exceeds the free base balance"
+                )
+            quote_free_after = state.quote_free + gross_quote
+            economic_proceeds = gross_quote
+            cost_basis = (sale_quantity + base_fee_amount) * state.average_cost
+
+        realized_pnl_delta = economic_proceeds - cost_basis
+        new_state = PaperAccountState(
+            base_asset=state.base_asset,
+            quote_asset=state.quote_asset,
+            base_free=base_free_after,
+            base_reserved=state.base_reserved,
+            quote_free=quote_free_after,
+            quote_reserved=state.quote_reserved,
+            average_cost=state.average_cost,
+            realized_pnl=state.realized_pnl + realized_pnl_delta,
+            total_fees=state.total_fees + fee_quote_value,
+            updated_at=now,
+        )
+        update = PaperAccountingUpdate(
+            old_state=state,
+            new_state=new_state,
+            old_reservation=None,
+            reservation=None,
+            event_id=str(event_id),
+            event_type="LIQUIDATION",
+            client_order_id=f"LIQUIDATION-{str(symbol).upper()}",
+            payload={
+                "symbol": str(symbol).upper(),
+                "side": "SELL",
+                "order_type": "MARKET_LIQUIDATION",
+                "fill_price": str(sale_price),
+                "fill_quantity": str(sale_quantity),
+                "fee_asset": fee_asset_upper,
+                "fee_amount": str(fee_amount),
+                "fee_quote_value": str(fee_quote_value),
+                "realized_pnl_delta": str(realized_pnl_delta),
+                "reason": str(reason).strip(),
+                "resulting_state": "FILLED",
+            },
+        )
+        applied = _apply_accounting_update(con, update)
+        con.commit()
+        return {
+            "liquidated": True,
+            "idempotent": not applied,
+            "symbol": str(symbol).upper(),
+            "sold_quantity": str(sale_quantity),
+            "price": str(sale_price),
+            "gross_quote": str(gross_quote),
+            "fee_amount": str(fee_amount),
+            "fee_asset": fee_asset_upper,
+            "realized_pnl_delta": str(realized_pnl_delta),
+            "remaining_base_free": str(base_free_after),
+        }
+    except Exception:
+        if owns:
+            con.rollback()
+        raise
     finally:
         if owns:
             con.close()

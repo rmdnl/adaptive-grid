@@ -271,6 +271,10 @@ def test_15m_close_kill_latches_and_cancels(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "fetch_symbol_info", _fetch_symbol_info_stub)
     monkeypatch.setattr(main, "fetch_klines",
                         lambda c, s, i, l, drop_incomplete=True: _closed_klines("92.0"))
+    # The dedicated gate consumes the latest CLOSED 15m candle close, fetched
+    # on its own 15m interval: stub it with the scenario's kill close.
+    monkeypatch.setattr(main, "fetch_15m_closed_close",
+                        lambda c, s: Decimal("92.0"))
     monkeypatch.setattr(main, "fetch_ticker_price",
                         lambda c, s: TickerSnapshot(
                             "BNBUSDT", Decimal("100.0"), datetime.now(timezone.utc)))
@@ -312,6 +316,8 @@ def test_above_threshold_candle_does_not_kill(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "fetch_symbol_info", _fetch_symbol_info_stub)
     monkeypatch.setattr(main, "fetch_klines",
                         lambda c, s, i, l, drop_incomplete=True: _closed_klines("93.0"))
+    monkeypatch.setattr(main, "fetch_15m_closed_close",
+                        lambda c, s: Decimal("93.0"))
     monkeypatch.setattr(main, "fetch_ticker_price",
                         lambda c, s: TickerSnapshot(
                             "BNBUSDT", Decimal("91.0"), datetime.now(timezone.utc)))
@@ -336,6 +342,9 @@ def test_missing_kline_df_fails_closed(tmp_path, monkeypatch):
     # No kline DataFrame available to the gate.
     monkeypatch.setattr(main, "fetch_klines",
                         lambda c, s, i, l, drop_incomplete=True: None)
+    # The 15m fetch itself yields nothing usable: the gate must veto.
+    monkeypatch.setattr(main, "fetch_15m_closed_close",
+                        lambda c, s: None)
     monkeypatch.setattr(main, "enrich", lambda df: None)
     monkeypatch.setattr(main, "latest_valid_row",
                         lambda df: {"close": Decimal("100.0"),
@@ -365,6 +374,8 @@ def test_repeated_15m_kill_evaluation_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "fetch_symbol_info", _fetch_symbol_info_stub)
     monkeypatch.setattr(main, "fetch_klines",
                         lambda c, s, i, l, drop_incomplete=True: _closed_klines("92.0"))
+    monkeypatch.setattr(main, "fetch_15m_closed_close",
+                        lambda c, s: Decimal("92.0"))
     monkeypatch.setattr(main, "fetch_ticker_price",
                         lambda c, s: TickerSnapshot(
                             "BNBUSDT", Decimal("100.0"), datetime.now(timezone.utc)))

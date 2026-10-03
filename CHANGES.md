@@ -5,6 +5,71 @@ in DRY_RUN / paper mode. Live trading is not implemented and must not be
 enabled without explicit authorization. All changes below preserve that
 invariant.
 
+## Release line: v4.0.1 (multi-symbol audit + repair, testnet-verified)
+
+### Milestone: multi-symbol audit and full repair (branch `hermes/autonomous`)
+- `multi_symbol_main.py` (rewritten) — the authoritative multi-symbol
+  entrypoint now implements the locked v4.0 strategy end-to-end:
+  - **Strategy auto-exit** (RSI>=70 | ADX>25 | %B>1 | |Z|>2.5) is a
+    close-all: idempotent cancel pass over every open grid order, paper
+    market liquidation of all free base inventory at the current price
+    (taker fee, realized PnL), lifecycle plan closure, and the 3-hour
+    auto-exit cooldown. It deliberately does NOT latch the permanent kill
+    state (operator release is reserved for risk kills).
+  - **Risk kills** (equity drawdown >= 2%, range-break ±1% buffer, 15m
+    lower-boundary stop) latch the persisted kill state via the same
+    fail-closed cancel controller; restarts re-enter the kill branch.
+  - Auto-range approval is mandatory before grid work (price-inside,
+    width, quality); the market-intelligence eligibility decision is
+    diagnostics-only per the strict strategy spec.
+  - Dedicated 15m lower-boundary gate now consumes the latest CLOSED **15m**
+    candle (`market_data.fetch_15m_closed_close`), not the 4h strategy
+    candle; missing data fails closed (veto, no latch).
+  - Paper-cycle clock anchored to the last closed candle + timeframe with a
+    matching `max_candle_age_seconds` (the 5400s default rejected most 4h
+    cycles as stale).
+  - Restart safety per symbol: `verify_restart_safety` (REFUSE on corrupt
+    state with activity), kill-latch restart recovery, run-state markers.
+  - Per-symbol failure isolation, complete result payloads (entry-blocked /
+    cooldown / range-blocked are healthy outcomes, not errors).
+  - Continuous candle-cadence runtime by default (`--once` for a single
+    pass, `--max-cycles N` for bounded observation) — the systemd unit
+    previously died after one pass (`Restart=on-failure` never restarts a
+    clean exit 0).
+- `config_loader.py` — shared fail-closed `resolve_binance_credentials`:
+  `.env`-only, `BINANCE_ENV` must be `testnet` (live refused), config mode
+  must agree, testnet credential pair required; LIVE credentials never read.
+- `binance_testnet.py` — `load_testnet_config_from_env` accepts the
+  canonical `BINANCE_TESTNET_API_KEY/SECRET` scheme (legacy names as
+  fallback) and defaults `BINANCE_BASE_URL` to the approved testnet
+  endpoint (still re-validated; production URLs keep failing closed).
+- `grid_lifecycle.py` — `LifecycleAction.CLOSE` +
+  `LifecycleManager.close_active_plan(reason, details)`: audited, idempotent
+  ACTIVE/RECONFIGURATION_PENDING/READY_TO_RECONFIGURE → NO_ACTIVE_GRID.
+- `storage.py` — `record_paper_liquidation`: single-transaction, optimistic-
+  concurrency liquidation of free base inventory mirroring the paper SELL
+  accounting math; audited via `paper_accounting_events` (LIQUIDATION).
+- `recovery.py` — LIQUIDATION is a first-class accounting-event class in the
+  reconciliation validator (reserved `LIQUIDATION-` client_order_id
+  namespace + strict payload contract); all other events still require a
+  known order.
+- `market_data.py` — fail-closed `fetch_15m_closed_close`.
+- `main.py` (legacy single-symbol) — `.env` credential scheme + live
+  refusal; 15m gate input fix; `config.yaml` restores legacy
+  `grid.step_pct: 0.006` for compatibility.
+- Tests: `tests/test_multi_symbol.py` (21) + `tests/test_strategy.py` (17)
+  — credentials, lifecycle close, liquidation math/idempotency, exit/
+  cooldown flows, range gate, 15m fail-closed veto, drawdown kill latch,
+  per-symbol isolation, clock anchoring, and the full entry/exit spec;
+  conftest provides deterministic testnet env + safe 15m stubs.
+- Verification: full suite 1407 passed; Binance Spot TESTNET read-only
+  check PASS (auth, skew −352ms, filters); gated order-path check ALL PASS
+  (LIMIT_MAKER placement, reconciliation, duplicate-cid prevention,
+  verified cancel, restart recovery); repaired multi-symbol cycle verified
+  end-to-end on testnet (real 4h data → correct RANGE_BLOCKED /
+  ENTRY_BLOCKED fail-closed outcomes) in both `--once` and runtime-loop
+  modes.
+
 ## Release line: v3.2.2 (dedicated 15m candle-close lower-boundary kill)
 
 ### Milestone: 15m lower-boundary candle-close kill (commit `20b13f7`)

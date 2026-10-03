@@ -15,10 +15,16 @@ grid:
     ETHUSDT: "arithmetic"
     SOLUSDT: "geometric"
     BNBUSDT: "arithmetic"
-  # Grid step = 1x ATR(14) percentage (dynamic per symbol)
-  # Minimum gross profit per grid = 0.5% (fee 0.1% maker + 0.1% taker + slippage)
+  # Legacy fixed step for the single-symbol path (main.py); the multi-symbol
+  # path uses the dynamic ATR step below.
+  step_pct: 0.006
+  # Grid step = 1x ATR(14) percentage (dynamic per symbol), floored so every
+  # grid gross profit is >= 0.5% (maker+taker 0.1% each + conservative
+  # slippage).  NOTE: with the conservative 0.05% round-trip slippage a
+  # 0.5%-gross step nets 0.25% and is correctly REJECTED by the hard
+  # minimum-net gate, so the effective gross floor is ~0.55%.
   min_gross_profit_pct: 0.005
-  # Minimum net profit per grid = 0.3% (after fees)
+  # Minimum net profit per grid = 0.3% (after fees) — hard floor.
   hard_min_net_pct: 0.003
   preferred_net_max_pct: 0.004
   min_cells: 6

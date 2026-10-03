@@ -718,6 +718,36 @@ def fetch_klines(client, symbol, interval="15m", limit=200, drop_incomplete=True
         raise RuntimeError("Not enough closed klines after removing incomplete candle")
     return df
 
+def fetch_15m_closed_close(client, symbol) -> Decimal | None:
+    """Close of the latest CLOSED 15m candle, or ``None`` when unavailable.
+
+    This is the sole input to the dedicated 15m lower-boundary stop
+    (:func:`risk_engine.lower_boundary_15m_kill`): the currently forming
+    candle is dropped by ``fetch_klines(drop_incomplete=True)`` and the
+    ticker price is deliberately never a substitute.  Any failure to obtain
+    a valid closed 15m close (network error, malformed data, non-finite or
+    non-positive close) returns ``None`` so the gate vetoes new orders
+    instead of passing on bad data.
+    """
+    try:
+        df = fetch_klines(client, symbol, "15m", 60, drop_incomplete=True)
+    except Exception:
+        return None
+    if df is None or not hasattr(df, "empty") or df.empty:
+        return None
+    if "close" not in getattr(df, "columns", []):
+        return None
+    try:
+        value = Decimal(str(df["close"].iloc[-1]))
+    except Exception:
+        return None
+    try:
+        if not value.is_finite() or value <= 0:
+            return None
+    except Exception:
+        return None
+    return value
+
 def fetch_symbol_info(client, symbol):
     response = client.rest_api.exchange_info(symbol=symbol.upper())
     payload = _model_to_plain(response.data())

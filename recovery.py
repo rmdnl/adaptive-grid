@@ -733,12 +733,23 @@ def _validate_account_state(
     # We do NOT recalculate financial state from events (that would duplicate
     # accounting logic and risk divergence).  We verify that every event
     # references a known order and that its payload is valid JSON.
+    #
+    # LIQUIDATION events (strategy auto-exit close-all) are the one
+    # deliberate exception to the order-reference rule: a liquidation is an
+    # accounting operation, not a grid order, so it carries the reserved
+    # ``LIQUIDATION-`` client_order_id namespace instead of an order id.
+    # They are still strictly validated (reserved namespace + payload
+    # contract below), never silently trusted.
     import json
 
     for ev_row in event_rows:
         ev_entity = f"accounting_event:{ev_row['event_id']}"
         oid = ev_row["client_order_id"]
-        if oid not in orders:
+        is_liquidation_event = (
+            ev_row["event_type"] == "LIQUIDATION"
+            and str(oid).startswith("LIQUIDATION-")
+        )
+        if oid not in orders and not is_liquidation_event:
             errors.append(RecoveryError(
                 RecoveryErrorCode.ACCOUNT_EVENT_MISMATCH, ev_entity,
                 f"event references unknown order {oid!r}",
@@ -779,6 +790,26 @@ def _validate_account_state(
                         RecoveryErrorCode.ACCOUNT_EVENT_MISMATCH, ev_entity,
                         f"RELEASE event missing payload key {key!r}",
                     ))
+        elif ev_type == "LIQUIDATION":
+            if not is_liquidation_event:
+                errors.append(RecoveryError(
+                    RecoveryErrorCode.ACCOUNT_EVENT_MISMATCH, ev_entity,
+                    "LIQUIDATION event must use the reserved "
+                    "'LIQUIDATION-' client_order_id namespace",
+                ))
+            for key in ("symbol", "side", "order_type", "fill_price",
+                        "fill_quantity", "fee_asset", "fee_amount", "reason"):
+                if key not in payload:
+                    errors.append(RecoveryError(
+                        RecoveryErrorCode.ACCOUNT_EVENT_MISMATCH, ev_entity,
+                        f"LIQUIDATION event missing payload key {key!r}",
+                    ))
+            if (payload.get("side"), payload.get("order_type")) != (
+                    "SELL", "MARKET_LIQUIDATION"):
+                errors.append(RecoveryError(
+                    RecoveryErrorCode.ACCOUNT_EVENT_MISMATCH, ev_entity,
+                    "LIQUIDATION event must be a MARKET_LIQUIDATION SELL",
+                ))
 
 
 def _validate_order_internal_consistency(
