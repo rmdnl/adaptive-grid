@@ -84,6 +84,27 @@ def state_db(tmp_path: Path) -> Path:
         " ('last_run_state','{\"run_id\":\"run-1\",\"phase\":\"COMPLETED\","
         "  \"risk_allowed\":false,\"kill_active\":false,"
         "  \"pending_cancels\":0,\"open_orders\":1}')")
+    # per-cycle persisted state (main() writes these every run)
+    con.execute(
+        "INSERT INTO bot_state (key, value) VALUES"
+        " ('last_symbol','BNBUSDT'),"
+        " ('last_price','765.88000000'),"
+        " ('last_range','{\"lower\":\"765.23\",\"upper\":\"778.856\"}'),"
+        " ('last_risk_decision','{\"allowed\":false,"
+        "  \"reason\":\"NET_PROFIT_BELOW_HARD_MIN\"}'),"
+        " ('last_account_risk','{\"current_equity\":\"405275.83\","
+        "  \"reference_equity\":\"405275.83\",\"drawdown_pct\":\"0E-20\","
+        "  \"base_inventory\":\"0\",\"inventory_pct\":\"0\"}'),"
+        " ('last_adaptive_plan','{\"plan_id\":\"p1\",\"decision\":"
+        "  \"GRID_BLOCKED\",\"reasons\":[\"GRID_COUNT_INVALID\"],"
+        "  \"regime\":\"RANGE\",\"range_quality_score\":\"0\","
+        "  \"candidate_lower\":\"765.23\",\"candidate_upper\":\"778.856\","
+        "  \"grid_step\":\"0.006\",\"grid_count\":2,"
+        "  \"estimated_net_profit_per_grid\":\"0.0034\"}'),"
+        " ('last_market_intelligence','{\"status\":\"GRID_BLOCKED\","
+        "  \"allowed\":false,\"reasons\":[\"VOLATILITY_TOO_LOW\"],"
+        "  \"regime\":\"RANGE\",\"range_quality_score\":\"0\","
+        "  \"diagnostics\":{\"adx\":\"14.36\",\"atr_pct\":\"0.0014\"}}')")
     con.execute(
         "INSERT INTO paper_orch_cycles (cycle_id, candle_index, symbol,"
         " plan_decision, orders_submitted, fills_applied, success,"
@@ -156,6 +177,15 @@ def test_root_html(server):
     assert "DRY RUN" in html
     assert "LIVE DISABLED" in html
     assert "KILL SWITCH OFF" in html
+    # per-cycle grid/market state renders even when every cycle is BLOCKED
+    assert "GRID_BLOCKED" in html
+    assert "NET_PROFIT_BELOW_HARD_MIN" in html
+    assert "765.88" in html            # current price from last_price
+    assert "765.23" in html            # lower from last_range
+    assert "FILTER GRID_BLOCKED" in html
+    assert "diagnostic: adx" in html   # market intelligence diagnostics table
+    # equity card falls back to last_account_risk when no snapshot exists
+    assert "405275.83" in html
     # auto-refresh present (10-15s window)
     assert 'http-equiv="refresh" content="12"' in html
 
@@ -181,6 +211,20 @@ def test_api_status(server):
     assert snap["runtime"]["phase"] == "COMPLETED"
     assert snap["grid"]["latest_cycles"][0]["cycle_id"] == "cycle-1"
     assert snap["grid"]["latest_cycles"][0]["metadata"]["lower_price"] == "100.0"
+    # per-cycle persisted state surfaces (present even when every cycle BLOCKs)
+    assert snap["grid"]["last_price"] == "765.88000000"
+    assert snap["grid"]["last_range"]["lower"] == "765.23"
+    assert snap["risk"]["last_risk_decision"]["allowed"] is False
+    assert snap["risk"]["last_risk_decision"]["reason"] == "NET_PROFIT_BELOW_HARD_MIN"
+    plan = snap["grid"]["last_adaptive_plan"]
+    assert plan["decision"] == "GRID_BLOCKED"
+    assert plan["grid_count"] == 2
+    assert plan["estimated_net_profit_per_grid"] == "0.0034"
+    intel = snap["grid"]["last_market_intelligence"]
+    assert intel["regime"] == "RANGE"
+    assert intel["diagnostics"]["adx"] == "14.36"
+    # account-risk fallback feeds the equity cards when no snapshot exists
+    assert snap["risk"]["last_account_risk"]["current_equity"] == "405275.83"
     assert len(snap["orders"]["open"]) == 1
     assert len(snap["fills"]) == 1
     assert snap["fills"][0]["fee_asset"] == "BNB"

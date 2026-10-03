@@ -147,6 +147,23 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
         except (ValueError, TypeError):
             return None
 
+    def _state_json(key: str):
+        def _read(c):
+            rows = _rows(c, "SELECT value FROM bot_state WHERE key = ?", (key,))
+            if not rows:
+                return None
+            try:
+                return json.loads(rows[0]["value"])
+            except (ValueError, TypeError):
+                return None
+        return _read
+
+    def _state_raw(key: str):
+        def _read(c):
+            rows = _rows(c, "SELECT value FROM bot_state WHERE key = ?", (key,))
+            return rows[0]["value"] if rows else None
+        return _read
+
     def _reference_equity(c):
         rows = _rows(c, "SELECT value FROM bot_state "
                         "WHERE key = 'paper_reference_equity'")
@@ -229,12 +246,25 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
             "equity_latest": _maybe(con, _equity_latest, None),
             "max_drawdown_pct": bot.get("max_drawdown_pct", "N/A"),
             "risk_events": _maybe(con, _risk_events, []),
+            "last_risk_decision": _maybe(
+                con, _state_json("last_risk_decision"), None),
+            "last_account_risk": _maybe(
+                con, _state_json("last_account_risk"), None),
         },
         "account": _maybe(con, _account, None),
         "grid": {
             "grid_step_pct": bot.get("grid_step_pct", "N/A"),
             "hard_min_net_pct": bot.get("hard_min_net_pct", "N/A"),
             "latest_cycles": _maybe(con, _last_cycles, []),
+            "last_price": _maybe(con, _state_raw("last_price"), None),
+            "last_range": _maybe(con, _state_json("last_range"), None),
+            "last_symbol": _maybe(con, _state_raw("last_symbol"), None),
+            "last_adaptive_plan": _maybe(
+                con, _state_json("last_adaptive_plan"), None),
+            "last_active_plan": _maybe(
+                con, _state_json("last_active_plan"), None),
+            "last_market_intelligence": _maybe(
+                con, _state_json("last_market_intelligence"), None),
         },
         "orders": {
             "open": _maybe(con, _orders_open, []),
@@ -301,10 +331,25 @@ def render_html(snap: dict[str, Any]) -> str:
     run_badge = (_badge(f"RUNTIME {run_phase}", "green")
                  if run_phase == "COMPLETED" else
                  _badge(f"RUNTIME {run_phase}", "yellow"))
-    plan_decision = (last_cycle or {}).get("plan_decision") or "N/A"
-    grid_badge = (_badge(f"GRID {plan_decision}", "green")
-                  if "ALLOW" in str(plan_decision).upper()
+
+    grid_state = snap["grid"]
+    adaptive_plan = grid_state.get("last_adaptive_plan") or {}
+    market_intel = grid_state.get("last_market_intelligence") or {}
+    risk_decision = risk.get("last_risk_decision") or {}
+    plan_decision = str(adaptive_plan.get("decision")
+                        or ("GRID_ALLOWED" if risk_decision.get("allowed")
+                            else "GRID_BLOCKED"))
+    plan_reason = str(adaptive_plan.get("reason")
+                      or risk_decision.get("reason") or "")
+    plan_allowed = "ALLOW" in plan_decision.upper()
+    grid_badge = (_badge(f"GRID {plan_decision}", "green") if plan_allowed
                   else _badge(f"GRID {plan_decision}", "yellow"))
+    intel_status = str(market_intel.get("status") or "N/A")
+    intel_badge = (_badge(f"FILTER {intel_status}", "green")
+                   if market_intel.get("allowed") is True
+                   else _badge(f"FILTER {intel_status}", "yellow"))
+    last_range = grid_state.get("last_range") or {}
+    last_price = grid_state.get("last_price")
 
     def card(label: str, value: Any, sub: str = "") -> str:
         sub_html = f'<div class="cardsub">{_esc(sub)}</div>' if sub else ""
@@ -313,8 +358,10 @@ def render_html(snap: dict[str, Any]) -> str:
 
     open_orders = snap["orders"].get("open") or []
     quote_free = account.get("quote_free")
-    equity_val = equity.get("equity_quote") or quote_free
-    drawdown = equity.get("drawdown_pct")
+    account_risk = risk.get("last_account_risk") or {}
+    equity_val = (equity.get("equity_quote") or quote_free
+                  or account_risk.get("current_equity"))
+    drawdown = equity.get("drawdown_pct") or account_risk.get("drawdown_pct")
 
     cycle_rows = [
         {"cycle_id": c.get("cycle_id"), "candle_index": c.get("candle_index"),
@@ -324,19 +371,38 @@ def render_html(snap: dict[str, Any]) -> str:
         for c in cycles]
 
     metadata = (last_cycle or {}).get("metadata") or {}
+    diag = market_intel.get("diagnostics") or {}
+
+    def _first(*keys_vals):
+        """First non-None value among (key, source-dict) pairs."""
+        for key, src in keys_vals:
+            if isinstance(src, dict) and src.get(key) is not None:
+                return src.get(key)
+        return None
+
     grid_detail = {
-        "lower_price": metadata.get("lower_price"),
-        "upper_price": metadata.get("upper_price"),
-        "effective_upper": metadata.get("effective_upper"),
-        "grid_cells": metadata.get("grid_cells"),
-        "net_pct": metadata.get("net_pct"),
-        "current_price": metadata.get("current_price"),
-        "range_quality": metadata.get("range_quality"),
-        "adx": metadata.get("adx"),
-        "atr_pct": metadata.get("atr_pct"),
-        "bb_width": metadata.get("bb_width"),
-        "volume_ratio": metadata.get("volume_ratio"),
-        "market_regime": metadata.get("market_regime"),
+        # latest cycle state (bot_state keys) wins over historical cycle rows
+        "lower_price": _first(("lower", last_range),
+                              ("candidate_lower", adaptive_plan),
+                              ("lower_price", metadata)),
+        "upper_price": _first(("upper", last_range),
+                              ("candidate_upper", adaptive_plan),
+                              ("upper_price", metadata)),
+        "effective_upper": last_range.get("upper")
+                           or metadata.get("effective_upper"),
+        "grid_cells": _first(("grid_count", adaptive_plan),
+                             ("grid_cells", metadata)),
+        "net_pct": _first(("estimated_net_profit_per_grid", adaptive_plan),
+                          ("net_pct", metadata)),
+        "current_price": metadata.get("current_price") or last_price,
+        "grid_step": _first(("grid_step", adaptive_plan),
+                            ("grid_step", metadata)),
+        "range_quality": _first(("range_quality_score", adaptive_plan),
+                                ("range_quality_score", market_intel),
+                                ("range_quality", metadata)),
+        "market_regime": _first(("regime", adaptive_plan),
+                                ("regime", market_intel),
+                                ("market_regime", metadata)),
     }
 
     return f"""<!DOCTYPE html>
@@ -385,7 +451,7 @@ tr:last-child td {{ border-bottom:none; }}
 <p class="sub">Binance Spot Grid Monitor &middot; {_esc(env.get("symbol"))} &middot;
 {_esc(env.get("timeframe"))} &middot; read-only</p>
 <div class="badges">{env_badge} {dry_badge} {live_badge} {run_badge}
-{grid_badge} {kill_badge} {db_badge}</div>
+{grid_badge} {intel_badge} {kill_badge} {db_badge}</div>
 
 <div class="cards">
 {card("Equity (quote)", equity_val, "latest equity snapshot")}
@@ -413,22 +479,32 @@ tr:last-child td {{ border-bottom:none; }}
 
 <h2>Grid</h2>
 {_table(["field", "value"], [
-    {"field": "grid step", "value": snap["grid"].get("grid_step_pct")},
+    {"field": "grid step", "value": grid_detail.get("grid_step")
+        or snap["grid"].get("grid_step_pct")},
     {"field": "min net profit per grid",
      "value": snap["grid"].get("hard_min_net_pct")},
     {"field": "lower price", "value": grid_detail.get("lower_price")},
     {"field": "upper price", "value": grid_detail.get("upper_price")},
     {"field": "effective upper", "value": grid_detail.get("effective_upper")},
     {"field": "grid cells", "value": grid_detail.get("grid_cells")},
-    {"field": "net profit / grid", "value": grid_detail.get("net_pct")},
+    {"field": "net profit / grid (estimated)",
+     "value": grid_detail.get("net_pct")},
     {"field": "current price", "value": grid_detail.get("current_price")},
-    {"field": "range quality", "value": grid_detail.get("range_quality")},
-    {"field": "market regime", "value": grid_detail.get("market_regime")},
-    {"field": "ADX", "value": grid_detail.get("adx")},
-    {"field": "ATR %", "value": grid_detail.get("atr_pct")},
-    {"field": "BB width", "value": grid_detail.get("bb_width")},
-    {"field": "volume ratio", "value": grid_detail.get("volume_ratio")},
+    {"field": "plan decision", "value": plan_decision},
+    {"field": "plan reasons", "value": plan_reason},
 ])}
+
+<h2>Market</h2>
+{_table(["field", "value"], [
+    {"field": "market regime", "value": grid_detail.get("market_regime")},
+    {"field": "range quality", "value": grid_detail.get("range_quality")},
+    {"field": "filter status", "value": intel_status},
+    {"field": "filter allowed", "value": market_intel.get("allowed")},
+    {"field": "filter reasons", "value":
+        ", ".join(market_intel.get("reasons") or []) or None},
+] + [{"field": f"diagnostic: {k}", "value": v}
+     for k, v in sorted(diag.items())
+     if not isinstance(v, (dict, list))])}
 
 <h2>Recent cycles</h2>
 {_table(["cycle_id", "candle_index", "plan", "orders", "fills", "success",
