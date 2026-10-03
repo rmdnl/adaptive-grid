@@ -63,15 +63,21 @@
 1. **Live trading is not implemented and must not be enabled.** This is a
    safety invariant, not an unfinished task. Enabling it requires explicit
    human authorization and a separate, well-tested implementation.
-2. **Roadmap E `RestReconciler` is an abstract seam.** There is no live
-   Binance user-data stream and no REST cancel/fetch implementation in this
-   repository. The deterministic event model, state machine, and tests are
-   the deliverable; a live feed is a future, separately-authorized task. Until
-   then, reconciliation reconciles against LOCAL paper state.
+2. **Round 7: the testnet order path is implemented and verified — the
+   live-execution wiring is not.** `testnet_orders.py` provides a
+   double-gated (`TESTNET_ORDERS_ENABLED` + validated testnet-only config)
+   LIMIT_MAKER placement / cancel client and a concrete §5 cancel executor
+   for the Round 6A `RestReconciler` seam, verified end-to-end on Binance
+   Spot Testnet (`scripts/testnet_order_path_check.py`, all checks PASS).
+   The `main()` production cycle remains paper-only by design (it raises
+   when `dry_run=false`); wiring real orders into the trading cycle is a
+   future, separately-authorized task. There is still no user-data
+   websocket; event reconciliation against a live stream remains a seam.
 3. **`open_orders` reconciliation is advisory.** `open_orders_available_gate`
    blocks the plan whenever open-order state cannot be VERIFIED (UNKNOWN
    status). The F-H2 cancel path reconciles LOCAL paper-order + reservation
-   state.
+   state; the Round 7 exchange-side cancel executor is available to the
+   testnet phase but is not yet wired into the paper kill path.
 4. **The kill-state release and reference-reset commands are paper-only** and
    refuse to run when the config is not explicitly `dry_run=true` with
    `allow_live_execution=false`.
@@ -81,6 +87,15 @@
    risk.
 6. **Testnet ≠ live.** Testnet balances and results are not a guarantee of
    live behavior; testnet may reset.
+7. **Partial-fill handling on the testnet order path is status-level only.**
+   `PARTIALLY_FILLED` is a known, validated status in the resolve/reconcile
+   paths (unit-tested); a live-forced partial fill is not deterministically
+   reproducible, so fill-event accounting remains the paper engine's
+   responsibility until the separately-authorized execution wiring exists.
+8. **Binance Spot reuses a clientOrderId after its order is canceled**
+   (uniqueness holds only among open orders — verified live, code -2010
+   rejection while open).  Duplicate prevention must therefore test against
+   the open state, as `scripts/testnet_order_path_check.py` does.
 
 ## Blocked decisions (require human authorization — NOT done)
 

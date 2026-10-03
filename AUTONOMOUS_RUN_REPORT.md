@@ -713,3 +713,110 @@ check). It is NOT ready for live order placement on testnet or production.
 - None in this run. Enabling live trading, a real exchange event stream,
   loosening any risk parameter, or adding withdrawal permission would each
   require explicit human sign-off per AGENTS.md and were NOT done.
+
+---
+
+# Round 7 — Gated testnet order path + live testnet verification (2026-10-03)
+
+## Objective
+
+Close the Round 5 testnet blockers and reach "deployment-ready and verified
+on Binance Testnet": implement the explicitly gated order path (LIMIT_MAKER
++ cancel) and the concrete REST reconciliation executor, then verify the
+full order lifecycle against the real Binance Spot Testnet.
+
+## What was implemented
+
+- `testnet_orders.py` (new) — `BinanceTestnetOrderClient`:
+  - Double-gated: validated testnet-only config (testnet URL, `DRY_RUN=true`,
+    `ALLOW_LIVE_EXECUTION=false` re-asserted at construction) AND explicit
+    `TESTNET_ORDERS_ENABLED=true` env gate (strict boolean, default false).
+  - Exactly two capabilities: `place_limit_maker_order` (post-only, exact
+    decimal strings, `newOrderRespType=RESULT` for validated acks) and
+    `cancel_order_by_client_id`.  No market/OCO/algo/SOR/batch/withdraw
+    methods exist on the class (tested).
+  - Deterministic outcome semantics (Round 6A §3): validated ack = CONFIRMED;
+    400-family exchange rejection with Binance error code = deterministic
+    FAILED (`BinanceTestnetOrderRejectedError`); timeout/network/429/418 =
+    typed UNKNOWN (rate-limit errors keep Retry-After; timestamp skew keeps
+    the §10 classification).  POSTs are never retried; a lost submission ack
+    is settled by resolving the deterministic clientOrderId (§4), never by
+    resubmitting.
+  - `make_cancel_executor(resolver=...)` — the concrete §5 cancel executor
+    for the `RestReconciler` seam: CONFIRMED_CANCELED only on a validated
+    CANCELED ack or an authoritative re-query settling the ambiguous
+    -2011/-2013 family; a fill racing the cancel stays UNRECONCILED;
+    the executor never raises.
+- `scripts/testnet_order_path_check.py` (new) — the skill §21 verification
+  harness: read-only by default; `--place-order` (gate required) runs
+  place → authoritative resolve → open-order reconcile → duplicate-cid
+  rejection while open → verified cancel → post-cancel re-resolve →
+  restart recovery with fresh client instances; `--verify-cid` proves
+  restart recovery from a brand-new process.  Fail-closed, best-effort
+  cleanup of any stray order.
+- `tests/test_testnet_orders.py` (new, 36 tests) — gate enforcement, minimal
+  surface, ack validation, rejection/UNKNOWN/rate-limit/skew classification,
+  executor contract (never raises, never confirms an unproven cancel),
+  reconciliation integration, credential redaction, decimal serialization.
+- Docs: README Phase 7 section, `.env.example` gate, LIMITATIONS refresh.
+
+## Live Binance Spot Testnet verification evidence (2026-10-03)
+
+Read-only suite (`scripts/testnet_order_path_check.py`): connectivity,
+clock skew (13-62ms), symbol filters (tick 0.01 / step 0.001 / minNotional 5),
+balances (405,275 USDT free), open orders — ALL PASS.
+
+Full order path (`--place-order`, 12/12 PASS, exit 0):
+
+- Placed LIMIT_MAKER BUY 0.01 BNB @ 764.62 (notional 7.65 USDT, filter-validated):
+  ack status NEW, orderId 3790263, cid AGTV-BNBUSDT-1790998639.
+- Authoritative single-order resolve by clientOrderId: NEW.
+- `reconcile_open_orders`: exact match, authoritative.
+- Duplicate prevention: resubmission with the SAME clientOrderId while the
+  order is open → deterministic rejection (Binance code -2010); open-order
+  count unchanged.
+- Verified cancel: testnet consistently "loses" the first DELETE response
+  (SDK retry sees -2011 "Unknown order sent."); the executor settled the
+  ambiguity via authoritative re-query → CANCELED, executedQty=0.  This is
+  the live demonstration of the §5 read/write settlement rules.
+- Post-cancel re-resolve: CANCELED.  Restart recovery: fresh client +
+  reconciler instances (and two brand-new processes via `--verify-cid`)
+  resolved both historical orders as CANCELED.
+
+Production `main()` dry-run cycle against real testnet data: real candles,
+ticker 768.52, equity 405,275.83 USDT, open orders VERIFIED (0), and the
+risk engine correctly vetoed the grid (range too narrow → GRID_COUNT_INVALID,
+VOLATILITY_TOO_LOW) — "Execution: DRY RUN, no order placement".
+
+Notable live-learned behavior: Binance Spot frees a clientOrderId once its
+order is canceled (uniqueness holds only among open orders).  The
+duplicate-prevention check therefore runs while the order is open, and the
+first (pre-fix) post-cancel resubmission test actually placed a duplicate
+that was cleaned up by the script's best-effort cancel pass (final state:
+0 open orders; documented in LIMITATIONS item 8).
+
+## Test results
+
+- New suite: `tests/test_testnet_orders.py` — 36 passed.
+- Related suites (testnet adapter, reconciler): 177 passed.
+- Full `pytest -q`: see final count below (recorded at commit time).
+- Lint: ruff not enforced repo-wide (no config); new files match repo
+  conventions (Optional[...] style, deliberate §16 blind-except guards).
+  Real findings fixed (unused import, unused noqa tags).
+
+## Safety invariants — unchanged
+
+- Spot only; no futures/margin/leverage/shorting.
+- `dry_run=true` default; `main()` still raises on `dry_run=false`.
+- `allow_live_execution=false`; no production endpoint constructible.
+- The order path cannot reach any non-testnet host (URL pinned + re-asserted).
+- `TESTNET_ORDERS_ENABLED` defaults to false — unset env = read-only.
+- Grid invariants unchanged (0.30% min net, 0.60% step, 2% drawdown kill,
+  ±1% range-break buffer, 15m lower-boundary kill, risk veto over orders).
+
+## Remaining (future, separately-authorized tasks)
+
+- Wiring the verified order path into a live testnet trading cycle
+  (state machine exists; `main()` remains paper-only by invariant).
+- User-data websocket event stream (Roadmap E seam is ready for it).
+- Live trading enablement (explicit human sign-off required).

@@ -800,6 +800,85 @@ pytest tests/test_binance_testnet.py -q
 
 ---
 
+# 🧭 Phase 7: Gated Testnet Order Path (LIMIT_MAKER + cancel)
+
+**Purpose:** Close the Round 5 testnet blockers — a real, explicitly gated
+order path on Binance Spot **Testnet** plus the concrete REST reconciliation
+executor, verified end-to-end against the live testnet.
+
+**This is NOT live trading.** Live/production execution remains structurally
+impossible: `main()` still refuses to run with `dry_run=false`, no production
+endpoint can be constructed, and the order path cannot reach any non-testnet
+host.
+
+## What was added
+
+- **`testnet_orders.py`** — `BinanceTestnetOrderClient`:
+  - Only two capabilities exist: `place_limit_maker_order` (post-only,
+    maker-only, exact decimal strings on the wire) and
+    `cancel_order_by_client_id`.  No market/OCO/algo/SOR/batch/withdraw
+    methods exist on the class.
+  - Double-gated: a validated testnet config (testnet URL + `DRY_RUN=true` +
+    `ALLOW_LIVE_EXECUTION=false`) AND the explicit env gate
+    `TESTNET_ORDERS_ENABLED=true` (strict boolean, default **false**).
+  - Deterministic outcomes: validated ack (CONFIRMED), typed rejection with
+    the Binance error code (deterministic FAILED — the order was not
+    accepted), or typed UNKNOWN (timeout/network/rate-limit).  A POST is
+    never retried; a lost submission ack is settled by resolving the
+    deterministic clientOrderId, never by resubmitting.
+  - The ambiguous cancel family (`-2011`/`-2013` "unknown order") is never
+    reported as a confirmed cancel: `make_cancel_executor(resolver=...)`
+    settles it only via an authoritative re-query returning `CANCELED`
+    (a fill racing the cancel stays UNRECONCILED — it became inventory).
+- **`scripts/testnet_order_path_check.py`** — the §21 verification harness:
+  - Read-only by default (connectivity, clock skew, filters, balances).
+  - `--place-order` (requires `TESTNET_ORDERS_ENABLED=true`) runs the full
+    path: place → authoritative resolve → open-order reconcile →
+    duplicate-clientOrderId rejection (while open) → verified cancel →
+    post-cancel re-resolve → restart recovery (fresh client instances).
+  - `--verify-cid <id>` resolves a prior order from a brand-new process
+    (true restart-recovery proof).
+  - Fail-closed everywhere; exit 0 only if ALL checks pass; best-effort
+    cleanup so a failed run leaves no open testnet order behind.
+
+## Verified on Binance Spot Testnet (2026-10-03, BNBUSDT)
+
+```text
+connectivity / clock skew / filters / balances   PASS
+place LIMIT_MAKER BUY 0.01 BNB @ 764.62          PASS  (status NEW)
+authoritative resolve by clientOrderId           PASS  (NEW, orderId echoed)
+open-order reconciliation (exact match)          PASS
+duplicate clientOrderId prevention               PASS  (rejected, code -2010)
+verified cancellation                            PASS  (settled CANCELED via
+                                                  authoritative re-query)
+post-cancel re-resolve                           PASS  (CANCELED)
+restart recovery (fresh process)                 PASS  (CANCELED, both cids)
+main() dry-run cycle vs real testnet data        PASS  (all risk gates vetoed
+                                                  the current grid, no order)
+```
+
+Testnet note: the testnet repeatedly "loses" the first cancel response and
+answers the (SDK-retried) cancel with `-2011` — the executor's
+resolve-to-settle path exists precisely for this and is exercised live.
+
+## Operator commands
+
+```bash
+# Read-only verification (no orders).
+python scripts/testnet_order_path_check.py
+
+# Full order-path verification (TESTNET ORDERS, gated).
+TESTNET_ORDERS_ENABLED=true python scripts/testnet_order_path_check.py --place-order
+
+# Restart-recovery proof for a prior order (fresh process).
+python scripts/testnet_order_path_check.py --verify-cid AGTV-BNBUSDT-...
+```
+
+`TESTNET_ORDERS_ENABLED` defaults to **false**; anything other than strict
+`true`/`false` is a configuration error.  Live trading remains disabled.
+
+---
+
 # 🗂️ Struktur project
 
 ```text
