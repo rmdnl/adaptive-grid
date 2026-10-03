@@ -40,6 +40,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -388,6 +389,186 @@ def _yn(value: Any) -> str:
     return str(value)
 
 
+# ---------------------------------------------------------------------------
+# Machine-code → human language.  The dashboard stores raw machine codes
+# (e.g. "NET_PROFIT_BELOW_HARD_MIN | MARKET_FILTER_BLOCK:ADX | ...").  These
+# are rendered as plain Indonesian/English labels, with the raw code kept in
+# a small muted line below for power users.  Translation only — no data is
+# invented or altered.
+# ---------------------------------------------------------------------------
+#: human-readable label for each machine reason code (the raw code is still
+#: shown in a muted line below the human text, for power users).
+_REASONS = {
+    "NET_PROFIT_BELOW_HARD_MIN": "Net profit per grid below the 0.30% minimum",
+    "GRID_COUNT_INVALID": "Grid has fewer than 6 cells",
+    "VOLATILITY_TOO_LOW": "Volatility too low to grid",
+    "RANGE_QUALITY_TOO_LOW": "Range quality too low",
+    "RANGE_WIDTH_OUTSIDE_LIMIT": "Range width outside 3%–25% limits",
+    "ADX": "ADX too high (strong trend)",
+    "ATR": "ATR too high",
+    "BB": "Bollinger width too wide",
+    "VOLUME": "Volume spike too high",
+    "SPREAD": "Spread too wide",
+    "LIQUIDITY": "Liquidity unavailable",
+    "TREND_TOO_STRONG": "Trend too strong for a grid",
+    "VOLATILITY_TOO_HIGH": "Volatility too high",
+    "RANGE_TOO_UNSTABLE": "Range too unstable",
+    "EQUITY_DRAWDOWN_KILL": "Equity drawdown kill switch",
+    "RANGE_BREAK_BELOW_BUFFER": "Price broke below range buffer",
+    "RANGE_BREAK_ABOVE_BUFFER": "Price broke above range buffer",
+    "LOWER_BOUNDARY_STOP_15M": "15m lower-boundary stop",
+}
+#: module prefix captions kept for documentation; the reason renderer uses
+#: the leaf code (last ':' segment) so no prefix table is required at runtime.
+#: market-intelligence diagnostic keys → plain labels
+_DIAGNOSTIC_LABELS = {
+    "adx": "ADX (trend strength)",
+    "atr_pct": "ATR % (volatility)",
+    "bb_width": "Bollinger width",
+    "volume_ratio": "Volume ratio",
+    "spread_pct": "Spread %",
+    "range_quality_score": "Range quality score",
+    "min_quality_score": "Minimum quality required",
+    "atr_pct_too_low": "ATR too low flag",
+    "regime_reason": "Regime reason",
+    "error": "Error",
+}
+
+
+def _diag_label(key: str) -> str:
+    return _DIAGNOSTIC_LABELS.get(key, key.replace("_", " ").title())
+
+
+#: machine regime values → plain words
+_REGIME = {
+    "RANGE": "Range-bound", "TREND_UP": "Trend up", "TREND_DOWN": "Trend down",
+    "VOLATILE": "Volatile", "INSUFFICIENT_DATA": "Not enough data",
+    "INVALID_DATA": "Invalid data",
+}
+#: machine status / decision values → plain words
+_STATUS = {
+    "GRID_ALLOWED": "Allowed", "GRID_BLOCKED": "Blocked",
+    "COMPLETED": "Completed", "INTERRUPTED": "Interrupted",
+}
+
+
+def _kvline(human: str, raw: str) -> str:
+    """A human line plus a muted raw-code line (hidden in 'penting saja')."""
+    return (f"<div class='kvline'>{_esc(human)}</div>"
+            f"<div class='kvcode detail'>{_esc(raw)}</div>")
+
+
+def _human_code(code: str) -> str:
+    """Translate a single machine code to a human phrase (never invent)."""
+    code = code.strip()
+    if code in _REASONS:
+        return _REASONS[code]
+    if code in _REGIME:
+        return _REGIME[code]
+    # a mixed-case sentence with spaces is already human text — keep as-is
+    if code and not code.isupper() and " " in code:
+        return code
+    if code:
+        return code.replace("_", " ").title()
+    return "N/A"
+
+
+def _human_reasons(raw: Any) -> str:
+    """Render a machine reason string into clean, human-readable lines.
+
+    Input shapes (all produced by the existing engine — not modified here):
+      * "CODE | PREFIX:CODE | PREFIX:CODE"
+      * "CODE1, CODE2"                        (comma-joined machine codes)
+      * "PREFIX:CODE:Range produces only 2 grid cells; minimum is 6"
+      * "PREFIX:GRID_BLOCKED:CODE1|CODE2"
+
+    Each '|' / ',' separated reason becomes one human line (the leaf code,
+    the last ':' segment, translated).  The exact raw string is kept in a
+    small muted line beneath — hidden in "penting saja" mode but still in the
+    DOM and always in the JSON API.  No data is invented or altered.
+    """
+    if raw is None:
+        return "N/A"
+    text = str(raw).strip()
+    if not text:
+        return "N/A"
+    lines = []
+    for part in re.split(r"\s*[|,]\s*", text):
+        part = part.strip()
+        if not part:
+            continue
+        leaf = part.split(":")[-1].strip()
+        lines.append(f"<div class='kvline'>{_esc(_human_code(leaf))}</div>")
+    if not lines:
+        return _esc(_fmt(text))
+    lines.append(f"<div class='kvcode detail'>{_esc(text)}</div>")
+    return "".join(lines)
+
+
+def _is_machineish(text: str) -> bool:
+    """True when a value looks like machine codes rather than plain text."""
+    if "|" in text:
+        return True
+    tokens = [t for t in re.split(r"\s*[|,]\s*", text) if t]
+    return any(t.upper() == t and "_" in t for t in tokens)
+
+
+def _human(value: Any) -> str:
+    """Best-effort human rendering of a value for the key/value tables.
+
+    Reason-looking values (contain '|' or a ':' module prefix) go through
+    :func:`_human_reasons`; regime names are translated; everything else
+    keeps the existing number/trim formatting.  Translation only — no data
+    is invented or altered.
+    """
+    if value is None:
+        return "N/A"
+    text = str(value).strip()
+    if not text:
+        return "N/A"
+    # Known machine values: show the human word, with the raw code kept in a
+    # muted sub-line (consistent with reason lists; hidden in "penting saja").
+    if text in _REGIME:
+        return _kvline(_REGIME[text], text)
+    if text in _STATUS:
+        return _kvline(_STATUS[text], text)
+    if text in _REASONS:
+        return _kvline(_REASONS[text], text)
+    # Reason-looking values: module prefix (e.g. "RANGE:...", "GRID:...") or
+    # any machine-code list (contains '|' / comma-joined UPPER_SNAKE codes).
+    prefix = text.split(":", 1)[0].upper() if ":" in text else ""
+    known_prefix = prefix in {
+        "NET_PROFIT", "MARKET_FILTER_BLOCK", "RANGE", "GRID",
+        "MARKET_INTELLIGENCE", "ADAPTIVE_PLANNER", "OPEN_ORDERS", "ACCOUNT"}
+    if _is_machineish(text) or known_prefix:
+        return _human_reasons(text)
+    return _esc(_fmt(value))
+
+
+def _kv(pairs: list[tuple[str, Any]]) -> str:
+    """Render (label, value) pairs as a clean two-column list.
+
+    ``value`` is a ready-to-display STRING (number, text, or human-rendered
+    HTML).  The label sits on the left, the value on the right; the value is
+    HTML-escaped except when it is known reason-render HTML (from
+    :func:`_human`), which is inserted verbatim.  This replaces the confusing
+    "field | value" header row.
+    """
+    if not pairs:
+        return '<p class="muted">no data</p>'
+    rows = []
+    for label, value in pairs:
+        text = "N/A" if value in (None, "") else str(value)
+        # reason-render HTML produced by _human() is safe by construction;
+        # everything else is escaped.  A value containing '<div' is the
+        # rendered-reason signature.
+        value_html = text if "<div" in text else _esc(text)
+        rows.append(
+            f'<div class="kvrow"><div class="kvlabel">{_esc(label)}</div>'
+            f'<div class="kvvalue">{value_html}</div></div>')
+    return f'<div class="kvlist">{"".join(rows)}</div>'
+
+
 def _table(columns: list[str], rows: list[dict]) -> str:
     if not rows:
         return '<p class="muted">no data</p>'
@@ -495,9 +676,23 @@ table.numalign td.num, table.numalign th.num { text-align:right;
 .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   font-size:.85em; color:#c9d1d9; }
 .foot { color:#8b949e; font-size:.75rem; margin-top:24px; line-height:1.5; }
-/* "penting saja" mode hides detail rows/blocks */
+/* key/value lists (replaces the confusing "field | value" tables) */
+.kvlist { background:#161b22; border:1px solid #30363d; border-radius:10px;
+  overflow-x:auto; }
+.kvrow { display:grid; grid-template-columns:150px 1fr; gap:0 14px;
+  padding:9px 14px; border-bottom:1px solid #21262d; align-items:baseline; }
+.kvrow:last-child { border-bottom:none; }
+.kvlabel { color:#8b949e; font-size:.82rem; }
+.kvvalue { color:#e6edf3; font-size:.9rem; font-weight:500;
+  word-break:break-word; min-width:0; }
+.kvline { color:#e6edf3; }
+.kvcode { color:#8b949e; font-size:.74rem; margin-top:3px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  word-break:break-word; }
+/* "penting saja" mode hides detail rows/blocks + the raw-code sub-lines */
 body.penting-only tr.detail { display:none; }
 body.penting-only .detail-block { display:none; }
+body.penting-only .kvcode { display:none; }
 /* mobile: stack cards 2-up, smaller cards, scrollable tables */
 @media (max-width: 640px) {
   main { padding:10px 10px 28px; }
@@ -695,11 +890,11 @@ def render_html(snap: dict[str, Any]) -> str:
 
 <section class="tabpane active" id="tab-general" role="tabpanel">
 <h2>Ringkasan</h2>
-{_table(["field", "value"], [
-    {"field": "risk decision", "value": "PASS" if risk_allowed else "BLOCKED"},
-    {"field": "plan decision", "value": plan_decision},
-    {"field": "plan reasons", "value": plan_reason or None},
-    {"field": "market filter", "value": intel_status},
+{_kv([
+    ("Risk decision", "PASS" if risk_allowed else "BLOCKED"),
+    ("Plan decision", _human(plan_decision)),
+    ("Plan reasons", _human(plan_reason)),
+    ("Market filter", _human(intel_status)),
 ])}
 <h2 class="detail-block">Recent cycles</h2>
 {_table(["cycle_id", "candle_index", "plan", "orders", "fills", "success",
@@ -708,14 +903,14 @@ def render_html(snap: dict[str, Any]) -> str:
 
 <section class="tabpane" id="tab-risk" role="tabpanel">
 <h2>Risk</h2>
-{_table(["field", "value"], [
-    {"field": "kill switch active", "value": kill.get("active", False)},
-    {"field": "kill trigger", "value": kill.get("trigger_reason")},
-    {"field": "activated at", "value": kill.get("activated_at")},
-    {"field": "cancel status", "value": kill.get("cancel_status")},
-    {"field": "reference equity", "value": _fmt(risk.get("reference_equity"))},
-    {"field": "latest drawdown", "value": _pct(drawdown)},
-    {"field": "max allowed drawdown", "value": _pct(risk.get("max_drawdown_pct"))},
+{_kv([
+    ("Kill switch", _yn(kill.get("active", False))),
+    ("Kill trigger", _human(kill.get("trigger_reason") or "")),
+    ("Activated at", _wib(kill.get("activated_at"))),
+    ("Cancel status", _yn(kill.get("cancel_status")) if kill.get("cancel_status") is not None else "N/A"),
+    ("Reference equity", _fmt(risk.get("reference_equity"))),
+    ("Current drawdown", _pct(drawdown)),
+    ("Drawdown limit", _pct(risk.get("max_drawdown_pct"))),
 ])}
 <h3 class="detail-block">Recent risk events</h3>
 {_table(["ts", "allowed", "reason"], risk.get("risk_events") or [])}
@@ -723,35 +918,32 @@ def render_html(snap: dict[str, Any]) -> str:
 
 <section class="tabpane" id="tab-grid" role="tabpanel">
 <h2>Grid</h2>
-{_table(["field", "value"], [
-    {"field": "grid step", "value": _pct(grid_detail.get("grid_step")
-        or snap["grid"].get("grid_step_pct"))},
-    {"field": "min net profit per grid",
-     "value": _pct(snap["grid"].get("hard_min_net_pct"))},
-    {"field": "lower price", "value": _fmt(grid_detail.get("lower_price"))},
-    {"field": "upper price", "value": _fmt(grid_detail.get("upper_price"))},
-    {"field": "effective upper", "value": _fmt(grid_detail.get("effective_upper"))},
-    {"field": "grid cells", "value": grid_detail.get("grid_cells")},
-    {"field": "net profit / grid (estimated)",
-     "value": _pct(grid_detail.get("net_pct"))},
-    {"field": "current price", "value": _fmt(grid_detail.get("current_price"))},
-    {"field": "plan decision", "value": plan_decision},
-    {"field": "plan reasons", "value": plan_reason or None},
+{_kv([
+    ("Grid step", _pct(grid_detail.get("grid_step") or snap["grid"].get("grid_step_pct"))),
+    ("Min net profit / grid", _pct(snap["grid"].get("hard_min_net_pct"))),
+    ("Lower price", _fmt(grid_detail.get("lower_price"))),
+    ("Upper price", _fmt(grid_detail.get("upper_price"))),
+    ("Effective upper", _fmt(grid_detail.get("effective_upper"))),
+    ("Grid cells", _fmt(grid_detail.get("grid_cells"))),
+    ("Net profit / grid (est.)", _pct(grid_detail.get("net_pct"))),
+    ("Current price", _fmt(grid_detail.get("current_price"))),
+    ("Plan decision", _human(plan_decision)),
+    ("Plan reasons", _human(plan_reason)),
 ])}
 </section>
 
 <section class="tabpane" id="tab-market" role="tabpanel">
 <h2>Market</h2>
-{_table(["field", "value"], [
-    {"field": "market regime", "value": grid_detail.get("market_regime")},
-    {"field": "range quality", "value": _fmt(grid_detail.get("range_quality"))},
-    {"field": "filter status", "value": intel_status},
-    {"field": "filter allowed", "value": market_intel.get("allowed")},
-    {"field": "filter reasons", "value":
-        ", ".join(market_intel.get("reasons") or []) or None},
-] + [{"field": f"diagnostic: {k}", "value": _fmt(v), "detail": True}
-     for k, v in sorted(diag.items())
-     if not isinstance(v, (dict, list))])}
+{_kv([
+    ("Market regime", _human(grid_detail.get("market_regime")) if grid_detail.get("market_regime") else "N/A"),
+    ("Range quality", _fmt(grid_detail.get("range_quality"))),
+    ("Filter status", _human(intel_status) if intel_status else "N/A"),
+    ("Filter allowed", _yn(market_intel.get("allowed"))),
+    ("Filter reasons", _human(", ".join(market_intel.get("reasons") or [])) if market_intel.get("reasons") else None),
+] + [
+    (_diag_label(k), _fmt(v))
+    for k, v in sorted(diag.items()) if not isinstance(v, (dict, list))
+])}
 </section>
 
 <section class="tabpane" id="tab-orders" role="tabpanel">
@@ -771,17 +963,16 @@ def render_html(snap: dict[str, Any]) -> str:
 
 <section class="tabpane" id="tab-system" role="tabpanel">
 <h2>System</h2>
-{_table(["field", "value"], [
-    {"field": "dashboard time", "value": _wib(dash.get("generated_at_utc"))},
-    {"field": "database healthy", "value": dash.get("db_healthy")},
-    {"field": "database error", "value": dash.get("db_error")},
-    {"field": "schema user_version", "value":
-        (snap.get("database") or {}).get("schema_user_version")},
-    {"field": "last run id", "value": run_state.get("run_id")},
-    {"field": "last run phase", "value": run_state.get("phase")},
-    {"field": "last run risk allowed", "value": run_state.get("risk_allowed")},
-    {"field": "open orders at last run", "value": run_state.get("open_orders")},
-    {"field": "read-only", "value": dash.get("read_only")},
+{_kv([
+    ("Dashboard time", _wib(dash.get("generated_at_utc"))),
+    ("Database healthy", _yn(dash.get("db_healthy"))),
+    ("Database error", _human(dash.get("db_error") or "")),
+    ("Schema user_version", _fmt((snap.get("database") or {}).get("schema_user_version"))),
+    ("Last run id", _fmt(run_state.get("run_id"))),
+    ("Last run phase", _human(run_state.get("phase") or "")),
+    ("Last run risk allowed", _yn(run_state.get("risk_allowed"))),
+    ("Open orders at last run", _fmt(run_state.get("open_orders"))),
+    ("Read-only", _yn(dash.get("read_only"))),
 ])}
 </section>
 <p class="foot">Public read-only monitor &middot; no authentication by design
@@ -821,7 +1012,7 @@ def make_handler(settings: dict[str, Any]):
         def _not_found(self) -> None:
             self._send(404, b'{"error": "not found"}', "application/json")
 
-        def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
+        def do_GET(self) -> None:
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
             if path == "/healthz":
                 body = json.dumps({"status": "ok", "read_only": True,

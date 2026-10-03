@@ -184,7 +184,7 @@ def test_root_html(server):
     assert "765.23" in html            # lower from last_range
     assert "MARKET FILTERED" in html   # human-friendly market badge
     assert "RISK BLOCKED" in html      # human-friendly risk badge
-    assert "diagnostic: adx" in html   # market intelligence diagnostics table
+    assert "ADX (trend strength)" in html   # human-labeled market diagnostic
     # equity card falls back to last_account_risk when no snapshot exists
     assert "405275.83" in html
     # human-friendly number formatting
@@ -208,9 +208,9 @@ def test_tabbed_layout_and_penting_filter(server):
     assert 'id="penting-toggle"' in html
     assert "penting-only" in html            # CSS rule that hides details
     assert "localStorage" in html            # remembers the user's choice
-    # detail rows / blocks are tagged so the filter can hide them
-    assert 'class="detail"' in html
-    assert "detail-block" in html
+    # detail lines / blocks are tagged so the "penting saja" filter hides them
+    assert "class='kvcode detail'" in html   # raw machine-code sub-lines
+    assert "detail-block" in html            # detail section headings
     # the CSS/JS chrome must not leak any credential material
     for secret in ("api_key", "api_secret", "BINANCE_API_KEY",
                    "BINANCE_API_SECRET", "password"):
