@@ -111,6 +111,17 @@ logging:
   log_path: ./logs/grid_bot.log
   csv_path: ./logs/trades.csv
 
+# Round 10: continuous runtime (orchestration only — it repeatedly invokes
+# the existing authoritative single-cycle main() entrypoint; it places no
+# orders and holds no trading logic of its own).  Cadence: one cycle per NEW
+# closed candle of `timeframe`, paced by interval_seconds; interval retry
+# after a cycle refused.  interval_seconds < timeframe keeps candle-aligned
+# operation (15m timeframe ⇒ default 60s is candle-aligned).
+runtime:
+  enabled: true
+  interval_seconds: 60
+  boundary_grace_seconds: 15
+
 # Phase 6A: Binance Spot Testnet read-only adapter.
 # Credentials come from environment variables (BINANCE_API_KEY, BINANCE_API_SECRET).
 # This block only configures transport/safety — never credentials.

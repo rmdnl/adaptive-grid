@@ -1,0 +1,47 @@
+# systemd unit template for the adaptive-grid continuous runtime.
+#
+# Install on the VPS (do NOT commit changes to the VPS unit files):
+#   sudo cp deploy/adaptive-grid.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now adaptive-grid.service
+#
+# Safety: the runtime is TESTNET/PAPER only.  It refuses to start unless
+# config.yaml has environment.dry_run=true (and main() independently
+# raises otherwise).  allow_live_execution stays false.  The unit never
+# passes any flag that could change that.
+
+[Unit]
+Description=adaptive-grid continuous runtime (testnet/paper)
+Documentation=https://github.com/rmdnl/adaptive-grid
+# Only run with real network access (the cycle needs Binance testnet).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated non-root user (create once: useradd -r -s /usr/sbin/nologin adaptive-grid)
+User=adaptive-grid
+Group=adaptive-grid
+WorkingDirectory=/opt/adaptive-grid
+ExecStart=/opt/adaptive-grid/.venv/bin/python runtime.py
+# Restart only after an actual process failure: an unexpected exception
+# exits nonzero (fail closed) and systemd restarts fresh; a graceful
+# SIGTERM stop is NOT restarted.
+Restart=on-failure
+RestartSec=30s
+# Graceful shutdown: SIGTERM is observed at safe boundaries only; allow a
+# cycle in flight to finish before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=90s
+# Credentials come from /opt/adaptive-grid/.env (loaded by the app itself);
+# the optional EnvironmentFile is a convenience mirror and is not required.
+EnvironmentFile=-/opt/adaptive-grid/.env
+# Basic hardening (keeps /opt/adaptive-grid writable for state/logs via
+# WorkingDirectory; ProtectSystem=full leaves /etc read-only, /usr read-only).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

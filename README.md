@@ -1022,6 +1022,67 @@ zero-open-order cleanup proof.
 
 ---
 
+# 🚀 Continuous Runtime (testnet/paper daemon)
+
+`runtime.py` is the long-running production wrapper for the VPS: it
+repeatedly invokes the **existing authoritative single-cycle entrypoint**
+(`main.main`) — it contains no trading logic of its own, places no orders,
+and never bypasses the Risk Engine, kill switch, reconciliation, or any
+safety gate.
+
+## How scheduling works
+
+- One cycle per **new closed candle** of the configured `timeframe`
+  (15m — deterministic wall-clock boundaries, no new timing model), with a
+  configurable grace period (`runtime.boundary_grace_seconds`) after the
+  boundary.
+- `runtime.interval_seconds` (default 60) paces wake-ups; after a cycle
+  that refused (config error / restart-reconciliation refusal) the daemon
+  keeps monitoring at that interval.  Within one closed candle it never
+  re-invokes just because time passed — the cycle itself is idempotent per
+  closed candle (deterministic `cycle_id` replay), so a restart cannot
+  create duplicate orders.
+- A normal **BLOCK** decision is a healthy outcome: the daemon logs it and
+  keeps monitoring.  An unexpected exception is logged with a traceback
+  and **fails closed** — the process exits nonzero so systemd restarts it
+  fresh; nothing is retried or invented at the runtime layer.
+
+## Running manually (testnet/dry-run)
+
+```bash
+# continuous run (Ctrl-C for graceful shutdown)
+python runtime.py
+
+# bounded observation (exits after N cycles)
+python runtime.py --max-cycles 2
+```
+
+The runtime refuses to start unless `environment.dry_run=true`;
+`allow_live_execution` must stay false.  Structured events are logged as
+`RUNTIME START / CYCLE START / CYCLE RESULT / CYCLE BLOCKED / RUNTIME WAIT /
+RUNTIME STOP / CYCLE UNEXPECTED EXCEPTION` to stdout and
+`logs/grid_bot.log` (the cycle's own logging is unchanged).
+
+## systemd (VPS)
+
+A unit template ships in `deploy/adaptive-grid.service`:
+
+```bash
+sudo cp deploy/adaptive-grid.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now adaptive-grid.service   # start + enable
+systemctl status adaptive-grid.service              # health
+journalctl -u adaptive-grid.service -f              # live logs
+sudo systemctl stop adaptive-grid.service           # graceful SIGTERM stop
+```
+
+The unit runs as a dedicated non-root `adaptive-grid` user from
+`/opt/adaptive-grid` with `/opt/adaptive-grid/.venv/bin/python`, uses
+`network-online.target`, and `Restart=on-failure` — a graceful stop is not
+restarted, only an actual process failure is.
+
+---
+
 # 🗂️ Struktur project
 
 ```text
