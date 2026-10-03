@@ -381,3 +381,44 @@ def test_equity_growth_does_not_trigger_kill_switch(tmp_path, monkeypatch):
     # The run recorded the higher equity (1000 + 5*101 = 1505) as the new
     # persisted peak.
     assert main.load_peak_equity(db) == Decimal("1505")
+
+
+# ---------------------------------------------------------------------------
+# Equity snapshot persistence (dashboard observability)
+# ---------------------------------------------------------------------------
+
+def test_production_cycle_persists_equity_snapshot(tmp_path, monkeypatch):
+    """Every production cycle persists the equity/drawdown it already
+    computed (storage.record_equity, previously an unwired helper) so the
+    read-only dashboard can display it.  Pure observability: the risk
+    decision and trading behavior are unchanged."""
+    db = str(tmp_path / DB)
+    _seed_peak(db, "1500")  # peak: 5 BNB + 1000 USDT @ price 100
+
+    _install_main_stubs(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "load_config", lambda: _config(tmp_path))
+    monkeypatch.setattr(main, "fetch_symbol_info",
+                        lambda client, symbol: _wide_percent_price_symbol_info())
+    monkeypatch.setattr(main, "fetch_account_snapshot",
+                        lambda client, base, quote: _account_snapshot_5bnb())
+    monkeypatch.setattr(
+        main, "fetch_ticker_price",
+        lambda client, symbol: TickerSnapshot(
+            symbol="BNBUSDT", price=Decimal("94.00"),
+            fetched_at=datetime.now(timezone.utc),
+        ),
+    )
+    assert main.main() == 0
+
+    with sqlite3.connect(db) as con:
+        rows = con.execute(
+            "SELECT equity_quote, drawdown_pct FROM equity_snapshots"
+            " ORDER BY ts DESC LIMIT 1"
+        ).fetchall()
+    assert rows, "cycle must persist an equity snapshot"
+    equity, drawdown = rows[0]
+    # 5 BNB @ 94 + 1000 USDT = 1470; drawdown vs the 1500 peak = 2%
+    assert Decimal(equity) == Decimal("1470")
+    assert Decimal(drawdown) == Decimal("0.02")
+    # observability only: the run above still blocked via the kill switch
+    assert "EQUITY_DRAWDOWN_KILL" in _risk_reasons(db)

@@ -65,6 +65,7 @@ from storage import (
     get_kill_state,
     get_state,
     init_db,
+    record_equity,
     record_risk_event,
     record_reference_equity_audit,
     set_state,
@@ -522,6 +523,15 @@ def main():
         # defeat the kill-switch invariant.
         if raw_reference is None or reference_equity is not None:
             record_peak_equity(db_path, account_risk.current_equity)
+        # Observability: persist the equity/drawdown this run already
+        # computed so the read-only dashboard can display it.  The storage
+        # helper existed (audited schema) but was never wired into the
+        # cycle.  This is never a trading gate and must never fail the run.
+        try:
+            record_equity(db_path, account_risk.current_equity,
+                          account_risk.drawdown_pct)
+        except Exception as exc:
+            logger.warning("EQUITY SNAPSHOT UNAVAILABLE: %s", exc)
 
     commission_payload, fee_source_raw=fetch_account_commission(client,symbol)
     fees=effective_fees(
