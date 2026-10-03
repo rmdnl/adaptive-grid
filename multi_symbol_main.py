@@ -241,7 +241,7 @@ class SymbolCycleRunner:
     def _get_hard_min_net(self) -> Decimal:
         return Decimal(str(self.cfg["grid"]["hard_min_net_pct"]))
     
-def run_cycle(self) -> dict[str, Any]:
+    def run_cycle(self) -> dict[str, Any]:
         """Execute one complete cycle for this symbol."""
         result = {
             "symbol": self.symbol,
@@ -512,10 +512,10 @@ def run_cycle(self) -> dict[str, Any]:
                 ),
             ]
             if account_risk:
-                decisions.extend((
-                    equity_dd_kill(account_risk.drawdown_pct, self.cfg["risk"]["max_equity_drawdown_pct")),
+                decisions.extend([
+                    equity_dd_kill(account_risk.drawdown_pct, self.cfg["risk"]["max_equity_drawdown_pct"]),
                     inventory_gate(account_risk.inventory_pct, self.cfg["execution"]["max_inventory_pct"]),
-                ))
+                ])
             else:
                 decisions.append(account_state_gate(False))
             
@@ -634,7 +634,7 @@ def run_cycle(self) -> dict[str, Any]:
             result["error"] = str(exc)
         
         return result
-    
+
     def _latest_closed_candle_close(self, kline_df) -> Decimal | None:
         if kline_df is None or not hasattr(kline_df, "empty") or kline_df.empty:
             return None
