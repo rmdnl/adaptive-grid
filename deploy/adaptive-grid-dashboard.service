@@ -1,0 +1,41 @@
+# systemd unit template for the adaptive-grid READ-ONLY web dashboard.
+#
+# Install on the VPS (do NOT commit changes to VPS unit files):
+#   sudo cp deploy/adaptive-grid-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now adaptive-grid-dashboard.service
+#
+# Coexists with adaptive-grid.service (the trading runtime) — independently
+# startable/stoppable.  The dashboard has NO authentication by design and is
+# strictly read-only: it opens the state database with SQLite mode=ro and
+# exposes only GET /, GET /api/status, and GET /healthz.  It has no Binance
+# credentials and no trading capability of any kind.
+
+[Unit]
+Description=adaptive-grid read-only dashboard (port 8080)
+Documentation=https://github.com/rmdnl/adaptive-grid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adaptive-grid
+Group=adaptive-grid
+WorkingDirectory=/opt/adaptive-grid
+ExecStart=/opt/adaptive-grid/.venv/bin/python dashboard.py
+# The dashboard reads files only; an unexpected exit is restarted fresh.
+Restart=on-failure
+RestartSec=15s
+Environment=DASHBOARD_HOST=0.0.0.0
+Environment=DASHBOARD_PORT=8080
+Environment=GRID_DB_PATH=/opt/adaptive-grid/data/grid_bot.sqlite3
+# The dashboard must NOT hold Binance credentials.  Do NOT add an
+# EnvironmentFile pointing at .env here — the dashboard requires none and
+# must never receive them.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

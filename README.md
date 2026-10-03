@@ -1083,6 +1083,81 @@ restarted, only an actual process failure is.
 
 ---
 
+# 📊 Public Read-Only Dashboard (port 8080)
+
+`dashboard.py` is a separate, independently-restartable monitor process
+(`adaptive-grid-dashboard.service`).  It reads the existing SQLite state
+database **read-only** (SQLite `mode=ro` at the connection level) and
+serves a dark, mobile-friendly HTML page that auto-refreshes every 12s.
+
+**It is intentionally public and has NO authentication** (operator
+decision): security comes from a strictly read-only architecture — the
+dashboard has no trading capability, no mutation endpoints, no file
+access, no Binance credentials, and cannot modify any state.  It cannot
+place/cancel/replace orders, cannot change risk or configuration, and
+cannot release the kill switch or reset the reference equity — those
+operations do not exist in the dashboard process.
+
+## Endpoints
+
+| Route | What |
+|---|---|
+| `GET /` | HTML dashboard |
+| `GET /api/status` | JSON status snapshot |
+| `GET /healthz` | health probe |
+
+Anything else returns 404; any non-GET method returns 405 (unknown paths
+404 regardless of method — no hidden admin routes).  A missing or corrupt
+database degrades the snapshot (`db_healthy: false`) instead of crashing.
+
+## Configuration (environment variables)
+
+```text
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=8080
+GRID_DB_PATH=/opt/adaptive-grid/data/grid_bot.sqlite3
+```
+
+The dashboard deliberately receives **no Binance credentials** — do not add
+an `EnvironmentFile` pointing at `.env` to its systemd unit.
+
+## Installation (VPS)
+
+```bash
+cd /opt/adaptive-grid && git pull --ff-only origin main
+sudo cp deploy/adaptive-grid-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now adaptive-grid-dashboard.service
+```
+
+Status / logs / local checks:
+
+```bash
+systemctl status adaptive-grid-dashboard.service --no-pager
+sudo journalctl -u adaptive-grid-dashboard.service -f
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/api/status
+ss -lntp | grep ':8080'
+```
+
+The trading runtime (`adaptive-grid.service`) is unaffected and does not
+need a restart.
+
+## Public access & firewall
+
+The dashboard is reachable at `http://SERVER_PUBLIC_IP:8080/`.  Exposing
+TCP 8080 requires an explicit firewall rule — do not disable the firewall:
+
+- **Ubuntu/UFW:** `sudo ufw allow 8080/tcp`
+- **Oracle Cloud:** add an ingress rule to the subnet's Security List /
+  NSG: source `0.0.0.0/0`, TCP, destination port `8080`.
+
+If unrestricted Internet access is not desired, restrict the source IP or
+front the dashboard with a reverse proxy providing HTTPS — recommended as
+a future production hardening, not a prerequisite.
+
+---
+
 # 🗂️ Struktur project
 
 ```text
