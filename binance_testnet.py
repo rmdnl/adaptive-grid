@@ -27,6 +27,24 @@ try:
 except ImportError:
     Spot = ConfigurationRestAPI = None  # type: ignore[assignment,misc]
 
+# Typed SDK error classes, used for *type-aware* classification in
+# ``_raise_network_or_auth`` (Round 6A §9/§10).  The binance SDK re-exports
+# its HTTP error classes at the top level; a missing import (SDK not
+# installed) leaves them ``None`` so the string heuristics stay the
+# fallback — the classifier never crashes on a partially available SDK.
+try:
+    from binance_sdk_spot import (
+        BadRequestError as _SDK_BadRequestError,
+        NotFoundError as _SDK_NotFoundError,
+        RateLimitBanError as _SDK_RateLimitBanError,
+        TooManyRequestsError as _SDK_TooManyRequestsError,
+    )
+except ImportError:  # pragma: no cover - SDK is a hard dependency when used
+    _SDK_BadRequestError = None  # type: ignore[assignment,misc]
+    _SDK_NotFoundError = None  # type: ignore[assignment,misc]
+    _SDK_RateLimitBanError = None  # type: ignore[assignment,misc]
+    _SDK_TooManyRequestsError = None  # type: ignore[assignment,misc]
+
 
 # ---------------------------------------------------------------------------
 # Approved testnet endpoints (absolute, no fallback)
@@ -54,7 +72,18 @@ class BinanceTestnetConfigError(BinanceTestnetError):
 
 
 class BinanceTestnetNetworkError(BinanceTestnetError):
-    """Network / transport failure."""
+    """Network / transport failure.
+
+    ``not_found`` marks a 404 / "order not found" outcome.  On Binance Spot a
+    missing-order response for an order we *submitted* is ambiguous (it may
+    have been filled-then-archived, rejected, or expired) and is NEVER proof
+    of non-existence — callers must treat ``not_found=True`` as UNKNOWN
+    (Round 6A §3), not as "safe to resubmit".
+    """
+
+    def __init__(self, message: str, *, not_found: bool = False) -> None:
+        super().__init__(message)
+        self.not_found = not_found
 
 
 class BinanceTestnetAuthenticationError(BinanceTestnetError):
@@ -71,6 +100,55 @@ class BinanceTestnetValidationError(BinanceTestnetError):
 
 class BinanceTestnetEnvironmentError(BinanceTestnetError):
     """Environment is not the approved testnet."""
+
+
+class BinanceTestnetRateLimitError(BinanceTestnetNetworkError):
+    """HTTP 429 / 418 rate-limit or ban response (Round 6A §9).
+
+    Carries the Retry-After value (seconds) when the response header was
+    available, plus the HTTP status and whether the IP is banned (418).
+    Still a ``BinanceTestnetNetworkError`` so existing callers keep
+    working; the extra fields let the reconciler apply a bounded,
+    Retry-After-aware backoff instead of trusting SDK defaults (§9).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_s: int | None = None,
+        banned: bool = False,
+        status_code: int = 429,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+        self.banned = banned
+        self.status_code = status_code
+
+    @property
+    def retry_after_ms(self) -> int | None:
+        if self.retry_after_s is None:
+            return None
+        return int(self.retry_after_s) * 1000
+
+
+class BinanceTestnetTimestampError(BinanceTestnetNetworkError):
+    """Signed-request timestamp rejected due to clock skew (Round 6A §10).
+
+    Binance returns a 400 when ``|local - server| > recvWindow``; the
+    message reads like "Timestamp for this request was ...ms
+    earlier/later than our time".  This is *retryable after a clock
+    re-sync*, never "safe to assume" — the reconciler measures the offset
+    via the exchange server-time endpoint and fails closed if it cannot
+    establish a bounded, sane offset.
+    """
+
+
+#: Subclasses that carry a Retry-After value the reconciler must honor.
+#: Bounded cap on a Retry-After value the reconciler will honor (Round 6A §9).
+#: A hostile or garbage header must not stall the fail-closed loop forever.
+_RETRY_AFTER_MAX_S = 300
+
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +661,30 @@ class BinanceTestnetClient:
             )
         return tuple(orders)
 
+    def get_order(self, symbol: str, client_order_id: str) -> dict[str, Any]:
+        """Query a single order status by deterministic clientOrderId.
+
+        Read-only USER_DATA query.  Returns the *validated* plain-dict
+        order payload (never raw SDK objects).  A missing order is an
+        ambiguous outcome on Binance Spot (the order may have been
+        filled-then-archived, rejected, or expired) and therefore
+        raises ``BinanceTestnetResponseError`` — the caller must treat
+        it as UNKNOWN, never as proof of non-existence (Round 6A §3).
+        """
+        normalized = str(symbol).upper()
+        if not isinstance(client_order_id, str) or not client_order_id.strip():
+            raise BinanceTestnetValidationError(
+                "client_order_id must be a non-empty string"
+            )
+        try:
+            resp = self._spot.rest_api.get_order(
+                symbol=normalized, orig_client_order_id=client_order_id
+            )
+        except Exception as exc:
+            _raise_network_or_auth(exc)
+        payload = _model_to_plain(resp.data())
+        return _parse_order_status(payload, normalized, client_order_id)
+
     def symbol_snapshot(self, symbol: str) -> BinanceSymbolSnapshot:
         """Aggregate snapshot: exchange info + all filters."""
         info = self.exchange_info(symbol)
@@ -778,6 +880,87 @@ class BinanceTestnetClient:
 
 
 # ---------------------------------------------------------------------------
+# Single-order status parser (get_order / cancel_order seam)
+# ---------------------------------------------------------------------------
+#: Binance order statuses this adapter understands.  Anything else is
+#: ambiguous and must fail closed — never silently map to a safe state
+#: (Round 6A §6).
+_KNOWN_ORDER_STATUSES = frozenset({
+    "NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED",
+})
+
+
+def _parse_order_status(payload: Any, symbol: str, client_order_id: str) -> dict[str, Any]:
+    """Validate a single-order status payload.
+
+    Returns a plain dict with the normalized fields the reconciliation
+    seam needs.  Malformed payloads, missing fields, and unknown
+    statuses raise (fail closed) — the caller maps any raised
+    BinanceTestnetError to an UNKNOWN outcome.
+    """
+    if not isinstance(payload, dict):
+        raise BinanceTestnetResponseError(
+            f"get_order response is not an object for {client_order_id!r}"
+        )
+    returned_symbol = payload.get("symbol")
+    if not isinstance(returned_symbol, str) or returned_symbol.upper() != symbol:
+        raise BinanceTestnetResponseError(
+            f"get_order symbol mismatch for {client_order_id!r}: "
+            f"expected {symbol}, got {returned_symbol!r}"
+        )
+    returned_cid = payload.get("clientOrderId")
+    if not isinstance(returned_cid, str) or returned_cid != client_order_id:
+        raise BinanceTestnetResponseError(
+            f"get_order clientOrderId mismatch: requested {client_order_id!r}, "
+            f"got {returned_cid!r}"
+        )
+    status = payload.get("status")
+    if not isinstance(status, str) or status.upper() not in _KNOWN_ORDER_STATUSES:
+        raise BinanceTestnetResponseError(
+            f"Unknown order status for {client_order_id!r}: {status!r}"
+        )
+    price = _decimal(payload.get("price"), "price")
+    orig_qty = _decimal(payload.get("origQty"), "origQty")
+    executed_qty = _decimal(payload.get("executedQty"), "executedQty")
+    if not price.is_finite() or price < 0:
+        raise BinanceTestnetValidationError(
+            f"Invalid price for order {client_order_id!r}: {price}"
+        )
+    if not orig_qty.is_finite() or orig_qty <= 0:
+        raise BinanceTestnetValidationError(
+            f"Invalid origQty for order {client_order_id!r}: {orig_qty}"
+        )
+    if not executed_qty.is_finite() or executed_qty < 0:
+        raise BinanceTestnetValidationError(
+            f"Invalid executedQty for order {client_order_id!r}: {executed_qty}"
+        )
+    if executed_qty > orig_qty:
+        raise BinanceTestnetValidationError(
+            f"executedQty exceeds origQty for order {client_order_id!r}"
+        )
+    order_id = payload.get("orderId")
+    if order_id is None or isinstance(order_id, bool):
+        raise BinanceTestnetValidationError(
+            f"Missing orderId for order {client_order_id!r}"
+        )
+    if isinstance(order_id, str) and order_id.isdigit():
+        order_id = int(order_id)
+    if not isinstance(order_id, int) or order_id <= 0:
+        raise BinanceTestnetValidationError(
+            f"Invalid orderId for order {client_order_id!r}"
+        )
+    return {
+        "orderId": order_id,
+        "clientOrderId": returned_cid,
+        "symbol": symbol,
+        "status": status.upper(),
+        "price": str(price),
+        "origQty": str(orig_qty),
+        "executedQty": str(executed_qty),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Open-order parser
 # ---------------------------------------------------------------------------
 _OPEN_ORDER_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED"})
@@ -906,9 +1089,95 @@ def _redact_credentials(msg: str) -> str:
     return msg
 
 
+#: Substring heuristics for typed SDK errors that cannot be imported
+#: (e.g. the SDK is missing or the caller raised a plain Exception with a
+#: telling message).  Checked in priority order BEFORE the auth heuristic so
+#: a rate-limited or banned request is never misclassified as auth/network.
+_RATE_LIMIT_BAN_INDICATORS = ("rate limit ban", "too many requests", "429", "418")
+_TIMESTAMP_INDICATORS = ("timestamp", "recv window", "recvwindow", "earlier than our time")
+_NOT_FOUND_INDICATORS = ("404", "not found", "unknown order", "no order found")
+
+
+def _retry_after_seconds(exc: Exception) -> int | None:
+    """Extract a bounded, non-negative Retry-After (seconds) if present."""
+    value = getattr(exc, "retry_after", None)
+    if value is None:
+        return None
+    try:
+        secs = int(value)
+    except (TypeError, ValueError):
+        return None
+    if secs < 0:
+        return 0
+    # Bounded so a hostile/garbage Retry-After cannot stall the reconciler
+    # indefinitely (Round 6A §9).
+    return min(secs, _RETRY_AFTER_MAX_S)
+
+
+def _is_sdk_error(exc: Exception, cls) -> bool:
+    """None-safe ``isinstance`` for an SDK error class that may be missing."""
+    if cls is None:
+        return False
+    return isinstance(exc, cls)
+
+
 def _raise_network_or_auth(exc: Exception) -> None:
     raw_msg = str(exc)
     lowered = raw_msg.lower()
+
+    # 0) Already-typed adapter errors: re-raise as-is.  They are already
+    #    classified AND already credential-redacted; the mapper must not
+    #    strip their typed fields (retry_after_ms, banned, not_found,
+    #    deterministic-FAILED semantics) by re-wrapping them.
+    if isinstance(exc, BinanceTestnetError):
+        raise exc
+
+    # 1) Typed SDK rate-limit / ban (429 / 418) → bounded, Retry-After-aware.
+    #    The SDK classifies 429/418 as transport errors, but they carry a
+    #    distinct, safe-to-retry-after-backoff outcome — never treated as a
+    #    generic network failure (Round 6A §9).
+    if _is_sdk_error(exc, _SDK_TooManyRequestsError) or _is_sdk_error(
+        exc, _SDK_RateLimitBanError
+    ) or any(
+        k in lowered for k in _RATE_LIMIT_BAN_INDICATORS
+    ):
+        banned = (
+            _is_sdk_error(exc, _SDK_RateLimitBanError)
+            or getattr(exc, "status_code", None) == 418
+            or "ban" in lowered
+        )
+        raise BinanceTestnetRateLimitError(
+            _redact_credentials(raw_msg),
+            retry_after_s=_retry_after_seconds(exc),
+            banned=banned,
+            status_code=int(getattr(exc, "status_code", None) or (418 if banned else 429)),
+        ) from exc
+
+    # 2) Clock-skew / timestamp rejection (400 "Timestamp ... earlier/later
+    #    than our time").  Retryable ONLY after a successful server-time
+    #    re-sync — never assumed (§10).
+    if _is_sdk_error(exc, _SDK_BadRequestError) or any(
+        k in lowered for k in _TIMESTAMP_INDICATORS
+    ):
+        if any(k in lowered for k in _TIMESTAMP_INDICATORS):
+            raise BinanceTestnetTimestampError(_redact_credentials(raw_msg)) from exc
+
+    # 3) Missing / unknown order (404 or explicit "order not found").  On
+    #    Binance Spot a 404 for an order we *submitted* is ambiguous — the
+    #    order may have been filled-then-archived, rejected, or expired.
+    #    It is NEVER proof of non-existence (§3): callers must treat it as
+    #    UNKNOWN, not as "safe to resubmit".
+    if _is_sdk_error(exc, _SDK_NotFoundError) or any(
+        k in lowered for k in _NOT_FOUND_INDICATORS
+    ):
+        raise BinanceTestnetNetworkError(
+            _redact_credentials(raw_msg),
+            not_found=True,
+        ) from exc
+
+    # 4) Auth indicators (existing behavior — 401/403/signature/invalid key).
     if any(k in lowered for k in AUTH_INDICATORS):
         raise BinanceTestnetAuthenticationError(_redact_credentials(raw_msg)) from exc
+
+    # 5) Everything else is a plain transport failure.
     raise BinanceTestnetNetworkError(_redact_credentials(raw_msg)) from exc
