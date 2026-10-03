@@ -43,10 +43,10 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -132,94 +132,50 @@ def _symbol_db_path(base_path: str, symbol: str) -> str:
 
 
 def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
-    """Assemble the full read-only status snapshot.
+    """Assemble the full read-only status snapshot (multi-symbol aware).
 
-    Every table read is independent: a missing/corrupt table degrades only
-    its own section (``None``), never the whole response.  Nothing here
-    can mutate the database (``mode=ro`` connection).
+    The multi-symbol runtime writes ALL per-symbol state into per-symbol
+    databases (``grid_bot_{SYMBOL}.sqlite3``); the configured base database
+    only carries legacy single-symbol state.  The snapshot therefore reads
+    every symbol's database independently and aggregates:
+
+    - per-symbol: price, range, risk decision, market-filter status, grid
+      economics, kill state, run state, paper account, equity, open orders,
+      recent fills/cycles;
+    - global: sums (equity, PnL, fees), totals (open orders), any-kill,
+      merged recent tables (each row tagged with its symbol).
+
+    Every single query is guarded: a missing/corrupt table or database (for
+    example a symbol database created by ``init_db`` that has not run a
+    paper cycle yet and therefore has no ``paper_orch_cycles`` table)
+    degrades only its own section — never the whole response.  When no
+    per-symbol database holds a value, the legacy base-database value is
+    used as a fallback so single-symbol deployments keep rendering.  Nothing
+    here can mutate any database (``mode=ro`` connections only).
     """
-    # Parse symbols
-    symbols_raw = bot.get("symbols", "")
-    if symbols_raw:
+    symbols_raw = str(bot.get("symbols", "") or "")
+    if symbols_raw.strip():
         symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
     else:
-        symbols = [bot.get("symbol", "N/A")]
+        symbols = [str(bot.get("symbol", "N/A"))]
 
-    # Read from each symbol's database
-    per_symbol_data = {}
+    # ---- per-symbol databases (authoritative in the multi-symbol runtime) --
+    per_symbol_data = {sym: _read_symbol_db(db_path, sym) for sym in symbols}
+
+    # ---- legacy base database (guarded; empty in multi-symbol deployments) --
     main_con: Optional[sqlite3.Connection] = None
     main_db_error: Optional[str] = None
     try:
         main_con = _connect_readonly(db_path)
-        main_con.execute("SELECT 1")
+        # Touch the schema (not just "SELECT 1"): a garbage file only fails
+        # when its header is actually read.
+        main_con.execute("SELECT name FROM sqlite_master LIMIT 1")
     except (sqlite3.Error, OSError) as exc:
         main_db_error = type(exc).__name__
+        if main_con is not None:
+            main_con.close()
+            main_con = None
 
-    def _read_symbol_db(symbol: str) -> dict[str, Any]:
-        """Read data from a symbol's database."""
-        sym_db = _symbol_db_path(db_path, symbol)
-        sym_con: Optional[sqlite3.Connection] = None
-        sym_error: Optional[str] = None
-        try:
-            sym_con = _connect_readonly(sym_db)
-            sym_con.execute("SELECT 1")
-        except (sqlite3.Error, OSError):
-            return {"db_healthy": False}
-        
-        data = {"db_healthy": True}
-        
-        def _rows(c, sql, args=()):
-            return [dict(r) for r in c.execute(sql, args).fetchall()]
-        
-        def _state_json(c, key: str):
-            rows = _rows(c, "SELECT value FROM bot_state WHERE key = ?", (key,))
-            if not rows:
-                return None
-            try:
-                return json.loads(rows[0]["value"])
-            except (ValueError, TypeError):
-                return None
-        
-        def _state_raw(c, key: str):
-            rows = _rows(c, "SELECT value FROM bot_state WHERE key = ?", (key,))
-            return rows[0]["value"] if rows else None
-        
-        # Read key state values
-        data["last_price"] = _state_raw(sym_con, "last_price")
-        data["last_range"] = _state_json(sym_con, "last_range")
-        data["last_risk_decision"] = _state_json(sym_con, "last_risk_decision")
-        data["last_adaptive_plan"] = _state_json(sym_con, "last_adaptive_plan")
-        data["last_market_intelligence"] = _state_json(sym_con, "last_market_intelligence")
-        data["last_account_risk"] = _state_json(sym_con, "last_account_risk")
-        data["paper_reference_equity"] = _state_raw(sym_con, "paper_reference_equity")
-        
-        # Read recent cycles
-        rows = _rows(sym_con, "SELECT cycle_id, candle_index, symbol, plan_decision,"
-                            " orders_submitted, fills_applied, success, is_idempotent,"
-                            " recovery_healthy, blocked_reason, error, metadata,"
-                            " created_at FROM paper_orch_cycles"
-                            " ORDER BY created_at DESC LIMIT ?", (_RECENT_LIMIT,))
-        for row in rows:
-            if row.get("metadata"):
-                try:
-                    row["metadata"] = json.loads(row["metadata"])
-                except (ValueError, TypeError):
-                    row["metadata"] = None
-        data["latest_cycles"] = rows
-        
-        # Read open orders
-        data["open_orders"] = _rows(sym_con, "SELECT client_order_id, exchange_order_id, symbol, side,"
-                              " grid_index, price, quantity, executed_qty, remaining_qty,"
-                              " status, order_type, created_at, updated_at FROM orders"
-                              " WHERE status IN ('NEW','PARTIALLY_FILLED')"
-                              " ORDER BY created_at DESC LIMIT ?", (_RECENT_LIMIT,))
-        
-        if sym_con:
-            sym_con.close()
-        
-        return data
-
-    # Read main database for overall status
     def _kill(c):
         row = _rows(c, "SELECT active, trigger_reason, activated_at, "
                        "open_order_count, cancel_status, note "
@@ -308,10 +264,179 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
         row = c.execute("PRAGMA user_version").fetchone()
         return row[0] if row else None
 
-    # Read per-symbol data
-    per_symbol_data = {}
-    for sym in symbols:
-        per_symbol_data[sym] = _read_symbol_db(sym)
+    # Legacy (single-symbol) values — used only where per-symbol data is absent.
+    legacy = {
+        "kill_state": _maybe(main_con, _kill, None),
+        "run_state": _maybe(main_con, _run_state, None),
+        "reference_equity": _maybe(main_con, _reference_equity, None),
+        "account": _maybe(main_con, _account, None),
+        "equity_latest": _maybe(main_con, _equity_latest, None),
+        "risk_events": _maybe(main_con, _risk_events, []),
+        "orders_open": _maybe(main_con, _orders_open, []),
+        "orders_recent": _maybe(main_con, _orders_recent, []),
+        "fills": _maybe(main_con, _fills, []),
+        "cycles": _maybe(main_con, _last_cycles, []),
+        "last_price": _maybe(main_con, _state_raw("last_price"), None),
+        "last_range": _maybe(main_con, _state_json("last_range"), None),
+        "last_symbol": _maybe(main_con, _state_raw("last_symbol"), None),
+        "last_risk_decision": _maybe(main_con, _state_json("last_risk_decision"), None),
+        "last_account_risk": _maybe(main_con, _state_json("last_account_risk"), None),
+        "last_adaptive_plan": _maybe(main_con, _state_json("last_adaptive_plan"), None),
+        "last_market_intelligence": _maybe(
+            main_con, _state_json("last_market_intelligence"), None),
+    }
+
+    # ---- aggregates over the per-symbol state --------------------------------
+    def _sym_rows(key: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for sym, data in per_symbol_data.items():
+            for row in (data.get(key) or []):
+                tagged = dict(row)
+                tagged.setdefault("symbol", sym)
+                rows.append(tagged)
+        return rows
+
+    def _dec_sum(values: list) -> Optional[str]:
+        total = None
+        for raw in values:
+            if raw is None:
+                continue
+            try:
+                value = Decimal(str(raw))
+            except (InvalidOperation, ValueError, TypeError):
+                continue
+            total = value if total is None else total + value
+        return str(total) if total is not None else None
+
+    kill_states = {sym: data.get("kill_state")
+                   for sym, data in per_symbol_data.items()}
+    kill_states = {sym: ks for sym, ks in kill_states.items() if ks is not None}
+    kill_any = any(bool((ks or {}).get("active")) for ks in kill_states.values())
+    if kill_states:
+        kill_view: dict[str, Any] = {
+            "active": kill_any,
+            "per_symbol": kill_states,
+        }
+    else:
+        kill_view = legacy["kill_state"] or {"active": False}
+
+    run_states = {sym: data.get("run_state")
+                  for sym, data in per_symbol_data.items()}
+    run_states = {sym: rs for sym, rs in run_states.items() if rs is not None}
+    if run_states:
+        phases = {str((rs or {}).get("phase")) for rs in run_states.values()}
+        if any(p == "INTERRUPTED" for p in phases):
+            global_phase = "INTERRUPTED"
+        elif phases and phases == {"COMPLETED"}:
+            global_phase = "COMPLETED"
+        else:
+            global_phase = "MIXED"
+        runtime_view: dict[str, Any] = {
+            "phase": global_phase,
+            "per_symbol": run_states,
+            "run_id": ", ".join(str((rs or {}).get("run_id") or "?")
+                                for rs in run_states.values()),
+            "risk_allowed": all(bool((rs or {}).get("risk_allowed"))
+                                for rs in run_states.values()),
+            "open_orders": sum(int((rs or {}).get("open_orders") or 0)
+                               for rs in run_states.values()),
+        }
+    else:
+        runtime_view = legacy["run_state"]
+
+    reference_sum = _dec_sum(
+        [data.get("paper_reference_equity") for data in per_symbol_data.values()])
+    equity_rows = {sym: data.get("equity_latest")
+                   for sym, data in per_symbol_data.items()}
+    equity_rows = {sym: eq for sym, eq in equity_rows.items() if eq is not None}
+    accounts = {sym: data.get("account")
+                for sym, data in per_symbol_data.items()}
+    accounts = {sym: acc for sym, acc in accounts.items() if acc is not None}
+
+    equity_sum = _dec_sum([eq.get("equity_quote") for eq in equity_rows.values()])
+    if equity_sum is None and accounts:
+        equity_sum = _dec_sum(
+            [acc.get("quote_free") for acc in accounts.values()])
+    drawdown_values = [eq.get("drawdown_pct") for eq in equity_rows.values()
+                       if eq.get("drawdown_pct") is not None]
+    if equity_sum is not None and reference_sum is not None:
+        try:
+            ref_dec, eq_dec = Decimal(reference_sum), Decimal(equity_sum)
+            if ref_dec > 0:
+                aggregate_drawdown = str((ref_dec - eq_dec) / ref_dec)
+            else:
+                aggregate_drawdown = None
+        except (InvalidOperation, ValueError, TypeError):
+            aggregate_drawdown = None
+    else:
+        aggregate_drawdown = (legacy["equity_latest"] or {}).get("drawdown_pct")
+    if equity_rows:
+        equity_view: dict[str, Any] = {
+            "equity_quote": equity_sum
+                            or (legacy["equity_latest"] or {}).get("equity_quote"),
+            "drawdown_pct": aggregate_drawdown,
+            "per_symbol": equity_rows,
+        }
+    else:
+        equity_view = legacy["equity_latest"]
+
+    if accounts:
+        account_view: dict[str, Any] = {
+            "realized_pnl": _dec_sum([a.get("realized_pnl")
+                                      for a in accounts.values()])
+                             or (legacy["account"] or {}).get("realized_pnl"),
+            "total_fees": _dec_sum([a.get("total_fees")
+                                    for a in accounts.values()])
+                          or (legacy["account"] or {}).get("total_fees"),
+            "quote_free": _dec_sum([a.get("quote_free")
+                                    for a in accounts.values()]),
+            "base_free": _dec_sum([a.get("base_free")
+                                   for a in accounts.values()]),
+            "by_symbol": accounts,
+        }
+    else:
+        account_view = legacy["account"]
+
+    reference_view = reference_sum if reference_sum is not None \
+        else legacy["reference_equity"]
+
+    risk_decisions = {sym: data.get("last_risk_decision")
+                      for sym, data in per_symbol_data.items()}
+    risk_decisions = {sym: rd for sym, rd in risk_decisions.items()
+                      if rd is not None}
+    if risk_decisions:
+        blocked = [str((rd or {}).get("reason") or "")
+                   for rd in risk_decisions.values()
+                   if not (rd or {}).get("allowed")]
+        risk_decision_view: dict[str, Any] = {
+            "allowed": all(bool((rd or {}).get("allowed"))
+                           for rd in risk_decisions.values()),
+            "reason": " | ".join(r for r in blocked if r) or "PASS",
+            "per_symbol": risk_decisions,
+        }
+    else:
+        risk_decision_view = legacy["last_risk_decision"]
+
+    orders_open_merged = _sym_rows("open_orders") or legacy["orders_open"]
+    orders_recent_merged = _sym_rows("recent_orders") or legacy["orders_recent"]
+    fills_merged = _sym_rows("recent_fills") or legacy["fills"]
+    cycles_merged = _sym_rows("latest_cycles") or legacy["cycles"]
+    risk_events_merged = _sym_rows("risk_events") or legacy["risk_events"]
+
+    last_prices = {sym: data.get("last_price")
+                   for sym, data in per_symbol_data.items()
+                   if data.get("last_price") is not None}
+    last_ranges = {sym: data.get("last_range")
+                   for sym, data in per_symbol_data.items()
+                   if data.get("last_range") is not None}
+    market_filter = {
+        sym: {
+            "blocked": bool(data.get("market_filter_blocked")),
+            "reasons": data.get("market_filter_reasons") or [],
+        }
+        for sym, data in per_symbol_data.items()
+        if data.get("market_filter_blocked") is not None
+    }
 
     snapshot: dict[str, Any] = {
         "dashboard": {
@@ -321,6 +446,7 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
             "db_error": main_db_error,
             "read_only": True,
             "auth": "none (public by design; read-only by construction)",
+            "symbols": symbols,
         },
         "environment": {
             "mode": bot.get("mode", "N/A"),
@@ -332,44 +458,242 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
             "timeframe": bot.get("timeframe", "N/A"),
             "config_error": bot.get("config_error"),
         },
-        "runtime": _maybe(main_con, _run_state, None),
+        "runtime": runtime_view,
         "risk": {
-            "kill_state": _maybe(main_con, _kill, None),
-            "reference_equity": _maybe(main_con, _reference_equity, None),
-            "equity_latest": _maybe(main_con, _equity_latest, None),
+            "kill_state": kill_view,
+            "reference_equity": reference_view,
+            "equity_latest": equity_view,
             "max_drawdown_pct": bot.get("max_drawdown_pct", "N/A"),
-            "risk_events": _maybe(main_con, _risk_events, []),
-            "last_risk_decision": _maybe(
-                main_con, _state_json("last_risk_decision"), None),
-            "last_account_risk": _maybe(
-                main_con, _state_json("last_account_risk"), None),
+            "risk_events": risk_events_merged,
+            "last_risk_decision": risk_decision_view,
+            "last_account_risk": ({"per_symbol": {
+                sym: data.get("last_account_risk")
+                for sym, data in per_symbol_data.items()
+                if data.get("last_account_risk") is not None}}
+                if any(data.get("last_account_risk")
+                       for data in per_symbol_data.values())
+                else legacy["last_account_risk"]),
         },
-        "account": _maybe(main_con, _account, None),
+        "account": account_view,
         "grid": {
             "grid_step_pct": bot.get("grid_step_pct", "N/A"),
             "hard_min_net_pct": bot.get("hard_min_net_pct", "N/A"),
-            "latest_cycles": _maybe(main_con, _last_cycles, []),
-            "last_price": _maybe(main_con, _state_raw("last_price"), None),
-            "last_range": _maybe(main_con, _state_json("last_range"), None),
-            "last_symbol": _maybe(main_con, _state_raw("last_symbol"), None),
-            "last_adaptive_plan": _maybe(
-                main_con, _state_json("last_adaptive_plan"), None),
-            "last_active_plan": _maybe(
-                main_con, _state_json("last_active_plan"), None),
-            "last_market_intelligence": _maybe(
-                main_con, _state_json("last_market_intelligence"), None),
+            "latest_cycles": cycles_merged,
+            "last_price": (last_prices if last_prices
+                           else legacy["last_price"]),
+            "last_range": (last_ranges if last_ranges
+                           else legacy["last_range"]),
+            "last_symbol": legacy["last_symbol"],
+            "last_adaptive_plan": (legacy["last_adaptive_plan"]),
+            "last_market_intelligence": legacy["last_market_intelligence"],
+            "market_filter": market_filter or None,
             "per_symbol": per_symbol_data,
         },
         "orders": {
-            "open": _maybe(main_con, _orders_open, []),
-            "recent": _maybe(main_con, _orders_recent, []),
+            "open": orders_open_merged,
+            "recent": orders_recent_merged,
         },
-        "fills": _maybe(main_con, _fills, []),
-        "database": {"schema_user_version": _maybe(main_con, _schema_version, None)},
+        "fills": fills_merged,
+        "database": {
+            "schema_user_version": _maybe(main_con, _schema_version, None),
+            "per_symbol": {
+                sym: {
+                    "healthy": data.get("db_healthy", False),
+                    "error": data.get("db_error"),
+                    "missing_tables": data.get("missing_tables") or [],
+                }
+                for sym, data in per_symbol_data.items()
+            },
+        },
     }
     if main_con is not None:
         main_con.close()
     return snapshot
+
+
+def _read_symbol_db(base_db_path: str, symbol: str) -> dict[str, Any]:
+    """Read one symbol's database; every query degrades independently.
+
+    A symbol database created by ``storage.init_db`` (which every runtime
+    cycle does before any paper cycle runs) does NOT contain the
+    orchestrator's ``paper_orch_cycles`` table — that schema is created by
+    the paper orchestrator on its first cycle.  Every read below is guarded
+    so a missing table, a missing database, or corrupt rows degrade only
+    their own section and the dashboard never fails as a whole.
+    """
+    sym_db = _symbol_db_path(base_db_path, symbol)
+    sym_con: Optional[sqlite3.Connection] = None
+    sym_error: Optional[str] = None
+    try:
+        sym_con = _connect_readonly(sym_db)
+        # Touch the schema (not just "SELECT 1"): a garbage file only fails
+        # when its header is actually read.
+        sym_con.execute("SELECT name FROM sqlite_master LIMIT 1")
+    except (sqlite3.Error, OSError) as exc:
+        sym_error = type(exc).__name__
+        if sym_con is not None:
+            sym_con.close()
+            sym_con = None
+
+    data: dict[str, Any] = {"db_healthy": sym_con is not None,
+                            "db_error": sym_error,
+                            "missing_tables": []}
+
+    def _guarded(key: str, default, fn: Callable[[sqlite3.Connection], Any]):
+        """Run one read; a missing/corrupt table degrades only that section."""
+        if sym_con is None:
+            data[key] = default
+            return
+        try:
+            data[key] = fn(sym_con)
+        except sqlite3.OperationalError as exc:
+            data[key] = default
+            message = str(exc)
+            if "no such table" in message:
+                table = message.split("no such table: ", 1)[-1].split()[0]
+                if table not in data["missing_tables"]:
+                    data["missing_tables"].append(table)
+        except sqlite3.Error:
+            data[key] = default
+
+    def _rows(c, sql, args=()):
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+    def _state_json(c, key: str):
+        rows = _rows(c, "SELECT value FROM bot_state WHERE key = ?", (key,))
+        if not rows:
+            return None
+        try:
+            return json.loads(rows[0]["value"])
+        except (ValueError, TypeError):
+            return None
+
+    def _state_raw(c, key: str):
+        rows = _rows(c, "SELECT value FROM bot_state WHERE key = ?", (key,))
+        return rows[0]["value"] if rows else None
+
+    def _kill(c):
+        row = _rows(c, "SELECT active, trigger_reason, activated_at, "
+                       "open_order_count, cancel_status, note "
+                       "FROM kill_state WHERE key = 'kill_state'")
+        return row[0] if row else None
+
+    def _account(c):
+        rows = _rows(c, "SELECT base_asset, quote_asset, base_free, base_reserved,"
+                        " quote_free, quote_reserved, average_cost, realized_pnl,"
+                        " total_fees, updated_at FROM paper_account_state")
+        return rows[0] if rows else None
+
+    def _equity_latest(c):
+        rows = _rows(c, "SELECT ts, equity_quote, drawdown_pct FROM equity_snapshots"
+                        " ORDER BY ts DESC LIMIT 1")
+        return rows[0] if rows else None
+
+    def _run_state(c):
+        rows = _rows(c, "SELECT value FROM bot_state WHERE key = 'last_run_state'")
+        if not rows:
+            return None
+        try:
+            return json.loads(rows[0]["value"])
+        except (ValueError, TypeError):
+            return None
+
+    # Per-symbol persisted runtime state (bot_state keys)
+    _guarded("last_price", None, lambda c: _state_raw(c, "last_price"))
+    _guarded("last_range", None, lambda c: _state_json(c, "last_range"))
+    _guarded("last_risk_decision", None,
+             lambda c: _state_json(c, "last_risk_decision"))
+    _guarded("last_symbol", None, lambda c: _state_raw(c, "last_symbol"))
+    _guarded("paper_reference_equity", None,
+             lambda c: _state_raw(c, "paper_reference_equity"))
+    _guarded("paper_cycle_index", None,
+             lambda c: _state_raw(c, "paper_cycle_index"))
+    _guarded("last_auto_exit_ts", None,
+             lambda c: _state_raw(c, "last_auto_exit_ts"))
+    _guarded("run_state", None, _run_state)
+
+    # Risk + account + orders + fills
+    _guarded("kill_state", None, _kill)
+    _guarded("account", None, _account)
+    _guarded("equity_latest", None, _equity_latest)
+
+    def _risk_events(c):
+        rows = _rows(c, "SELECT ts, allowed, reason, context_json FROM risk_events"
+                        " ORDER BY id DESC LIMIT ?", (_RECENT_LIMIT,))
+        for row in rows:
+            if row.get("context_json"):
+                try:
+                    row["payload"] = json.loads(row["context_json"])
+                except (ValueError, TypeError):
+                    row["payload"] = None
+        return rows
+
+    _guarded("risk_events", [], _risk_events)
+    _guarded("open_orders", [], lambda c: _rows(
+        c, "SELECT client_order_id, exchange_order_id, symbol, side,"
+           " grid_index, price, quantity, executed_qty, remaining_qty,"
+           " status, order_type, created_at, updated_at FROM orders"
+           " WHERE status IN ('NEW','PARTIALLY_FILLED')"
+           " ORDER BY created_at DESC LIMIT ?", (_RECENT_LIMIT,)))
+    _guarded("recent_orders", [], lambda c: _rows(
+        c, "SELECT client_order_id, symbol, side, grid_index, price,"
+           " quantity, executed_qty, remaining_qty, status,"
+           " created_at, updated_at FROM orders"
+           " ORDER BY created_at DESC LIMIT ?", (_RECENT_LIMIT,)))
+    _guarded("recent_fills", [], lambda c: _rows(
+        c, "SELECT trade_id, order_id, symbol, side, price, quantity,"
+           " fee, fee_asset, event_time, resulting_state FROM fills"
+           " ORDER BY event_time DESC LIMIT ?", (_RECENT_LIMIT,)))
+
+    # Orchestrator cycles: table exists only after the first paper cycle ran.
+    def _cycles(c):
+        rows = _rows(c, "SELECT cycle_id, candle_index, symbol, plan_decision,"
+                        " orders_submitted, fills_applied, success, is_idempotent,"
+                        " recovery_healthy, blocked_reason, error, metadata,"
+                        " created_at FROM paper_orch_cycles"
+                        " ORDER BY created_at DESC LIMIT ?", (_RECENT_LIMIT,))
+        for row in rows:
+            if row.get("metadata"):
+                try:
+                    row["metadata"] = json.loads(row["metadata"])
+                except (ValueError, TypeError):
+                    row["metadata"] = None
+        return rows
+
+    _guarded("latest_cycles", [], _cycles)
+
+    # Derived per-symbol views (real persisted fields only — no invention).
+    decision = data.get("last_risk_decision") or {}
+    reason_text = str(decision.get("reason") or "")
+    if bool((data.get("kill_state") or {}).get("active")):
+        data["status"] = "KILL_ACTIVE"
+    elif decision.get("allowed") is True:
+        data["status"] = "ACTIVE"
+    elif decision.get("allowed") is False:
+        data["status"] = "BLOCKED"
+    else:
+        data["status"] = "NO_DATA" if sym_con is None or not data.get("last_price") \
+            else "NO_DECISION"
+    data["market_filter_blocked"] = ("MARKET_FILTER_BLOCK" in reason_text) \
+        if reason_text else None
+    data["market_filter_reasons"] = (
+        [part.strip() for part in reason_text.split("|")
+         if "MARKET_FILTER_BLOCK" in part] if reason_text else [])
+
+    economics: dict[str, Any] = {}
+    for event in (data.get("risk_events") or []):
+        payload = event.get("payload") or {}
+        for key in ("min_net_pct", "dynamic_step_pct", "grid_cells",
+                    "atr_pct", "grid_mode", "price", "range"):
+            if key in payload and payload[key] is not None:
+                economics[key] = payload[key]
+        if economics:
+            break
+    data["grid_economics"] = economics or None
+
+    if sym_con is not None:
+        sym_con.close()
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -1430,9 +1754,12 @@ def render_html(snap: dict[str, Any]) -> str:
     risk_badge = (_badge("RISK PASS", "badge-green") if risk_allowed
                   else _badge("RISK BLOCKED", "badge-yellow"))
     intel_status = str(market_intel.get("status") or "N/A")
-    intel_badge = (_badge("MARKET OK", "badge-green")
-                   if market_intel.get("allowed") is True
-                   else _badge("MARKET FILTERED", "badge-yellow"))
+    if market_intel.get("allowed") is True:
+        intel_badge = _badge("MARKET OK", "badge-green")
+    elif market_intel.get("allowed") is False:
+        intel_badge = _badge("MARKET FILTERED", "badge-yellow")
+    else:
+        intel_badge = _badge("MARKET N/A", "badge-yellow")
     last_range = grid_state.get("last_range") or {}
     last_price = grid_state.get("last_price")
 
@@ -1496,37 +1823,70 @@ def render_html(snap: dict[str, Any]) -> str:
     }
 
     # Build multi-symbol cards
+    # Build multi-symbol cards from each symbol's real persisted state
+    # (legacy single-symbol grid_detail is the fallback when a symbol has no
+    # per-symbol database yet).
     symbols_raw = env.get("symbols", "")
     if symbols_raw:
         symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
     else:
         symbols = [env.get("symbol", "N/A")]
-    
+
     # Get per-symbol data from grid_state
     per_symbol_data = grid_state.get("per_symbol") or {}
-    
+
     # Build symbol cards
     symbol_cards = []
     for sym in symbols:
-        sym_data = per_symbol_data.get(sym, {})
-        sym_price = sym_data.get("current_price") or (last_price if sym == symbols[0] else "N/A")
-        sym_lower = sym_data.get("lower_price") or (grid_detail.get("lower_price") if sym == symbols[0] else "N/A")
-        sym_upper = sym_data.get("upper_price") or (grid_detail.get("upper_price") if sym == symbols[0] else "N/A")
-        sym_cells = sym_data.get("grid_cells") or (grid_detail.get("grid_cells") if sym == symbols[0] else "N/A")
-        sym_step = sym_data.get("grid_step") or (grid_detail.get("grid_step") if sym == symbols[0] else "N/A")
-        sym_net = sym_data.get("net_pct") or (grid_detail.get("net_pct") if sym == symbols[0] else "N/A")
-        sym_regime = sym_data.get("market_regime") or (grid_detail.get("market_regime") if sym == symbols[0] else "N/A")
-        sym_vol_osc = sym_data.get("volume_oscillator") or "N/A"
-        sym_zscore = sym_data.get("z_score") or "N/A"
-        
+        sym_data = per_symbol_data.get(sym) or {}
+        first_symbol = sym == symbols[0]
+        sym_price = (sym_data.get("last_price")
+                     or (grid_detail.get("current_price") if first_symbol else None))
+        sym_range = sym_data.get("last_range") or (
+            last_range if first_symbol else None)
+        sym_lower = (sym_range or {}).get("lower") or (
+            grid_detail.get("lower_price") if first_symbol else None)
+        sym_upper = (sym_range or {}).get("upper") or (
+            grid_detail.get("upper_price") if first_symbol else None)
+        econ = sym_data.get("grid_economics") or {}
+        sym_cells = econ.get("grid_cells") or (
+            grid_detail.get("grid_cells") if first_symbol else None)
+        sym_step = econ.get("dynamic_step_pct") or (
+            grid_detail.get("grid_step") if first_symbol else None)
+        sym_net = econ.get("min_net_pct") or (
+            grid_detail.get("net_pct") if first_symbol else None)
+        sym_regime = econ.get("grid_mode") or (
+            grid_detail.get("market_regime") if first_symbol else None)
+        # Per-symbol status derived from its real risk decision / kill state.
+        sym_status = str(sym_data.get("status") or "N/A")
+        if sym_status == "KILL_ACTIVE":
+            status_badge = _badge("KILL", "badge-red")
+        elif sym_status == "ACTIVE":
+            status_badge = _badge("ACTIVE", "badge-green")
+        elif sym_status == "BLOCKED":
+            status_badge = _badge("BLOCKED", "badge-yellow")
+        else:
+            status_badge = _badge("N/A", "badge-yellow")
+        sym_reason = str((sym_data.get("last_risk_decision") or {}).get("reason")
+                         or "")
+        sym_open = len(sym_data.get("open_orders") or [])
+        sym_fills = len(sym_data.get("recent_fills") or [])
+        sym_ref = sym_data.get("paper_reference_equity")
+        db_ok = bool(sym_data.get("db_healthy"))
+        db_note = "" if db_ok else " · DB unavailable"
+        missing = sym_data.get("missing_tables") or []
+        if missing:
+            db_note += f" · no {missing[0]}"
+
         symbol_cards.append(f"""
         <div class="card symbol-card">
-            <div class="card-label">{_esc(sym)}</div>
+            <div class="card-label">{_esc(sym)} {status_badge}</div>
             <div class="card-value">{_esc(_fmt(sym_price))}</div>
             <div class="card-sub">Range: {_fmt(sym_lower)} \u2013 {_fmt(sym_upper)}</div>
-            <div class="card-sub">Grid: {_fmt(sym_cells)} cells @ {_pct(sym_step)}</div>
-            <div class="card-sub">Net/grid: {_pct(sym_net)} | Regime: {_human(sym_regime)}</div>
-            <div class="card-sub">VolOsc: {_fmt(sym_vol_osc)} | Z-Score: {_fmt(sym_zscore)}</div>
+            <div class="card-sub">Grid: {_fmt(sym_cells)} cells @ {_pct(sym_step)} | Net/grid: {_pct(sym_net)}</div>
+            <div class="card-sub">Mode: {_human(sym_regime)} | Ref equity: {_fmt(sym_ref)}</div>
+            <div class="card-sub">Open orders: {sym_open} | Recent fills: {sym_fills}</div>
+            <div class="card-sub">Risk: {_esc(sym_reason or "N/A")}{_esc(db_note)}</div>
         </div>""")
     
     symbol_cards_html = "".join(symbol_cards)
@@ -1583,8 +1943,23 @@ def render_html(snap: dict[str, Any]) -> str:
   ])}
 </div>
 <div class="panel">
+  <h2 class="panel-title">Per-symbol status <span class="count">{len(symbols)}</span></h2>
+  {_table(["symbol", "status", "last_price", "open orders", "fills",
+           "risk reason", "db"],
+          [{"symbol": sym,
+            "status": (per_symbol_data.get(sym) or {}).get("status") or "N/A",
+            "last_price": (per_symbol_data.get(sym) or {}).get("last_price") or "N/A",
+            "open orders": len((per_symbol_data.get(sym) or {}).get("open_orders") or []),
+            "fills": len((per_symbol_data.get(sym) or {}).get("recent_fills") or []),
+            "risk reason": ((per_symbol_data.get(sym) or {})
+                            .get("last_risk_decision") or {}).get("reason") or "N/A",
+            "db": "OK" if (per_symbol_data.get(sym) or {}).get("db_healthy")
+                  else "unavailable"}
+           for sym in symbols])}
+</div>
+<div class="panel">
   <h2 class="panel-title">Recent cycles <span class="count">{len(cycle_rows)}</span></h2>
-  {_table(["cycle_id", "candle_index", "plan", "orders", "fills", "success",
+  {_table(["symbol", "cycle_id", "candle_index", "plan", "orders", "fills", "success",
            "blocked_reason", "at"], [dict(r, **{"class": "detail"}) for r in cycle_rows])}
 </div>
 </section>
@@ -1603,8 +1978,17 @@ def render_html(snap: dict[str, Any]) -> str:
   ])}
 </div>
 <div class="panel">
+  <h2 class="panel-title">Kill state per symbol <span class="count">{len(kill.get("per_symbol") or {})}</span></h2>
+  {_table(["symbol", "active", "trigger", "activated_at", "cancel_status"],
+          [{"symbol": sym, "active": _yn(bool((ks or {}).get("active"))),
+            "trigger": (ks or {}).get("trigger_reason") or "",
+            "activated_at": (ks or {}).get("activated_at") or "",
+            "cancel_status": (ks or {}).get("cancel_status") or ""}
+           for sym, ks in sorted((kill.get("per_symbol") or {}).items())])}
+</div>
+<div class="panel">
   <h2 class="panel-title">Recent risk events <span class="count">{(len(risk.get("risk_events") or []))}</span></h2>
-  {_table(["ts", "allowed", "reason"], [dict(r, **{"class": "detail"}) for r in (risk.get("risk_events") or [])])}
+  {_table(["symbol", "ts", "allowed", "reason"], [dict(r, **{"class": "detail"}) for r in (risk.get("risk_events") or [])])}
 </div>
 </section>
 
@@ -1679,6 +2063,27 @@ def render_html(snap: dict[str, Any]) -> str:
       ("Open orders at last run", _fmt(run_state.get("open_orders"))),
       ("Read-only", _yn(dash.get("read_only"))),
   ])}
+</div>
+<div class="panel">
+  <h2 class="panel-title">Runtime state per symbol <span class="count">{len((run_state or {}).get("per_symbol") or {})}</span></h2>
+  {_table(["symbol", "phase", "run_id", "risk_allowed", "open_orders", "pending_cancels"],
+          [{"symbol": sym,
+            "phase": (rs or {}).get("phase") or "N/A",
+            "run_id": (rs or {}).get("run_id") or "N/A",
+            "risk_allowed": _yn(bool((rs or {}).get("risk_allowed"))),
+            "open_orders": (rs or {}).get("open_orders") or 0,
+            "pending_cancels": (rs or {}).get("pending_cancels") or 0}
+           for sym, rs in sorted(((run_state or {}).get("per_symbol") or {}).items())])}
+</div>
+<div class="panel">
+  <h2 class="panel-title">Per-symbol databases <span class="count">{len(symbols)}</span></h2>
+  {_table(["symbol", "healthy", "error", "missing tables"],
+          [{"symbol": sym,
+            "healthy": _yn(bool((per_symbol_data.get(sym) or {}).get("db_healthy"))),
+            "error": (per_symbol_data.get(sym) or {}).get("db_error") or "",
+            "missing tables": ", ".join(
+                (per_symbol_data.get(sym) or {}).get("missing_tables") or []) or "none"}
+           for sym in symbols])}
 </div>
 </section>
 <p class="foot">Public read-only monitor \u00b7 no authentication by design

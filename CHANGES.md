@@ -5,6 +5,51 @@ in DRY_RUN / paper mode. Live trading is not implemented and must not be
 enabled without explicit authorization. All changes below preserve that
 invariant.
 
+## Release line: v4.1.1 (multi-symbol dashboard repair)
+
+### Milestone: dashboard adapted to the multi-symbol architecture
+- Root cause: `dashboard._read_symbol_db` queried the orchestrator's
+  `paper_orch_cycles` table **unguarded**. A symbol database created by
+  `storage.init_db` (every runtime cycle does this before any paper cycle
+  runs) does not contain that table until the first paper cycle — so the
+  whole snapshot raised `sqlite3.OperationalError` and every route answered
+  503 "snapshot unavailable". Additionally, every aggregate section
+  (account, equity, kill state, runtime, orders, fills, cycles) read only
+  the configured base database, which is empty in the multi-symbol
+  architecture.
+- `dashboard.build_snapshot` rewritten for the current state model:
+  - **Per-symbol databases are authoritative**: price, range, risk decision,
+    derived status (ACTIVE/BLOCKED/KILL_ACTIVE/NO_DATA), market-filter
+    status, grid economics (from the latest risk-event payload: step, cells,
+    min net, ATR, mode), kill state, run state, paper account, equity,
+    open orders, recent orders/fills/cycles — every query individually
+    guarded (missing table → empty section + `missing_tables` entry; missing
+    or corrupt symbol DB → degraded, not fatal).
+  - **Global aggregates**: summed reference equity / equity / realized PnL /
+    fees, merged open orders and recent fills/cycles (each row tagged with
+    its symbol), kill-active-any with per-symbol breakdown, global runtime
+    phase, per-symbol DB health and missing-table reporting.
+  - **Legacy fallback**: when no per-symbol database holds a value, the
+    base-database (single-symbol) value is used so legacy deployments keep
+    rendering unchanged.
+  - Corrupt database files are now detected by probing the schema header
+    (a garbage file passes a bare `SELECT 1`); failed connections are
+    closed and reported.
+- HTML: symbol cards render real per-symbol state (status badge, price,
+  range, grid economics, open orders, fills, reference equity, risk reason,
+  DB health); new per-symbol tables for status, kill states, runtime state,
+  and per-symbol database health; global badges/cards use the aggregates.
+- Trading behavior untouched: read-only connections only (`mode=ro`), no
+  schema changes, no `paper_orch_cycles` fabrication, no trading-module
+  imports, no credentials, still public and unauthenticated, separate
+  process.
+- Tests: `tests/test_dashboard.py` extended from 24 to 33 tests — the
+  production VPS schema as fixture (base DB without `paper_orch_cycles`),
+  multi-symbol per-symbol + aggregate assertions, missing-optional-table
+  degradation, corrupt symbol file degradation, kill aggregation across
+  symbols, no-mutation across all databases, per-symbol read-only and
+  runtime-coexistence checks, secrets never in responses.
+
 ## Release line: v4.1.0 (gated testnet execution bridge — roadmap B)
 
 ### Milestone: real-order mirroring for the multi-symbol runtime

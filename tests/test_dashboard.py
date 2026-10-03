@@ -581,3 +581,358 @@ def test_startup_warns_about_public_exposure(capsys):
     assert "PUBLIC READ-ONLY" in source
     assert "no authentication by design" in source.lower() or \
         "no authentication by design" in source
+
+
+# ---------------------------------------------------------------------------
+# Multi-symbol architecture (current state model)
+# ---------------------------------------------------------------------------
+# The multi-symbol runtime writes ALL per-symbol state into per-symbol
+# databases; the configured base database is created by storage.init_db alone
+# (exactly the production VPS schema: no paper_orch_cycles table).  These
+# tests pin the dashboard against THAT reality.
+
+
+def _orchestrator_schema(db_path: str) -> None:
+    """Create the orchestrator's own schema (paper_orch_cycles etc.)."""
+    from paper_orchestrator import PaperOrchestrator
+
+    class _SchemaOnly(PaperOrchestrator):
+        def __init__(self, path: str) -> None:
+            self._ensure_schema(path)
+
+    _SchemaOnly(db_path)
+
+
+def _seed_symbol_db(path: Path, *, symbol: str, with_cycles: bool) -> None:
+    """Seed one per-symbol database with realistic runtime state."""
+    storage.init_db(str(path))
+    if with_cycles:
+        _orchestrator_schema(str(path))
+    con = sqlite3.connect(str(path))
+    con.row_factory = sqlite3.Row
+    con.execute(
+        "INSERT INTO paper_account_state (id, base_asset, quote_asset,"
+        " base_free, base_reserved, quote_free, quote_reserved, average_cost,"
+        " realized_pnl, total_fees, updated_at) VALUES (1,'BNB','USDT',"
+        " '1.0','0','500.0','0','100.0','7.5','0.3','2026-10-04T00:00:00Z')")
+    con.execute(
+        "INSERT INTO orders (client_order_id, exchange_order_id, symbol, side,"
+        " grid_index, price, quantity, status, created_at, updated_at,"
+        " executed_qty, remaining_qty) VALUES"
+        f" ('AG{symbol[:3]}-1','11','{symbol}','BUY',1,'100.0','0.25','NEW',"
+        "  '2026-10-04T00:00:00Z','2026-10-04T00:01:00Z','0','0.25')")
+    con.execute(
+        "INSERT INTO fills (trade_id, order_id, symbol, side, price, quantity,"
+        " fee, fee_asset, event_time, resulting_state) VALUES"
+        f" ('t-{symbol}','AG{symbol[:3]}-0','{symbol}','BUY','100.0','0.1',"
+        "  '0.0001','USDT','2026-10-04T00:02:30Z','FILLED')")
+    con.execute(
+        "INSERT INTO equity_snapshots (ts, equity_quote, drawdown_pct) VALUES"
+        " ('2026-10-04T00:03:00Z','500.0','0.01')")
+    con.execute(
+        "INSERT INTO risk_events (ts, allowed, reason, context_json) VALUES"
+        " ('2026-10-04T00:04:00Z',1,'PASS','{\"min_net_pct\":\"0.0035\","
+        "  \"dynamic_step_pct\":\"0.006\",\"grid_cells\":8,"
+        "  \"atr_pct\":\"0.006\",\"grid_mode\":\"arithmetic\"}')")
+    con.execute(
+        "INSERT INTO kill_state (key, active, trigger_reason, activated_at,"
+        " open_order_count, cancel_status, note) VALUES"
+        " ('kill_state',0,'','',0,'','')")
+    run_id = f"multi-{symbol}-4"
+    con.execute(
+        "INSERT INTO bot_state (key, value) VALUES"
+        f" ('last_symbol','{symbol}'),"
+        " ('last_price','765.88000000'),"
+        " ('last_range','{\"lower\":\"750.0\",\"upper\":\"780.0\"}'),"
+        " ('last_risk_decision','{\"allowed\":true,\"reason\":\"PASS\"}'),"
+        " ('paper_reference_equity','505.0'),"
+        " ('paper_cycle_index','4'),"
+        " ('last_auto_exit_ts','2026-10-03T20:00:00Z'),"
+        " ('last_run_state','{\"run_id\":\"" + run_id + "\","
+        "  \"phase\":\"COMPLETED\",\"risk_allowed\":true,"
+        "  \"kill_active\":false,\"pending_cancels\":0,"
+        "  \"open_orders\":1}')")
+    if with_cycles:
+        con.execute(
+            "INSERT INTO paper_orch_cycles (cycle_id, candle_index, symbol,"
+            " plan_decision, orders_submitted, fills_applied, success,"
+            " is_idempotent, recovery_healthy, blocked_reason, error,"
+            " metadata, created_at) VALUES"
+            f" ('cycle-{symbol}',42,'{symbol}','GRID_ALLOWED',2,1,1,0,1,"
+            "  NULL,NULL,'{\"lower_price\":\"750.0\"}',"
+            "  '2026-10-04T00:05:00Z')")
+    con.commit()
+    con.close()
+
+
+@pytest.fixture()
+def multi_bot_config():
+    return {
+        "mode": "testnet", "dry_run": True, "allow_live_execution": False,
+        "symbols": "BNBUSDT,ETHUSDT,SOLUSDT", "timeframe": "4h",
+        "max_drawdown_pct": "0.02", "grid_step_pct": "0.006",
+        "hard_min_net_pct": "0.003", "config_error": None,
+    }
+
+
+@pytest.fixture()
+def multi_state(tmp_path: Path) -> Path:
+    """The production VPS layout: a base DB created by storage.init_db only
+    (no paper_orch_cycles), one fully-active symbol DB, one symbol DB that
+    never ran a paper cycle (missing optional table), and one corrupt file."""
+    main = tmp_path / "grid_bot.sqlite3"
+    storage.init_db(str(main))  # base schema only — no paper_orch_cycles
+    _seed_symbol_db(
+        tmp_path / "grid_bot_BNBUSDT.sqlite3", symbol="BNBUSDT",
+        with_cycles=True)
+    _seed_symbol_db(
+        tmp_path / "grid_bot_ETHUSDT.sqlite3", symbol="ETHUSDT",
+        with_cycles=False)
+    (tmp_path / "grid_bot_SOLUSDT.sqlite3").write_bytes(
+        b"not a sqlite database" * 50)
+    return main
+
+
+@pytest.fixture()
+def multi_server(multi_state: Path, multi_bot_config):
+    srv, base = start_server(multi_state.parent, str(multi_state),
+                             multi_bot_config)
+    yield srv, base
+    srv.shutdown()
+    srv.server_close()
+
+
+def test_multi_healthz(multi_server):
+    _, base = multi_server
+    status, body = http_get(base, "/healthz")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["status"] == "ok"
+    assert payload["read_only"] is True
+    assert payload["auth"] == "none"
+
+
+def test_multi_api_status_vps_schema(multi_server):
+    """Regression: the base DB has NO paper_orch_cycles table (exact
+    production schema) and one symbol DB never ran a paper cycle — the
+    snapshot must still return 200 with per-symbol + aggregate state."""
+    _, base = multi_server
+    status, body = http_get(base, "/api/status")
+    assert status == 200
+    snap = json.loads(body)
+    assert snap["dashboard"]["db_healthy"] is True
+    assert snap["dashboard"]["symbols"] == ["BNBUSDT", "ETHUSDT", "SOLUSDT"]
+
+    per_symbol = snap["grid"]["per_symbol"]
+    assert set(per_symbol) == {"BNBUSDT", "ETHUSDT", "SOLUSDT"}
+
+    # Active symbol: full per-symbol state from its own database.
+    bnb = per_symbol["BNBUSDT"]
+    assert bnb["db_healthy"] is True
+    assert bnb["last_price"] == "765.88000000"
+    assert bnb["last_range"]["lower"] == "750.0"
+    assert bnb["last_risk_decision"]["allowed"] is True
+    assert bnb["status"] == "ACTIVE"
+    assert bnb["paper_reference_equity"] == "505.0"
+    assert bnb["latest_cycles"][0]["cycle_id"] == "cycle-BNBUSDT"
+    assert bnb["open_orders"][0]["client_order_id"] == "AGBNB-1"
+    assert bnb["grid_economics"]["min_net_pct"] == "0.0035"
+    assert bnb["grid_economics"]["grid_cells"] == 8
+    assert bnb["missing_tables"] == []
+
+    # Symbol DB that never ran a paper cycle: optional table reported as
+    # missing, section empty — never a failure.
+    eth = per_symbol["ETHUSDT"]
+    assert eth["db_healthy"] is True
+    assert "paper_orch_cycles" in eth["missing_tables"]
+    assert eth["latest_cycles"] == []
+    assert eth["last_price"] == "765.88000000"
+
+    # Corrupt symbol file: degraded, not fatal.
+    sol = per_symbol["SOLUSDT"]
+    assert sol["db_healthy"] is False
+    assert sol["db_error"]
+
+    # Aggregates over the two healthy symbol DBs.
+    assert snap["risk"]["kill_state"]["active"] is False
+    assert snap["risk"]["reference_equity"] == "1010.0"  # 505.0 + 505.0
+    assert snap["account"]["realized_pnl"] == "15.0"     # 7.5 + 7.5
+    assert snap["account"]["quote_free"] == "1000.0"     # 500.0 + 500.0
+    assert len(snap["orders"]["open"]) == 2
+    assert {row["symbol"] for row in snap["orders"]["open"]} == {
+        "BNBUSDT", "ETHUSDT"}
+    assert snap["runtime"]["phase"] == "COMPLETED"
+    # The base DB itself has no cycles; merged cycles come from symbol DBs.
+    assert {row["symbol"] for row in snap["grid"]["latest_cycles"]} == {
+        "BNBUSDT"}
+    # Per-symbol DB health surfaces in the database section.
+    db_info = snap["database"]["per_symbol"]
+    assert db_info["BNBUSDT"]["healthy"] is True
+    assert db_info["ETHUSDT"]["missing_tables"] == ["paper_orch_cycles"]
+    assert db_info["SOLUSDT"]["healthy"] is False
+
+
+def test_multi_root_html(multi_server):
+    _, base = multi_server
+    status, body = http_get(base, "/")
+    assert status == 200
+    html = body.decode()
+    assert "dashboard error" not in html
+    for symbol in ("BNBUSDT", "ETHUSDT", "SOLUSDT"):
+        assert symbol in html
+    assert "ACTIVE" in html          # BNBUSDT status badge
+    assert "765.88" in html          # per-symbol price renders
+    assert "Per-symbol status" in html
+    assert "Kill state per symbol" in html
+    assert "Per-symbol databases" in html
+    assert "no such table" not in html
+
+
+def test_multi_missing_optional_data_degrades_gracefully(
+        tmp_path, multi_bot_config):
+    """A symbol DB missing every optional table must produce N/A sections,
+    not an HTTP 503."""
+    main = tmp_path / "grid_bot.sqlite3"
+    storage.init_db(str(main))
+    bare = tmp_path / "grid_bot_XRPUSDT.sqlite3"
+    storage.init_db(str(bare))  # schema only: no cycles, no account, nothing
+    bot_config = dict(multi_bot_config)
+    bot_config["symbols"] = "BNBUSDT,XRPUSDT"  # BNBUSDT DB does not exist
+    srv, base = start_server(tmp_path, str(main), bot_config)
+    try:
+        status, body = http_get(base, "/api/status")
+        assert status == 200
+        snap = json.loads(body)
+        xrp = snap["grid"]["per_symbol"]["XRPUSDT"]
+        assert xrp["db_healthy"] is True
+        assert "paper_orch_cycles" in xrp["missing_tables"]
+        assert xrp["latest_cycles"] == []
+        assert xrp["account"] is None
+        assert xrp["status"] in ("NO_DATA", "NO_DECISION")
+        status, body = http_get(base, "/")
+        assert status == 200
+        assert "XRPUSDT" in body.decode()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_multi_kill_active_in_one_symbol_aggregates_globally(
+        multi_state: Path, multi_bot_config):
+    """A kill latch in ONE symbol's database must surface as the global
+    kill-active status (with the per-symbol breakdown intact)."""
+    con = sqlite3.connect(
+        str(multi_state.parent / "grid_bot_BNBUSDT.sqlite3"))
+    con.execute(
+        "UPDATE kill_state SET active=1, trigger_reason='EQUITY_DRAWDOWN_KILL',"
+        " activated_at='2026-10-04T02:00:00Z' WHERE key='kill_state'")
+    con.commit()
+    con.close()
+    srv, base = start_server(multi_state.parent, str(multi_state),
+                             multi_bot_config)
+    try:
+        status, body = http_get(base, "/api/status")
+        assert status == 200
+        snap = json.loads(body)
+        kill = snap["risk"]["kill_state"]
+        assert kill["active"] is True
+        assert kill["per_symbol"]["BNBUSDT"]["active"] == 1
+        assert kill["per_symbol"]["ETHUSDT"]["active"] == 0
+        status, body = http_get(base, "/")
+        assert status == 200
+        assert "KILL ACTIVE" in body.decode()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_multi_no_mutation(multi_state: Path, multi_server):
+    """Serving the multi-symbol dashboard must not write to ANY database."""
+    _, base = multi_server
+    dbs = {
+        str(multi_state): None,
+        str(multi_state.parent / "grid_bot_BNBUSDT.sqlite3"): None,
+        str(multi_state.parent / "grid_bot_ETHUSDT.sqlite3"): None,
+    }
+    for db in dbs:
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        tables = [r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")]
+        dbs[db] = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                   for t in tables}
+        con.close()
+    for path in ("/", "/api/status", "/healthz"):
+        http_get(base, path)
+    for db, before in dbs.items():
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        tables = [r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")]
+        after = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                 for t in tables}
+        con.close()
+        assert before == after, db
+
+
+def test_multi_symbol_connections_are_read_only(multi_state: Path):
+    con = db_mod._connect_readonly(
+        str(multi_state.parent / "grid_bot_BNBUSDT.sqlite3"))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            con.execute("DELETE FROM orders")
+    finally:
+        con.close()
+
+
+def test_multi_no_secrets_in_response(tmp_path, multi_bot_config):
+    """A fake .env in the database directory must never surface in any
+    response — the dashboard has no Binance credentials and must not
+    expose any file contents."""
+    main = tmp_path / "grid_bot.sqlite3"
+    storage.init_db(str(main))
+    env_text = (
+        "BINANCE_TESTNET_API_KEY=topsecretkey\n"
+        "BINANCE_TESTNET_API_SECRET=topsecret\n")
+    (tmp_path / ".env").write_text(env_text)
+    srv, base = start_server(tmp_path, str(main), multi_bot_config)
+    try:
+        for path in ("/", "/api/status", "/healthz"):
+            status, body = http_get(base, path)
+            text = body.decode("utf-8", "replace")
+            assert status == 200, path
+            assert "topsecretkey" not in text, path
+            assert "topsecret" not in text, path
+            assert "api_key" not in text.lower(), path
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_multi_dashboard_reads_while_runtime_connection_is_open(
+        multi_state: Path, multi_bot_config):
+    """A runtime-style read-write connection stays open on a SYMBOL database
+    while the dashboard keeps reading it — coexistence without locks."""
+    sym_db = str(multi_state.parent / "grid_bot_BNBUSDT.sqlite3")
+    runtime_con = sqlite3.connect(sym_db, timeout=2.0)
+    srv, base = start_server(multi_state.parent, str(multi_state),
+                             multi_bot_config)
+    try:
+        runtime_con.execute(
+            "INSERT INTO orders (client_order_id, exchange_order_id, symbol,"
+            " side, grid_index, price, quantity, status, created_at,"
+            " updated_at, executed_qty, remaining_qty) VALUES"
+            " ('AGBNB-LIVE','12','BNBUSDT','BUY',3,'100.1','0.25','NEW',"
+            "  '2026-10-04T01:00:00Z','2026-10-04T01:00:00Z','0','0.25')")
+        runtime_con.commit()
+        status, body = http_get(base, "/api/status")
+        assert status == 200
+        snap = json.loads(body)
+        bnb_orders = snap["grid"]["per_symbol"]["BNBUSDT"]["open_orders"]
+        assert any(o["client_order_id"] == "AGBNB-LIVE" for o in bnb_orders)
+        status, _ = http_get(base, "/")
+        assert status == 200
+    finally:
+        runtime_con.close()
+        srv.shutdown()
+        srv.server_close()
