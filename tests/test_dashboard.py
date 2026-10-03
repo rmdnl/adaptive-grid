@@ -182,12 +182,39 @@ def test_root_html(server):
     assert "NET_PROFIT_BELOW_HARD_MIN" in html
     assert "765.88" in html            # current price from last_price
     assert "765.23" in html            # lower from last_range
-    assert "FILTER GRID_BLOCKED" in html
+    assert "MARKET FILTERED" in html   # human-friendly market badge
+    assert "RISK BLOCKED" in html      # human-friendly risk badge
     assert "diagnostic: adx" in html   # market intelligence diagnostics table
     # equity card falls back to last_account_risk when no snapshot exists
     assert "405275.83" in html
+    # human-friendly number formatting
+    assert "405275.8339338000000000" not in html   # no raw decimal noise
     # auto-refresh present (10-15s window)
     assert 'http-equiv="refresh" content="12"' in html
+
+
+def test_tabbed_layout_and_penting_filter(server):
+    _, base = server
+    status, body = http_get(base, "/")
+    html = body.decode()
+    # all six tabs and their panes are present
+    for tab in ("tab-general", "tab-risk", "tab-grid", "tab-market",
+                "tab-orders", "tab-system"):
+        assert f' data-tab="{tab}"' in html
+        assert f'id="{tab}"' in html
+    # the "General" pane is the default active one
+    assert 'class="tabpane active" id="tab-general"' in html
+    # the "penting saja" filter toggle + its JS + CSS rules are present
+    assert 'id="penting-toggle"' in html
+    assert "penting-only" in html            # CSS rule that hides details
+    assert "localStorage" in html            # remembers the user's choice
+    # detail rows / blocks are tagged so the filter can hide them
+    assert 'class="detail"' in html
+    assert "detail-block" in html
+    # the CSS/JS chrome must not leak any credential material
+    for secret in ("api_key", "api_secret", "BINANCE_API_KEY",
+                   "BINANCE_API_SECRET", "password"):
+        assert secret not in html.lower(), secret
 
 
 def test_api_status(server):

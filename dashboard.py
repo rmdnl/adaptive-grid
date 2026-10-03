@@ -41,7 +41,8 @@ import html
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
@@ -285,24 +286,267 @@ def _esc(value: Any) -> str:
     return html.escape(str(value if value is not None else "N/A"))
 
 
+def _fmt(value: Any) -> str:
+    """Human-friendly number: trims Decimal noise, keeps sensible precision.
+
+    ``405275.8339338000000000`` → ``405275.83``; ``765.88000000`` →
+    ``765.88``; ``0.00341234`` → ``0.003412``.  Non-numeric values are
+    returned unchanged (rendered via :func:`_esc` by the caller).
+    """
+    if value is None or isinstance(value, bool):
+        return str(value) if value is not None else "N/A"
+    text = str(value).strip()
+    try:
+        number = Decimal(text)
+    except Exception:
+        return text
+    if not number.is_finite():
+        return text
+    magnitude = abs(number)
+    if magnitude >= 1000:
+        places = 2
+    elif magnitude >= 1:
+        places = 4
+    else:
+        places = 6
+    quantized = number.quantize(Decimal(1).scaleb(-places))
+    text = format(quantized, "f").rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _pct(value: Any) -> str:
+    """Fraction → percentage string (``0.006`` → ``0.60%``)."""
+    if value is None or isinstance(value, bool):
+        return "N/A"
+    text = str(value).strip()
+    if text.endswith("%"):
+        return text
+    try:
+        number = Decimal(text)
+    except Exception:
+        return _esc(value)
+    if not number.is_finite():
+        return _esc(value)
+    return f"{_fmt(number * Decimal(100))}%"
+
+
+_WIB = timezone(timedelta(hours=7))
+_MONTHS_ID = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
+              "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+
+
+def _wib(value: Any) -> str:
+    """UTC timestamp → Indonesian time (WIB).  Unparseable → raw value."""
+    if value is None:
+        return "N/A"
+    text = str(value).strip()
+    try:
+        # ISO-8601 with timezone
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            # ISO-8601 naive (assume UTC) or plain date
+            moment = datetime.fromisoformat(text)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return _esc(text)
+    local = moment.astimezone(_WIB)
+    return (f"{local.day:02d} {_MONTHS_ID[local.month - 1]} "
+            f"{local.year} {local.hour:02d}:{local.minute:02d}:{local.second:02d} WIB")
+
+
 def _badge(text: str, cls: str) -> str:
     return f'<span class="badge {cls}">{_esc(text)}</span>'
+
+
+#: kolom yang berisi timestamp (dirender sebagai WIB)
+_TIME_COLUMNS = {"ts", "at", "activated_at", "created_at", "updated_at",
+                 "event_time"}
+#: kolom yang berisi fraksi (dirender sebagai persen)
+_PCT_COLUMNS = {"drawdown_pct", "max_allowed_drawdown", "net_pct_grid",
+                "min_net", "grid_step", "grid_step_pct", "hard_min_net",
+                "atr_pct", "bb_width"}
+
+
+def _short_id(value: Any, keep: int = 14) -> str:
+    """Short display form of a long identifier (full value in a tooltip)."""
+    text = str(value) if value is not None else ""
+    if len(text) <= keep:
+        return text
+    return "…" + text[-keep:]
+
+
+def _yn(value: Any) -> str:
+    """Human label for boolean-ish DB values (0/1/None)."""
+    if value is None:
+        return "N/A"
+    if isinstance(value, str) and value.lower() in ("0", "1", "true", "false"):
+        value = int(value) if value.isdigit() else value.lower() == "true"
+    if isinstance(value, bool):
+        return "YES" if value else "NO"
+    return str(value)
 
 
 def _table(columns: list[str], rows: list[dict]) -> str:
     if not rows:
         return '<p class="muted">no data</p>'
-    head = "".join(f"<th>{_esc(c)}</th>" for c in columns)
+
+    def _cell(column: str, row: dict) -> str:
+        value = row.get(column)
+        if column in _TIME_COLUMNS:
+            return _wib(value)
+        if column in _PCT_COLUMNS:
+            return _pct(value)
+        if column in ("client_order_id", "order_id", "trade_id"):
+            text = _fmt(value)
+            return f'<span class="mono" title="{_esc(value)}">{_esc(_short_id(text))}</span>'
+        if value is True or value is False:
+            return _yn(value)
+        return _esc(_fmt(value))
+
+    head = "".join(
+        f'<th class="{("num " if c in _NUMERIC_COLUMNS else "")}'
+        f'{"wrap" if c in _WRAP_COLUMNS else ""}">{_esc(c)}</th>'
+        for c in columns)
     body = ""
     for row in rows:
-        body += "<tr>" + "".join(
-            f"<td>{_esc(row.get(c))}</td>" for c in columns) + "</tr>"
-    return (f'<div class="tablewrap"><table><thead><tr>{head}</tr></thead>'
+        cls = ' class="detail"' if row.get("detail") else ""
+        tds = []
+        for c in columns:
+            classes = []
+            if c in _NUMERIC_COLUMNS:
+                classes.append("num")
+            if c in _WRAP_COLUMNS:
+                classes.append("wrap")
+            tds.append(f'<td class="{" ".join(classes)}">{_cell(c, row)}</td>')
+        body += f"<tr{cls}>" + "".join(tds) + "</tr>"
+    has_num = any(c in _NUMERIC_COLUMNS for c in columns)
+    tbl = "table numalign" if has_num else "table"
+    return (f'<div class="tablewrap"><table class="{tbl}"><thead><tr>{head}</tr></thead>'
             f"<tbody>{body}</tbody></table></div>")
 
 
+_NUMERIC_COLUMNS = {"price", "quantity", "executed_qty", "remaining_qty",
+                   "fee", "grid_index", "orders", "fills", "success",
+                   "candle_index", "drawdown_pct", "equity_quote"}
+#: long free-text columns that should wrap instead of forcing horizontal scroll
+_WRAP_COLUMNS = {"reason", "blocked_reason", "filter reasons", "plan reasons",
+                 "regime_reason", "value"}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard chrome (dark, mobile-friendly). Plain strings so they can be
+# interpolated into the f-string body without brace-escaping.
+# ---------------------------------------------------------------------------
+_DASH_CSS = """
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin:0; background:#0d1117; color:#e6edf3; font-family:
+  -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; }
+main { max-width:1080px; margin:0 auto; padding:14px 14px 32px; }
+h1 { font-size:1.4rem; margin:6px 0 2px; }
+.sub { color:#8b949e; margin:0 0 14px; font-size:.9rem; }
+.badges { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
+.badge { padding:4px 10px; border-radius:999px; font-size:.78rem;
+  font-weight:600; border:1px solid transparent; white-space:nowrap; }
+.green { background:#0f2d1d; color:#3fb950; border-color:#1d4527; }
+.yellow { background:#332a0d; color:#d29922; border-color:#574413; }
+.red { background:#3d1114; color:#f85149; border-color:#67282c; }
+.cards { display:grid; gap:10px; grid-template-columns:
+  repeat(auto-fit, minmax(150px, 1fr)); }
+.card { background:#161b22; border:1px solid #30363d; border-radius:10px;
+  padding:12px 14px; }
+.cardlabel { color:#8b949e; font-size:.72rem; text-transform:uppercase;
+  letter-spacing:.06em; }
+.cardvalue { font-size:1.3rem; font-weight:600; margin-top:4px;
+  word-break:break-word; }
+.cardsub { color:#8b949e; font-size:.72rem; margin-top:2px;
+  word-break:break-word; }
+.toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px;
+  margin:16px 0 6px; }
+.tabs { display:flex; flex-wrap:wrap; gap:6px; }
+.tab { background:#161b22; color:#c9d1d9; border:1px solid #30363d;
+  border-radius:8px; padding:6px 12px; font-size:.85rem; cursor:pointer;
+  font-family:inherit; }
+.tab:hover { border-color:#8b949e; }
+.tab[aria-selected="true"] { background:#1f6feb22; color:#58a6ff;
+  border-color:#1f6feb; }
+.penting { margin-left:auto; display:flex; align-items:center; gap:6px;
+  font-size:.8rem; color:#8b949e; cursor:pointer; user-select:none; }
+.penting input { accent-color:#1f6feb; }
+.tabpane { display:none; }
+.tabpane.active { display:block; }
+section.block { margin:18px 0; }
+h2 { font-size:1rem; margin:18px 0 8px; color:#8b949e;
+  text-transform:uppercase; letter-spacing:.06em; }
+h3 { font-size:.9rem; margin:14px 0 6px; color:#c9d1d9; }
+.tablewrap { overflow-x:auto; background:#161b22; border:1px solid #30363d;
+  border-radius:10px; margin:8px 0; }
+table { border-collapse:collapse; width:100%; font-size:.85rem; }
+th, td { padding:7px 10px; text-align:left; border-bottom:1px solid #21262d; }
+th { color:#8b949e; font-weight:600; background:#161b22; white-space:nowrap; }
+td { white-space:nowrap; }
+td.wrap { white-space:normal; word-break:break-word; max-width:38ch; }
+tr:last-child td { border-bottom:none; }
+table.numalign td.num, table.numalign th.num { text-align:right;
+  font-variant-numeric:tabular-nums; }
+.muted { color:#8b949e; padding:0 4px; }
+.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:.85em; color:#c9d1d9; }
+.foot { color:#8b949e; font-size:.75rem; margin-top:24px; line-height:1.5; }
+/* "penting saja" mode hides detail rows/blocks */
+body.penting-only tr.detail { display:none; }
+body.penting-only .detail-block { display:none; }
+/* mobile: stack cards 2-up, smaller cards, scrollable tables */
+@media (max-width: 640px) {
+  main { padding:10px 10px 28px; }
+  .cards { grid-template-columns:repeat(2, 1fr); gap:8px; }
+  .cardvalue { font-size:1.05rem; }
+  .card { padding:9px 11px; }
+  .tab { padding:5px 9px; font-size:.8rem; }
+  table { font-size:.8rem; }
+  th, td { padding:6px 8px; }
+}
+"""
+
+_DASH_JS = """
+(function () {
+  var tabs = document.querySelectorAll('.tab');
+  var panes = document.querySelectorAll('.tabpane');
+  tabs.forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      tabs.forEach(function (t) { t.setAttribute('aria-selected', 'false'); });
+      panes.forEach(function (p) { p.classList.remove('active'); });
+      tab.setAttribute('aria-selected', 'true');
+      var pane = document.getElementById(tab.getAttribute('data-tab'));
+      if (pane) { pane.classList.add('active'); }
+    });
+  });
+  var toggle = document.getElementById('penting-toggle');
+  var saved = null;
+  try { saved = localStorage.getItem('dashboard-penting'); } catch (e) { saved = null; }
+  if (toggle) {
+    if (saved === '1') { document.body.classList.add('penting-only'); toggle.checked = true; }
+    toggle.addEventListener('change', function () {
+      document.body.classList.toggle('penting-only', toggle.checked);
+      try { localStorage.setItem('dashboard-penting', toggle.checked ? '1' : '0'); }
+      catch (e) {}
+    });
+  }
+})();
+"""
+
+
 def render_html(snap: dict[str, Any]) -> str:
-    """Dark, mobile-friendly, server-rendered page (auto-refresh 12s)."""
+    """Dark, mobile-friendly, tabbed, server-rendered page (auto-refresh 12s).
+
+    Layout: a persistent "key data" strip (status badges + metric cards) on
+    top, then tabs (General / Risk / Grid / Market / Orders / System).  The
+    "penting saja" toggle hides detail rows and detail blocks, showing only
+    the essentials.  Everything is read-only; no client logic trades or
+    mutates state.
+    """
     env = snap["environment"]
     risk = snap["risk"]
     kill = risk.get("kill_state") or {}
@@ -342,19 +586,27 @@ def render_html(snap: dict[str, Any]) -> str:
     plan_reason = str(adaptive_plan.get("reason")
                       or risk_decision.get("reason") or "")
     plan_allowed = "ALLOW" in plan_decision.upper()
-    grid_badge = (_badge(f"GRID {plan_decision}", "green") if plan_allowed
-                  else _badge(f"GRID {plan_decision}", "yellow"))
+    grid_badge = (_badge("GRID OK", "green") if plan_allowed
+                  else _badge("GRID BLOCKED", "yellow"))
+    risk_allowed = bool(risk_decision.get("allowed"))
+    risk_badge = (_badge("RISK PASS", "green") if risk_allowed
+                  else _badge("RISK BLOCKED", "yellow"))
     intel_status = str(market_intel.get("status") or "N/A")
-    intel_badge = (_badge(f"FILTER {intel_status}", "green")
+    intel_badge = (_badge("MARKET OK", "green")
                    if market_intel.get("allowed") is True
-                   else _badge(f"FILTER {intel_status}", "yellow"))
+                   else _badge("MARKET FILTERED", "yellow"))
     last_range = grid_state.get("last_range") or {}
     last_price = grid_state.get("last_price")
 
     def card(label: str, value: Any, sub: str = "") -> str:
         sub_html = f'<div class="cardsub">{_esc(sub)}</div>' if sub else ""
         return (f'<div class="card"><div class="cardlabel">{_esc(label)}</div>'
-                f'<div class="cardvalue">{_esc(value)}</div>{sub_html}</div>')
+                f'<div class="cardvalue">{_esc(_fmt(value))}</div>{sub_html}</div>')
+
+    def card_pct(label: str, value: Any, sub: str = "") -> str:
+        sub_html = f'<div class="cardsub">{_esc(sub)}</div>' if sub else ""
+        return (f'<div class="card"><div class="cardlabel">{_esc(label)}</div>'
+                f'<div class="cardvalue">{_pct(value)}</div>{sub_html}</div>')
 
     open_orders = snap["orders"].get("open") or []
     quote_free = account.get("quote_free")
@@ -411,123 +663,116 @@ def render_html(snap: dict[str, Any]) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="12">
 <title>adaptive-grid dashboard</title>
-<style>
-:root {{ color-scheme: dark; }}
-* {{ box-sizing: border-box; }}
-body {{ margin:0; background:#0d1117; color:#e6edf3; font-family:
-  -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; }}
-main {{ max-width:1080px; margin:0 auto; padding:16px; }}
-h1 {{ font-size:1.5rem; margin:8px 0 2px; }}
-h2 {{ font-size:1.05rem; margin:28px 0 8px; color:#8b949e;
-  text-transform:uppercase; letter-spacing:.08em; }}
-.sub {{ color:#8b949e; margin:0 0 16px; }}
-.badges {{ display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }}
-.badge {{ padding:4px 10px; border-radius:999px; font-size:.8rem;
-  font-weight:600; border:1px solid transparent; }}
-.green {{ background:#0f2d1d; color:#3fb950; border-color:#1d4527; }}
-.yellow {{ background:#332a0d; color:#d29922; border-color:#574413; }}
-.red {{ background:#3d1114; color:#f85149; border-color:#67282c; }}
-.cards {{ display:grid; gap:12px; grid-template-columns:
-  repeat(auto-fit, minmax(150px, 1fr)); }}
-.card {{ background:#161b22; border:1px solid #30363d; border-radius:10px;
-  padding:12px 14px; }}
-.cardlabel {{ color:#8b949e; font-size:.75rem; text-transform:uppercase;
-  letter-spacing:.06em; }}
-.cardvalue {{ font-size:1.25rem; font-weight:600; margin-top:4px;
-  word-break:break-all; }}
-.cardsub {{ color:#8b949e; font-size:.75rem; margin-top:2px; }}
-.tablewrap {{ overflow-x:auto; background:#161b22; border:1px solid #30363d;
-  border-radius:10px; }}
-table {{ border-collapse:collapse; width:100%; font-size:.85rem; }}
-th, td {{ padding:7px 10px; text-align:left; border-bottom:1px solid #21262d;
-  white-space:nowrap; }}
-th {{ color:#8b949e; font-weight:600; background:#161b22; }}
-tr:last-child td {{ border-bottom:none; }}
-.muted {{ color:#8b949e; padding:0 4px; }}
-.foot {{ color:#8b949e; font-size:.75rem; margin-top:24px; }}
-</style></head>
+<style>{_DASH_CSS}</style></head>
 <body><main>
 <h1>ADAPTIVE GRID</h1>
 <p class="sub">Binance Spot Grid Monitor &middot; {_esc(env.get("symbol"))} &middot;
-{_esc(env.get("timeframe"))} &middot; read-only</p>
+{_esc(env.get("timeframe"))} &middot; read-only &middot; waktu Indonesia (WIB)</p>
 <div class="badges">{env_badge} {dry_badge} {live_badge} {run_badge}
-{grid_badge} {intel_badge} {kill_badge} {db_badge}</div>
+{grid_badge} {risk_badge} {intel_badge} {kill_badge} {db_badge}</div>
 
 <div class="cards">
-{card("Equity (quote)", equity_val, "latest equity snapshot")}
-{card("Drawdown", drawdown is not None and f"{drawdown}" or "N/A",
-      f"limit {risk.get('max_drawdown_pct', 'N/A')}")}
+{card("Equity", equity_val, f"ref {_fmt(risk.get('reference_equity'))}")}
+{card_pct("Drawdown", drawdown, f"limit {_pct(risk.get('max_drawdown_pct'))}")}
 {card("Realized PnL", account.get("realized_pnl"), "after fees")}
 {card("Total fees", account.get("total_fees"))}
 {card("Open orders", len(open_orders))}
-{card("Grid step", snap['grid'].get('grid_step_pct'),
-      f"min net {snap['grid'].get('hard_min_net_pct')}")}
+{card("Harga terakhir", grid_detail.get("current_price"),
+      f"{env.get('symbol')} &middot; range {_fmt(grid_detail.get('lower_price'))} &ndash; {_fmt(grid_detail.get('upper_price'))}")}
 </div>
 
+<div class="toolbar">
+<nav class="tabs" role="tablist">
+<button class="tab" role="tab" data-tab="tab-general" aria-selected="true">General</button>
+<button class="tab" role="tab" data-tab="tab-risk" aria-selected="false">Risk</button>
+<button class="tab" role="tab" data-tab="tab-grid" aria-selected="false">Grid</button>
+<button class="tab" role="tab" data-tab="tab-market" aria-selected="false">Market</button>
+<button class="tab" role="tab" data-tab="tab-orders" aria-selected="false">Orders &amp; Fills</button>
+<button class="tab" role="tab" data-tab="tab-system" aria-selected="false">System</button>
+</nav>
+<label class="penting"><input type="checkbox" id="penting-toggle">penting saja</label>
+</div>
+
+<section class="tabpane active" id="tab-general" role="tabpanel">
+<h2>Ringkasan</h2>
+{_table(["field", "value"], [
+    {"field": "risk decision", "value": "PASS" if risk_allowed else "BLOCKED"},
+    {"field": "plan decision", "value": plan_decision},
+    {"field": "plan reasons", "value": plan_reason or None},
+    {"field": "market filter", "value": intel_status},
+])}
+<h2 class="detail-block">Recent cycles</h2>
+{_table(["cycle_id", "candle_index", "plan", "orders", "fills", "success",
+         "blocked_reason", "at"], cycle_rows)}
+</section>
+
+<section class="tabpane" id="tab-risk" role="tabpanel">
 <h2>Risk</h2>
 {_table(["field", "value"], [
     {"field": "kill switch active", "value": kill.get("active", False)},
     {"field": "kill trigger", "value": kill.get("trigger_reason")},
     {"field": "activated at", "value": kill.get("activated_at")},
     {"field": "cancel status", "value": kill.get("cancel_status")},
-    {"field": "reference equity", "value": risk.get("reference_equity")},
-    {"field": "latest drawdown", "value": drawdown},
-    {"field": "max allowed drawdown", "value": risk.get("max_drawdown_pct")},
+    {"field": "reference equity", "value": _fmt(risk.get("reference_equity"))},
+    {"field": "latest drawdown", "value": _pct(drawdown)},
+    {"field": "max allowed drawdown", "value": _pct(risk.get("max_drawdown_pct"))},
 ])}
-<h3>Recent risk events</h3>
+<h3 class="detail-block">Recent risk events</h3>
 {_table(["ts", "allowed", "reason"], risk.get("risk_events") or [])}
+</section>
 
+<section class="tabpane" id="tab-grid" role="tabpanel">
 <h2>Grid</h2>
 {_table(["field", "value"], [
-    {"field": "grid step", "value": grid_detail.get("grid_step")
-        or snap["grid"].get("grid_step_pct")},
+    {"field": "grid step", "value": _pct(grid_detail.get("grid_step")
+        or snap["grid"].get("grid_step_pct"))},
     {"field": "min net profit per grid",
-     "value": snap["grid"].get("hard_min_net_pct")},
-    {"field": "lower price", "value": grid_detail.get("lower_price")},
-    {"field": "upper price", "value": grid_detail.get("upper_price")},
-    {"field": "effective upper", "value": grid_detail.get("effective_upper")},
+     "value": _pct(snap["grid"].get("hard_min_net_pct"))},
+    {"field": "lower price", "value": _fmt(grid_detail.get("lower_price"))},
+    {"field": "upper price", "value": _fmt(grid_detail.get("upper_price"))},
+    {"field": "effective upper", "value": _fmt(grid_detail.get("effective_upper"))},
     {"field": "grid cells", "value": grid_detail.get("grid_cells")},
     {"field": "net profit / grid (estimated)",
-     "value": grid_detail.get("net_pct")},
-    {"field": "current price", "value": grid_detail.get("current_price")},
+     "value": _pct(grid_detail.get("net_pct"))},
+    {"field": "current price", "value": _fmt(grid_detail.get("current_price"))},
     {"field": "plan decision", "value": plan_decision},
-    {"field": "plan reasons", "value": plan_reason},
+    {"field": "plan reasons", "value": plan_reason or None},
 ])}
+</section>
 
+<section class="tabpane" id="tab-market" role="tabpanel">
 <h2>Market</h2>
 {_table(["field", "value"], [
     {"field": "market regime", "value": grid_detail.get("market_regime")},
-    {"field": "range quality", "value": grid_detail.get("range_quality")},
+    {"field": "range quality", "value": _fmt(grid_detail.get("range_quality"))},
     {"field": "filter status", "value": intel_status},
     {"field": "filter allowed", "value": market_intel.get("allowed")},
     {"field": "filter reasons", "value":
         ", ".join(market_intel.get("reasons") or []) or None},
-] + [{"field": f"diagnostic: {k}", "value": v}
+] + [{"field": f"diagnostic: {k}", "value": _fmt(v), "detail": True}
      for k, v in sorted(diag.items())
      if not isinstance(v, (dict, list))])}
+</section>
 
-<h2>Recent cycles</h2>
-{_table(["cycle_id", "candle_index", "plan", "orders", "fills", "success",
-         "blocked_reason", "at"], cycle_rows)}
-
-<h2>Open orders</h2>
+<section class="tabpane" id="tab-orders" role="tabpanel">
+<h2>Open orders ({len(open_orders)})</h2>
 {_table(["client_order_id", "side", "grid_index", "price", "quantity",
          "executed_qty", "remaining_qty", "status", "type", "created_at"],
         open_orders)}
-
 <h2>Recent orders</h2>
 {_table(["client_order_id", "side", "grid_index", "price", "quantity",
          "executed_qty", "remaining_qty", "status", "created_at"],
         snap["orders"].get("recent") or [])}
-
 <h2>Recent fills</h2>
 {_table(["event_time", "side", "price", "quantity", "fee", "fee_asset",
          "resulting_state", "symbol"],
         snap["fills"] or [])}
+</section>
 
+<section class="tabpane" id="tab-system" role="tabpanel">
 <h2>System</h2>
 {_table(["field", "value"], [
-    {"field": "dashboard time (UTC)", "value": dash.get("generated_at_utc")},
+    {"field": "dashboard time", "value": _wib(dash.get("generated_at_utc"))},
     {"field": "database healthy", "value": dash.get("db_healthy")},
     {"field": "database error", "value": dash.get("db_error")},
     {"field": "schema user_version", "value":
@@ -538,11 +783,13 @@ tr:last-child td {{ border-bottom:none; }}
     {"field": "open orders at last run", "value": run_state.get("open_orders")},
     {"field": "read-only", "value": dash.get("read_only")},
 ])}
+</section>
 <p class="foot">Public read-only monitor &middot; no authentication by design
 &middot; this dashboard cannot place, cancel, or modify orders, cannot change
 risk or configuration, and cannot release the kill switch &middot; page
 auto-refreshes every 12s &middot; API: <code>/api/status</code>,
 <code>/healthz</code></p>
+<script>{_DASH_JS}</script>
 </main></body></html>"""
 
 
