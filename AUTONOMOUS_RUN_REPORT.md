@@ -983,3 +983,137 @@ secrets in code, logs, events, or the ledger.
   is tracked and reconciled; PnL accounting remains the paper engine's
   domain until a separately authorized execution wiring).
 - User-data websocket event stream (Roadmap E seam ready).
+
+---
+
+# Round 9 — Production readiness + economics (2026-10-03)
+
+## Scope (per task)
+
+1. Fee + net grid profit validation (theoretical AND executable net).
+2. Partial-fill / inventory accounting over authoritative executed quantities.
+3. Deterministic realized PnL accounting.
+4. Bounded testnet validation (50–100 controlled cycles).
+
+## Plan (written before coding)
+
+- **`economics.py` (new).**  `CycleEconomics`: inventory + realized PnL for
+  the testnet cycle path over AUTHORITATIVE fills only.  Average-cost
+  accounting; SELL applies realized PnL = (executed price × executed qty)
+  − fees − avg-cost basis (never the intended price/qty when authoritative
+  data exists); realized PnL is profitable only AFTER fees; SELL exceeding
+  held inventory raises (Spot-only, no shorting at the accounting layer);
+  tracks realized PnL quote, PnL pct, total fees, grids completed /
+  profitable / losing / zero.  Persisted as append-only ledger fill rows
+  (replay-safe unique key) so a restart reconstructs inventory exactly.
+  Fees use the repo-wide conservative fallback maker rate applied to
+  executed notional (documented; per-trade commissions via get_my_trades
+  are a future refinement).
+- **`binance_testnet.py` (additive).**  `_parse_order_status` now validates
+  and returns `cummulativeQuoteQty` (Decimal ≥ 0, optional) so the average
+  AUTHORITATIVE execution price (cummulativeQuoteQty / executedQty) is
+  available; missing → None (caller falls back to the limit price, marked
+  ESTIMATED).
+- **`testnet_cycle.py` (additive).**  `cycle_fills` ledger table; on every
+  authoritative ack/resolve the runner syncs executed-quantity DELTAS into
+  fill rows and applies them to `CycleEconomics` — executed quantity is
+  never assumed equal to requested quantity.  Cycle reports now include
+  BOTH the theoretical net (grid step → `net_pct_from_step`) and the
+  executable net after tick/step quantization (`validate_quantized_order_plan`
+  minimum); the executable net remains the gate (hard min 0.003, never
+  rounded upward).
+- **`scripts/testnet_cycle_check.py`.**  `--validate` mode: bounded cycles
+  (default 60, hard cap 100), fail-closed cleanup, and the Round 9 report
+  block (cycles, orders created/filled/partially filled/canceled/
+  UNKNOWN-PENDING, theoretical/executable net, realized PnL, fees, final
+  open orders).
+
+Safety invariants unchanged: DRY_RUN=true, ALLOW_LIVE_EXECUTION=false,
+main() paper-only, TESTNET_ORDERS_ENABLED default false.
+
+## Results
+
+(appended after implementation and verification)
+
+## Results (Round 9)
+
+### 1. Fee + net grid profit validation
+
+- 35 new deterministic tests (`tests/test_round9_economics.py`): normal
+  0.6% grid reports theoretical ≈ 0.3487% AND executable-after-quantization
+  net (executable is the gate); fee increase (0.2%/leg) and slippage
+  increase (1%) each reject the plan; a coarse tickSize erodes the
+  quantized spread below 0.30% → `NET_PROFIT_BELOW_HARD_MIN_AFTER_QUANTIZATION`
+  (marginal cell ≈ 0.289% recorded as below-min — never rounded upward);
+  quantity rounding stays inside stepSize with notional above minimum;
+  minNotional violation rejects; exactly 0.003 passes (`>=` boundary);
+  0.00299 rejects.
+- Live confirmation (SOLUSDT testnet data): theoretical 0.3487011497%,
+  executable 0.3431061196% — both ≥ 0.30%.
+
+### 2. Partial fill / inventory accounting
+
+- Executed-quantity DELTAS only: the runner syncs (new executed − recorded)
+  per authoritative ack/resolve; requested quantity is never assumed
+  filled.  Delta pricing is exact when `cummulativeQuoteQty` is present
+  ((newCum − recordedCum)/deltaQty, `AUTHORITATIVE_PRICE`), otherwise the
+  limit price with an explicit `ESTIMATED_PRICE` marker.
+- Tests: 10% / 50% / 99% / full fill deltas; partial-then-cancel keeps the
+  executed portion (unfilled remainder released only by the authoritative
+  terminal state); partial-then-restart reconstructs inventory exactly from
+  ledger fill replay; delayed reconciliation syncs each delta exactly once
+  (idempotent, no phantom double-count); UNKNOWN after partial execution
+  keeps the synced portion visible, blocks placement, and cleanup refuses
+  to claim success; SELL exceeding the held position raises (no shorting).
+- Adapter additively validates `cummulativeQuoteQty` (present / absent →
+  None / invalid → fail closed).
+
+### 3. Realized PnL accounting
+
+- `economics.py` `CycleEconomics`: average-cost inventory; realized PnL =
+  proceeds − average-cost basis − BOTH fees, computed from authoritative
+  execution prices (never intended price/qty when execution data exists).
+  Tracks realized PnL quote + pct, total fees, grids completed / profitable
+  / losing / zero, fill counts; `to_state`/`replay` gives exact restart
+  reconstruction.
+- Tests: profitable grid (PnL positive but strictly below the gross move —
+  after fees); `sell > buy` with a 0.2% move is a LOSS after conservative
+  fees (grids_losing, never counted profitable); exact zero PnL; negative
+  PnL; partial-fill PnL across two buy lots at average cost; multiple
+  completed grids accumulate; fee totals exact; rounding effects exact in
+  Decimal; state round-trip and replay identity.
+
+### 4. Bounded testnet validation (live, 2026-10-03, SOLUSDT)
+
+| Metric | Value |
+|---|---|
+| Cycles run | 60 (bounded, interval 1s, exit 0) |
+| Orders created | 120 (deterministic AGTC- cids, 2/cycle) |
+| Filled | 0 (each cycle ends flat within ~1s) |
+| Partially filled | 0 |
+| Canceled (verified) | 120 |
+| Rejected | 0 |
+| UNKNOWN / PENDING | 0 |
+| Realized PnL | 0.000 (no executed sells — cycle starts flat) |
+| Total fees | 0.000 (no fills) |
+| Final unintended open orders | 0 (authoritative proof, cleanup ok=true) |
+| Risk vetoes | none this run (market cooperated); veto paths tested |
+| Kill latch | not triggered (equity stable); deterministic tests cover it |
+
+`--validate` without `TESTNET_ORDERS_ENABLED=true` is refused (fail-closed).
+
+### Safety invariants — unchanged
+
+`DRY_RUN=true`; `ALLOW_LIVE_EXECUTION=false`; `main()` paper-only;
+`TESTNET_ORDERS_ENABLED` default false; Spot-only (shorting impossible at
+the accounting layer); hard min net 0.003 unchanged and enforced on the
+executable net; risk gates untouched.
+
+### Remaining (future refinements, not blockers)
+
+- Exact per-trade commissions via `GET /api/v3/myTrades` to replace the
+  conservative fee estimate (must only ever replace with authoritative
+  data).
+- SELL legs / completed-grid PnL on the live cycle path require inventory
+  carry-over between cycles — the bounded cycle deliberately starts flat;
+  the PnL machinery is in place and tested for when that is authorized.

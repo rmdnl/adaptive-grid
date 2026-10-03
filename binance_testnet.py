@@ -949,6 +949,20 @@ def _parse_order_status(payload: Any, symbol: str, client_order_id: str) -> dict
         raise BinanceTestnetValidationError(
             f"Invalid orderId for order {client_order_id!r}"
         )
+    # Round 9: authoritative cumulative quote quantity, when the exchange
+    # provides it.  With executedQty it yields the average EXECUTION price
+    # (never the intended limit price).  Absent → None (caller must treat
+    # the limit-price fallback as ESTIMATED); present-but-invalid → fail
+    # closed rather than feed a wrong price into PnL accounting.
+    cum_raw = payload.get("cummulativeQuoteQty")
+    cum_quote: Decimal | None = None
+    if cum_raw is not None:
+        cum_quote = _decimal(cum_raw, "cummulativeQuoteQty")
+        if not cum_quote.is_finite() or cum_quote < 0:
+            raise BinanceTestnetValidationError(
+                f"Invalid cummulativeQuoteQty for order {client_order_id!r}: "
+                f"{cum_quote}"
+            )
     return {
         "orderId": order_id,
         "clientOrderId": returned_cid,
@@ -957,6 +971,7 @@ def _parse_order_status(payload: Any, symbol: str, client_order_id: str) -> dict
         "price": str(price),
         "origQty": str(orig_qty),
         "executedQty": str(executed_qty),
+        "cummulativeQuoteQty": str(cum_quote) if cum_quote is not None else None,
     }
 
 

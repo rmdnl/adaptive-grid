@@ -963,6 +963,65 @@ Live trading remains disabled.  `DRY_RUN=true`, `ALLOW_LIVE_EXECUTION=false`,
 
 ---
 
+# 🧭 Phase 9: Economics — Fees, Partial Fills, Realized PnL
+
+**Purpose:** close the accounting loop on the testnet cycle: prove the
+executable grid economics end-to-end, account for partial fills from
+authoritative execution data, and track realized PnL deterministically.
+
+## Grid economics (theoretical AND executable)
+
+Every candidate grid reports BOTH nets, and the executable one is the gate:
+
+- **Theoretical net** — from the raw 0.60% grid step:
+  `net_pct_from_step(step, maker, maker, slippage)` (0.60% step with
+  0.10%/leg conservative fees + 0.05% round-trip slippage ⇒ ≈0.349%).
+- **Executable net** — the worst grid cell AFTER tick/step quantization
+  (`validate_quantized_order_plan`), re-checked against
+  `hard_min_net_pct = 0.003`.  A marginal cell is rejected
+  (`NET_PROFIT_BELOW_HARD_MIN_AFTER_QUANTIZATION`) — never rounded upward
+  to pass.  Fee changes, slippage changes, coarse tick sizes, quantity
+  rounding, and minNotional violations each fail the plan fail-closed.
+
+## Authoritative fills → inventory → realized PnL (`economics.py`)
+
+- The adapter now validates and returns `cummulativeQuoteQty` from order
+  payloads, giving the AUTHORITATIVE average execution price
+  (`cumQuote / executedQty`); without it the limit price is used and the
+  fill is explicitly `ESTIMATED_PRICE`.
+- `testnet_cycle` syncs the executed-quantity DELTA of every order on each
+  authoritative ack/resolve — requested quantity is never assumed to be
+  filled quantity.  Deltas are priced exactly
+  (`(newCum − recordedCum) / deltaQty`), persisted as append-only ledger
+  fill rows (replay-safe unique key), and applied to `CycleEconomics`.
+- `CycleEconomics` (average-cost): BUY fills grow the position by exactly
+  the executed amount (fee included in basis); SELL closes basis at the
+  average cost.  Realized PnL = proceeds − basis − BOTH fees — a grid is
+  profitable only AFTER fees (`sell > buy` alone proves nothing).  A SELL
+  exceeding the held position raises: shorting is structurally impossible
+  at the accounting layer.
+- Restart reconstruction: a fresh process replays the ledger's fill rows
+  in order and reproduces the exact pre-restart state
+  (`CycleEconomics.replay`).  Partial-then-cancel keeps the executed
+  portion; the unfilled remainder releases only on the authoritative
+  terminal state.
+- Fees use the repo-wide conservative fallback maker rate applied to
+  executed notional; per-trade commissions (get_my_trades) are a future
+  refinement that must only ever REPLACE the estimate with authoritative
+  data.
+
+## Bounded testnet validation
+
+`python scripts/testnet_cycle_check.py --validate --cycles 60 --symbol SOLUSDT`
+(requires `TESTNET_ORDERS_ENABLED=true`): bounded cycles (hard cap 100),
+Risk-Engine vetoes recorded and skipped safely (orders are never forced),
+every order tracked + reconciled, and the final report includes cycles,
+orders created / filled / partially filled / canceled / UNKNOWN-PENDING,
+theoretical + executable net, realized PnL, fees, and the fail-closed
+zero-open-order cleanup proof.
+
+---
+
 # 🗂️ Struktur project
 
 ```text

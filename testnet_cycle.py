@@ -62,8 +62,17 @@ from binance_testnet import (
     BinanceTestnetError,
     BinanceTestnetNetworkError,
 )
+from economics import (
+    CycleEconomics,
+    EconomicsError,
+    FillRecord,
+    PRICE_SOURCE_AUTHORITATIVE,
+    average_execution_price,
+    estimate_fill_fee,
+)
 from indicators import enrich, latest_valid_row
 from market_data import fetch_klines
+from profit_model import net_pct_from_step
 from range_engine import auto_range
 from grid_engine import build_geometric_grid
 from rest_reconciler import CancelVerdict, Outcome, RestReconciler
@@ -274,6 +283,17 @@ _SCHEMA = (
     " detail TEXT NOT NULL DEFAULT '',"
     " created_at_ms INTEGER NOT NULL,"
     " updated_at_ms INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS cycle_fills ("
+    " fill_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " client_order_id TEXT NOT NULL,"
+    " symbol TEXT NOT NULL,"
+    " side TEXT NOT NULL,"
+    " price TEXT NOT NULL,"
+    " quantity TEXT NOT NULL,"
+    " fee_quote TEXT NOT NULL,"
+    " source TEXT NOT NULL,"
+    " at_ms INTEGER NOT NULL,"
+    " UNIQUE(client_order_id, quantity, price, source))",
     "CREATE TABLE IF NOT EXISTS cycle_events ("
     " event_id INTEGER PRIMARY KEY AUTOINCREMENT,"
     " run_id INTEGER NOT NULL,"
@@ -303,6 +323,17 @@ class CycleLedger:
         for stmt in _SCHEMA:
             self._conn.execute(stmt)
         self._conn.commit()
+        self._ensure_column("cycle_orders", "cum_quote",
+                            "TEXT NOT NULL DEFAULT '0'")
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        """Additive schema extension (never destroys or migrates state)."""
+        cols = [r[1] for r in self._conn.execute(
+            f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols:
+            self._conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -400,7 +431,7 @@ class CycleLedger:
     def get_order(self, client_order_id: str) -> Optional[dict]:
         row = self._conn.execute(
             "SELECT client_order_id, run_id, cycle_id, symbol, side, price,"
-            " quantity, state, exchange_order_id, fill_qty, detail"
+            " quantity, state, exchange_order_id, fill_qty, detail, cum_quote"
             " FROM cycle_orders WHERE client_order_id = ?",
             (client_order_id,)).fetchone()
         return self._order_row(row) if row else None
@@ -411,7 +442,7 @@ class CycleLedger:
         placeholders = ",".join("?" for _ in states)
         rows = self._conn.execute(
             "SELECT client_order_id, run_id, cycle_id, symbol, side, price,"
-            " quantity, state, exchange_order_id, fill_qty, detail"
+            " quantity, state, exchange_order_id, fill_qty, detail, cum_quote"
             f" FROM cycle_orders WHERE state IN ({placeholders})"
             " ORDER BY created_at_ms",
             tuple(states)).fetchall()
@@ -420,7 +451,7 @@ class CycleLedger:
     def all_orders(self) -> list[dict]:
         rows = self._conn.execute(
             "SELECT client_order_id, run_id, cycle_id, symbol, side, price,"
-            " quantity, state, exchange_order_id, fill_qty, detail"
+            " quantity, state, exchange_order_id, fill_qty, detail, cum_quote"
             " FROM cycle_orders ORDER BY created_at_ms").fetchall()
         return [self._order_row(r) for r in rows]
 
@@ -430,8 +461,40 @@ class CycleLedger:
             "client_order_id": row[0], "run_id": row[1], "cycle_id": row[2],
             "symbol": row[3], "side": row[4], "price": row[5],
             "quantity": row[6], "state": row[7], "exchange_order_id": row[8],
-            "fill_qty": row[9], "detail": row[10],
+            "fill_qty": row[9], "detail": row[10], "cum_quote": row[11],
         }
+
+    # -- fills / economics -------------------------------------------------------
+    def record_fill(self, record, symbol: str = "") -> bool:
+        """Append one fill row (idempotent on its replay key)."""
+        try:
+            self._conn.execute(
+                "INSERT INTO cycle_fills (client_order_id, symbol, side,"
+                " price, quantity, fee_quote, source, at_ms)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (record.client_order_id, symbol, record.side,
+                 str(record.price), str(record.qty), str(record.fee_quote),
+                 record.source, self._clock_ms()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        self._conn.commit()
+        return True
+
+    def all_fills(self) -> list:
+        from economics import FillRecord, PRICE_SOURCE_AUTHORITATIVE, \
+            PRICE_SOURCE_ESTIMATED
+        rows = self._conn.execute(
+            "SELECT client_order_id, side, price, quantity, fee_quote, source"
+            " FROM cycle_fills ORDER BY fill_id").fetchall()
+        records = []
+        for cid, side, price, qty, fee, source in rows:
+            if source not in (PRICE_SOURCE_AUTHORITATIVE, PRICE_SOURCE_ESTIMATED):
+                continue
+            records.append(FillRecord(
+                client_order_id=cid, side=side, price=Decimal(price),
+                qty=Decimal(qty), fee_quote=Decimal(fee), source=source))
+        return records
 
     # -- kill latch ------------------------------------------------------------
     def kill_active(self) -> Optional[dict]:
@@ -527,6 +590,11 @@ class TestnetCycleRunner:
             read_client, cancel_executor=executor, sleep=sleep
         )
         self.run_id: Optional[int] = None
+        # Round 9: inventory + realized PnL over authoritative fills.
+        # Restart reconstruction: the ledger's fill rows are the single
+        # source of truth; economics is rebuilt by replaying them in order.
+        self.economics = CycleEconomics.replay(
+            self.ledger.all_fills(), maker_rate=config.maker_fee)
 
     # -- helpers -------------------------------------------------------------
     def _event(self, cycle_id: int, kind: str, **payload) -> None:
@@ -660,6 +728,86 @@ class TestnetCycleRunner:
             reference = equity
         return equity, reference, gate
 
+    # -- fill / economics sync ---------------------------------------------------
+    def _sync_fill(self, pre_row: dict, payload: dict, cycle_id: int) -> None:
+        """Sync an authoritative executed-quantity DELTA into the ledger and
+        economics.
+
+        ``pre_row`` is the ledger row as captured BEFORE the authoritative
+        status update advanced ``fill_qty`` — the delta (payload executed −
+        recorded) is the only quantity ever applied; the requested quantity
+        is never assumed.  The delta's average execution price is exact when
+        cumulative quote data is available ((newCum − recordedCum)/deltaQty);
+        otherwise the limit price is used and the fill is explicitly
+        ESTIMATED.  Idempotent: a fill already persisted (crash between
+        insert and ledger update) is applied to economics exactly once.
+        """
+        if pre_row is None:
+            return
+        client_order_id = pre_row["client_order_id"]
+        recorded = Decimal(pre_row["fill_qty"] or "0")
+        executed_raw = payload.get("executedQty")
+        if executed_raw is None:
+            return
+        executed = Decimal(str(executed_raw))
+        if not executed.is_finite() or executed <= recorded:
+            return
+        delta_qty = executed - recorded
+        recorded_cum = Decimal(pre_row.get("cum_quote") or "0")
+        price = None
+        source = None
+        cum_quote = payload.get("cummulativeQuoteQty")
+        if cum_quote is not None:
+            cum = Decimal(str(cum_quote))
+            if cum.is_finite() and cum > recorded_cum and delta_qty > 0:
+                delta_notional = cum - recorded_cum
+                candidate = delta_notional / delta_qty
+                if candidate.is_finite() and candidate > 0:
+                    price, source = candidate, PRICE_SOURCE_AUTHORITATIVE
+        if price is None:
+            price, source = average_execution_price(
+                None, delta_qty, Decimal(str(payload.get("price", "0"))))
+        record = FillRecord(
+            client_order_id=client_order_id, side=pre_row["side"],
+            price=price, qty=delta_qty,
+            fee_quote=estimate_fill_fee(delta_qty, price,
+                                        self.config.maker_fee),
+            source=source)
+        inserted = self.ledger.record_fill(record, symbol=pre_row["symbol"])
+        if inserted:
+            self.economics.apply_fill(record)
+        if cum_quote is not None:
+            cum = Decimal(str(cum_quote))
+            if cum.is_finite():
+                self.ledger._conn.execute(
+                    "UPDATE cycle_orders SET cum_quote = ? "
+                    "WHERE client_order_id = ?",
+                    (str(cum), client_order_id))
+                self.ledger._conn.commit()
+        self._event(cycle_id, "fill_synced", client_order_id=client_order_id,
+                    delta_qty=str(delta_qty), price=str(price),
+                    source=source, fee=str(record.fee_quote))
+
+    def economics_summary(self) -> dict:
+        return self.economics.summary()
+
+    def validation_report(self) -> dict:
+        """Round 9 bounded-validation report block (orders + economics)."""
+        orders = self.ledger.all_orders()
+        counts: dict[str, int] = {}
+        for row in orders:
+            counts[row["state"]] = counts.get(row["state"], 0) + 1
+        return {
+            "orders_created": len(orders),
+            "orders_filled": counts.get(ORDER_FILLED, 0),
+            "orders_partially_filled": counts.get(ORDER_PARTIALLY_FILLED, 0),
+            "orders_canceled": counts.get(ORDER_CANCELED, 0),
+            "orders_rejected": counts.get(ORDER_REJECTED, 0),
+            "orders_unknown_pending": counts.get(ORDER_PENDING_RECONCILIATION, 0)
+            + counts.get(ORDER_SUBMITTED_UNKNOWN, 0),
+            "economics": self.economics.summary(),
+        }
+
     # -- reconciliation ----------------------------------------------------------
     def _apply_authoritative_status(self, order_row: dict, status: str,
                                     exchange_order_id, executed_qty: Decimal,
@@ -717,6 +865,9 @@ class TestnetCycleRunner:
             order_row, status, payload.get("orderId"),
             Decimal(str(payload.get("executedQty", "0"))),
             detail="recovered by resolve")
+        # sync the executed DELTA against the PRE-update row: the ledger
+        # fill_qty was already advanced by _apply_authoritative_status
+        self._sync_fill(order_row, payload, order_row["cycle_id"])
         self._event(order_row["cycle_id"], "resolved",
                     client_order_id=cid, status=status, state=state)
         return {"cid": cid, "state": state, "status": status}
@@ -753,10 +904,13 @@ class TestnetCycleRunner:
                 continue
             expected_remote = ("NEW" if row["state"] == ORDER_OPEN
                                else row["state"])
-            if remote_order.status == expected_remote:
-                # authoritative agreement; refresh fill qty
-                self.ledger.update_order(cid, fill_qty=remote_order.executed_qty)
+            if remote_order.status == expected_remote and \
+                    remote_order.executed_qty <= Decimal(row["fill_qty"] or "0"):
+                # authoritative agreement with no new execution
                 continue
+            # new execution visible in the snapshot, or status divergence:
+            # settle via the authoritative single-order query (it carries
+            # cummulativeQuoteQty for exact delta pricing)
             corrected.append(self.resolve_ledger_order(row))
         # An exchange-side order with our prefix that we never recorded is
         # an anomaly: record it, never invent local exposure.
@@ -873,6 +1027,16 @@ class TestnetCycleRunner:
             # continue: still run the risk stack for the record?  No — the
             # plan gate already vetoed; record and stop this cycle.
             return report
+        # Round 9: report BOTH nets — theoretical (raw grid step) and
+        # executable (worst cell after tick/step quantization, which is the
+        # gate; hard min 0.003, never rounded upward to pass).
+        report["plan_net"] = {
+            "theoretical": str(net_pct_from_step(
+                self.config.grid_step_pct, self.config.maker_fee,
+                self.config.maker_fee,
+                self.config.slippage_roundtrip_pct)),
+            "executable_min": str(plan.min_net_pct),
+        }
 
         # 5. full risk stack (authoritative veto).
         decision, equity, reference = self._risk_decision(
@@ -977,9 +1141,19 @@ class TestnetCycleRunner:
             row = self.ledger.get_order(cid)
             self.resolve_ledger_order(row)
             return
+        pre_row = self.ledger.get_order(cid)
         state = self._apply_authoritative_status(
-            self.ledger.get_order(cid), ack.status, ack.order_id,
+            pre_row, ack.status, ack.order_id,
             ack.executed_qty, detail="placement ack")
+        if ack.executed_qty > 0:
+            # immediate maker match at placement: sync the executed delta
+            # (ack carries no cumulative quote → price is ESTIMATED until
+            # the authoritative single-order query provides it)
+            self._sync_fill(pre_row, {
+                "executedQty": str(ack.executed_qty),
+                "cummulativeQuoteQty": None,
+                "price": str(ack.price),
+            }, cycle_id)
         self._event(cycle_id, "order_placed", client_order_id=cid,
                     exchange_order_id=ack.order_id, status=ack.status,
                     state=state)
@@ -1063,6 +1237,7 @@ class TestnetCycleRunner:
                 self.sleep(self.config.poll_interval_s)
         self.shutdown.complete()
         summary["cleanup"] = self.cleanup()
+        summary["economics"] = self.economics.summary()
         status = "COMPLETED" if summary["stopped_reason"] is None else "STOPPED"
         self.ledger.finish_run(self.run_id, status,
                                summary["stopped_reason"] or "")
@@ -1124,6 +1299,7 @@ class TestnetCycleRunner:
             "non_terminal": [o["client_order_id"] for o in orders
                              if not is_terminal(o["state"])],
             "events": self.ledger.events(self.run_id),
+            "economics": self.economics.summary(),
         }
 
 

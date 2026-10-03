@@ -100,8 +100,19 @@ def main() -> int:
     parser.add_argument("--db", default="./data/testnet_cycle.sqlite3")
     parser.add_argument("--cleanup-only", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="Round 9 bounded validation: run cycles then emit the "
+             "orders/economics report block (implies orders mode).",
+    )
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
+
+    if args.validate:
+        args.mode = "orders"
+        if args.cycles > 100:
+            print("CYCLE: FAIL reason=validate cycles hard cap is 100")
+            return 1
 
     try:
         if args.status:
@@ -123,8 +134,13 @@ def main() -> int:
         summary = runner.run(place_orders=place,
                              config_json=json.dumps(
                                  {"mode": args.mode}, sort_keys=True))
-        _emit(summary, args.as_json)
         cleanup = summary.get("cleanup") or {}
+        if args.validate:
+            summary["validation"] = runner.validation_report()
+            summary["validation"]["final_open_orders"] = not cleanup.get("ok")
+            summary["validation"]["cycles_run"] = len(
+                summary.get("cycles") or [])
+        _emit(summary, args.as_json)
         ok = summary.get("stopped_reason") is None and cleanup.get("ok")
         return 0 if ok else 1
     except (TestnetCycleConfigError, TestnetCycleError,

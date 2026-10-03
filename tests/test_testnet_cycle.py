@@ -696,6 +696,7 @@ def test_no_order_outside_range(tmp_path, monkeypatch):
     class _Plan:
         allowed = True
         reason = "ORDER_PLAN_PASS"
+        min_net_pct = Decimal("0.015")
         cells = (_Cell(0, Decimal("110.00"), Decimal("112.00"),
                        Decimal("0.25"), Decimal("0.018"), Decimal("0.015"),
                        True, ()),)

@@ -106,6 +106,17 @@
    (uniqueness holds only among open orders — verified live, code -2010
    rejection while open).  Duplicate prevention must therefore test against
    the open state, as `scripts/testnet_order_path_check.py` does.
+9. **Cycle-path fees are conservative estimates.**  `CycleEconomics` fees
+   use the config fallback maker rate applied to AUTHORITATIVE executed
+   notional (never omitted, never a discount guess).  Per-trade commissions
+   via `GET /api/v3/myTrades` would be exact; when added they must only
+   replace the estimate with authoritative data.  The paper engine's fee
+   handling is unchanged.
+10. **Cycle-path realized PnL accrues only from executed SELLs.**  The
+   bounded cycle places BUY legs only (it starts flat each run), so testnet
+   validation reports 0 realized PnL and 0 completed grids unless a sell
+   occurs; the PnL machinery itself is deterministic and fully tested
+   (profitable / below-min / zero / negative / partial-fill cases).
 
 ## Blocked decisions (require human authorization — NOT done)
 
