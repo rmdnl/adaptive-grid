@@ -267,9 +267,6 @@ def _install_runner_stubs(monkeypatch, tmp_path, *, features=None,
         monkeypatch.setattr(msm, "calculate_range_quality",
                             lambda features, cfg: SimpleNamespace(
                                 score=Decimal("80")))
-        import grid_eligibility
-        monkeypatch.setattr(grid_eligibility, "evaluate_grid_eligibility",
-                            lambda **kwargs: None)
     return cfg
 
 
@@ -648,7 +645,11 @@ def test_run_once_isolates_per_symbol_failures(monkeypatch, tmp_path):
     def fake_symbol_info(client, symbol):
         if symbol == "BTCUSDT":
             calls["btc"] += 1
-            raise RuntimeError("no exchangeInfo for BTCUSDT (simulated)")
+            # First call: the GLOBAL risk evaluation (succeeds). Later calls:
+            # the per-symbol cycle (fails — isolated per symbol).
+            if calls["btc"] > 1:
+                raise RuntimeError("no exchangeInfo for BTCUSDT (simulated)")
+            return _symbol_info()
         return _symbol_info()
 
     monkeypatch.setattr(msm, "fetch_symbol_info", fake_symbol_info)
@@ -658,7 +659,7 @@ def test_run_once_isolates_per_symbol_failures(monkeypatch, tmp_path):
                              cfg["_parsed_symbols"], ShutdownCoordinator())
 
     assert exit_code == 0
-    assert calls["btc"] == 1  # attempted exactly once, isolated failure
+    assert calls["btc"] == 2  # global evaluation + isolated cycle failure
     # The surviving symbol produced per-symbol state.
     eth_db = msm._symbol_db_path(cfg["logging"]["sqlite_path"], "ETHUSDT")
     assert get_state(eth_db, "last_risk_decision") is not None

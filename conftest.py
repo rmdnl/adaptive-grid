@@ -36,7 +36,7 @@ def _testnet_env_and_default_15m_close(monkeypatch):
        the network, so a deterministic dummy pair is set here; ``load_dotenv``
        does not override already-present environment variables, so the local
        developer .env can never leak real credentials into the suite.
-    2. ``main``/``multi_symbol_main`` fetch the latest CLOSED 15m candle
+    2. ``multi_symbol_main`` fetch the latest CLOSED 15m candle
        close for the dedicated lower-boundary gate.  The default stub returns
        a safe high value so production-path tests exercise the normal pass
        branch without network access; tests that specifically pin 15m-gate
@@ -46,14 +46,6 @@ def _testnet_env_and_default_15m_close(monkeypatch):
     monkeypatch.setenv("BINANCE_TESTNET_API_KEY", "test-api-key")
     monkeypatch.setenv("BINANCE_TESTNET_API_SECRET", "test-api-secret")
     safe_close = Decimal("999999")
-    try:
-        import main
-    except ImportError:
-        pass
-    else:
-        monkeypatch.setattr(
-            main, "fetch_15m_closed_close",
-            lambda client, symbol: safe_close, raising=False)
     try:
         import multi_symbol_main
     except ImportError:

@@ -134,32 +134,22 @@ def build_grid(
     )
 
 
-def calculate_dynamic_step_pct(
-    atr_pct: Decimal,
-    min_gross_profit_pct: Decimal,
-    maker_fee: Decimal,
-    taker_fee: Decimal,
-    slippage_roundtrip_pct: Decimal,
-) -> Decimal:
-    """Calculate dynamic grid step based on 1x ATR(14) percentage.
-    
-    The grid step is set to max(ATR%, min_gross_profit_pct) to ensure:
-    - Grid spacing adapts to market volatility
-    - Minimum gross profit per grid is maintained (0.5% default)
-    
-    Args:
-        atr_pct: ATR as percentage of price (atr / close)
-        min_gross_profit_pct: Minimum gross profit per grid (0.005 = 0.5%)
-        maker_fee: Maker fee rate
-        taker_fee: Taker fee rate
-        slippage_roundtrip_pct: Round-trip slippage estimate
-    
-    Returns:
-        Dynamic step percentage as Decimal
+def atr_grid_step_pct(atr_pct: Decimal, multiplier: Decimal = Decimal("1.0")) -> Decimal:
+    """Locked grid step = GRID_STEP_ATR_MULTIPLIER x ATR(14) of price.
+
+    The multiplier defaults to 1.0 (locked specification).  The locked
+    specification forbids substituting a fixed percentage step and forbids
+    silently capping ATR: when the ATR step produces an economically invalid
+    grid (gross < 0.5% or executable net < 0.3%), the callers must BLOCK the
+    grid and record the reason — never widen it artificially.
+
+    Fail-closed: a non-finite or non-positive ATR raises ValueError so the
+    caller blocks with an explicit reason instead of deploying a bogus grid.
     """
-    # Use 1x ATR as base step, but enforce minimum for profit viability
-    step = max(atr_pct, min_gross_profit_pct)
-    return step
+    value = D(atr_pct) * D(multiplier)
+    if not value.is_finite() or value <= 0:
+        raise ValueError(f"ATR percentage is invalid: {atr_pct!r}")
+    return value
 
 
 def validate_grid_profit(

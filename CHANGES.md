@@ -5,6 +5,70 @@ in DRY_RUN / paper mode. Live trading is not implemented and must not be
 enabled without explicit authorization. All changes below preserve that
 invariant.
 
+## Release line: v5.0.0 (strategy replacement — locked multi-symbol spec)
+
+### Milestone: the NEW strategy is the ONLY authoritative trading strategy
+- **Entry (the ONLY mandatory filters, AND logic)**: `ADX(14) < 25 AND
+  RSI(14) < 40 AND Bollinger %B <= 0` — all from CLOSED candles on the
+  configured indicator timeframe (default 1h).  The Volume Oscillator is
+  diagnostics only and NEVER gates entry; the previous ADX<20 / RSI<35 /
+  VO>0 logic and the "RSI OR %B" alternative trigger are REMOVED.
+- **Exit (OR logic, at-or-beyond the threshold)**: `RSI >= 70 OR
+  ADX >= 25 OR %B >= 1 OR |Z-Score(20)| >= 2.5` (either Z extreme triggers
+  the same emergency exit).  Boundary behavior pinned by tests: RSI 70.00 →
+  EXIT, ADX 25.00 → EXIT, %B 1.00 → EXIT, Z ±2.5 → EXIT; entry boundaries
+  strict (ADX 25.00 → FAIL, RSI 40.00 → FAIL, %B 0.01 → FAIL, %B 0.00 →
+  PASS).
+- **INSUFFICIENT_DATA**: missing/NaN indicators yield an explicit
+  INSUFFICIENT_DATA signal (no trade, no silent defaults).
+- **Grid step = GRID_STEP_ATR_MULTIPLIER × ATR(14)** (default 1.0): the
+  fixed 0.5% floor is REMOVED — `grid_engine.atr_grid_step_pct` is pure
+  ATR, an invalid ATR fails closed, and the 0.5% gross minimum is now a
+  GATE (`GRID_GROSS_BELOW_MIN`) that BLOCKS low-volatility grids with a
+  recorded reason instead of widening the step.  Executable/quantized net
+  ≥ 0.30% remains the authoritative economics gate.
+- **Old strategy removed (hard requirement)**: `main.py` (single-symbol
+  legacy path), the old market-intelligence eligibility gate
+  (`grid_eligibility.py`), the strategy-specific `market_filter` gate and
+  config section, and the old validation replay harness are deleted with
+  their dedicated tests; `runtime.py` remains as shared orchestration
+  infrastructure only (GridRuntime) and can no longer run a strategy.
+  Regression tests (`tests/test_strategy_replacement.py`) prove the old
+  signal paths cannot generate orders.
+- **Global account risk (2%, non-negotiable)**: `global_risk.py` computes
+  shared global equity (USDT + Σ base×price across ALL symbols) once per
+  pass; the reference equity is a persistent high-water-mark in the base
+  DB (never auto-reset, audited); drawdown ≥ 2.00% latches the GLOBAL kill
+  (boundary tests: 1.99% no kill / 2.00% kill / 2.01% kill), which
+  propagates to EVERY symbol (cancel + latch, no automatic release);
+  unknown equity with an existing reference FAILS CLOSED.
+- **Per-symbol strategy state machine** (`strategy_state.py`): the ten
+  locked states (WAITING_FOR_ENTRY … ERROR) with a validated transition
+  table — invalid transitions are rejected and reported; state persists in
+  each symbol's database and survives restart.
+- **Exit/signal persistence**: `last_exit_signal` (symbol, timestamp,
+  reasons, indicator values, thresholds, price, cancel/liquidation result)
+  and `last_signal` (ADX/RSI/%B/VO/Z/ATR + entry/exit decisions + cooldown)
+  persisted per symbol every cycle.
+- **Configuration from `.env`** (operator-facing source of truth,
+  config.yaml as documented fallback): PAIR_LIST, INDICATOR_TIMEFRAME=1h,
+  ADX/RSI/BB/Z/ATR/VO periods, ADX_ENTRY_MAX=25, RSI_ENTRY_MAX=40,
+  BB_ENTRY_MAX_PERCENT_B=0, ADX_EXIT_MIN=25, RSI_EXIT_MIN=70,
+  BB_EXIT_MIN_PERCENT_B=1, ZSCORE_ABS_EXIT=2.5, GRID_STEP_ATR_MULTIPLIER=1.0,
+  GRID_GROSS_MIN=0.005, MIN_NET_PROFIT_PER_GRID=0.003, COOLDOWN_HOURS=3,
+  MAX_DRAWDOWN_PERCENT=2, STOP_IF_BELOW_LOWER_PERCENT=2.
+- **Dashboard**: per-symbol indicator snapshot (ADX, RSI, %B, Z, ATR%),
+  strategy state, entry signal, last exit reason, cooldown end time —
+  always from real persisted state; global aggregates unchanged; still
+  read-only, public, unauthenticated, separate process.
+- **Volume Oscillator formula** corrected to the locked definition:
+  `(SMA(volume,5) / SMA(volume,10)) − 1`.
+- Tests: `tests/test_strategy.py` (rewritten, boundary table + VO-no-
+  influence), `tests/test_global_risk.py` (boundaries + propagation),
+  `tests/test_strategy_state.py` (transition validation, persistence),
+  `tests/test_strategy_replacement.py` (old strategy cannot trade);
+  no backtest implemented (not part of this task).
+
 ## Release line: v4.1.1 (multi-symbol dashboard repair)
 
 ### Milestone: dashboard adapted to the multi-symbol architecture

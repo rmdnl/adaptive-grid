@@ -53,11 +53,13 @@ from execution_bridge import (
 from fee_model import effective_fees
 from grid_engine import (
     GridMode,
+    atr_grid_step_pct,
     build_grid,
-    calculate_dynamic_step_pct,
     validate_grid_profit,
 )
 from grid_lifecycle import LifecycleManager
+from global_risk import evaluate as global_risk_evaluate
+from global_risk import is_killed as global_risk_killed
 from grid_planner import ActivePlan
 from indicators import enrich, latest_valid_row
 from market_data import (
@@ -93,7 +95,6 @@ from risk_engine import (
     equity_reference_gate,
     inventory_gate,
     lower_boundary_15m_kill,
-    market_gate,
     open_orders_available_gate,
     open_orders_gate,
     profit_gate,
@@ -103,6 +104,7 @@ from risk_engine import (
 from runstate import persist_run_state, verify_restart_safety
 from runtime import GridRuntime, RuntimeConfigError, load_runtime_config
 from shutdown import ShutdownCoordinator
+from strategy_state import StrategyState, StrategyStateTracker
 from storage import (
     get_kill_state,
     get_paper_account_state,
@@ -114,7 +116,7 @@ from storage import (
     set_state,
 )
 from symbol_rules import parse_symbol_info, validate_quantized_order_plan
-from strategy import evaluate_strategy
+from strategy import calculate_percent_b, evaluate_strategy
 
 #: Risk-gate reasons that latch the permanent kill state.  The strategy
 #: auto-exit deliberately is NOT in this set: it cancels + liquidates and
@@ -259,6 +261,8 @@ class SymbolCycleRunner:
         logger: logging.Logger,
         shutdown: ShutdownCoordinator,
         bridge: TestnetExecutionBridge | None = None,
+        global_db_path: str | None = None,
+        global_risk_allowed: bool = True,
     ):
         self.symbol = symbol
         self.cfg = cfg
@@ -267,6 +271,9 @@ class SymbolCycleRunner:
         self.logger = logger
         self.shutdown = shutdown
         self.bridge = bridge
+        self.global_db_path = global_db_path
+        self.global_risk_allowed = global_risk_allowed
+        self.state_tracker = StrategyStateTracker(db_path)
         init_db(db_path)
 
     # -- config accessors ----------------------------------------------------
@@ -311,10 +318,25 @@ class SymbolCycleRunner:
             self._run_cycle_inner(result)
         except Exception as exc:
             self.logger.exception("CYCLE ERROR for %s", self.symbol)
+            self.state_tracker.transition(
+                StrategyState.ERROR, f"cycle exception: {exc}")
             result["success"] = False
             result["status"] = "ERROR"
             result["error"] = str(exc)
         return result
+
+    def _transition_state(self, target: StrategyState, reason: str) -> None:
+        report = self.state_tracker.transition(target, reason)
+        result_state = self.state_tracker.current()
+        set_state(self.db_path, "last_strategy_state",
+                  {"state": result_state.value, "reason": reason,
+                   "transition_applied": report["applied"],
+                   "transition_rejected": report["rejected"],
+                   "from_state": report["from"], "to_state": report["to"]})
+        if report["rejected"]:
+            self.logger.warning(
+                "STRATEGY STATE transition rejected for %s: %s -> %s (%s)",
+                self.symbol, report["from"], report["to"], reason)
 
     def _run_cycle_inner(self, result: dict[str, Any]) -> None:
         cfg = self.cfg
@@ -330,11 +352,52 @@ class SymbolCycleRunner:
             record_risk_event(db_path, False, "RESTART_RECONCILIATION_REFUSED",
                               {"symbol": self.symbol,
                                "recovery_errors": restart["recovery_errors"]})
+            self._transition_state(StrategyState.BLOCKED,
+                                   "RESTART_RECONCILIATION_REFUSED")
             result["status"] = "RESTART_REFUSED"
             result["combined_reason"] = "RESTART_RECONCILIATION_REFUSED"
             self.logger.error(
                 "RESTART REFUSED for %s: paper-state reconciliation failed; "
                 "fix or reconcile, then re-run", self.symbol)
+            return
+
+        # GLOBAL risk has priority over everything (locked spec section 25).
+        if not self.global_risk_allowed:
+            global_kill = (
+                self.global_db_path is not None
+                and global_risk_killed(self.global_db_path))
+            if global_kill:
+                # Propagate: latch the per-symbol kill and cancel its orders.
+                report = _activate_kill_state(
+                    db_path, cfg, rules, "GLOBAL_EQUITY_DRAWDOWN_KILL",
+                    note="global kill propagation",
+                )
+                bridge_cancels = (
+                    self.bridge.cancel_all_open("global_kill")
+                    if self.bridge is not None else None
+                )
+                record_risk_event(db_path, False, "GLOBAL_KILL", {
+                    "symbol": self.symbol,
+                    "cancel_status": report.overall_status,
+                    "pending_orders": report.pending,
+                    "bridge_cancels": bridge_cancels,
+                })
+                self._transition_state(StrategyState.BLOCKED, "GLOBAL_KILL")
+                result["status"] = "KILL_ACTIVE"
+                result["combined_reason"] = "GLOBAL_KILL"
+                result["pending_cancels"] = int(report.pending)
+                self.logger.warning(
+                    "GLOBAL_KILL active for %s (cancel_status=%s pending=%s)",
+                    self.symbol, report.overall_status, report.pending)
+                return
+            # Unknown global drawdown (fail-closed, section 17).
+            self._transition_state(StrategyState.BLOCKED,
+                                   "GLOBAL_RISK_UNAVAILABLE")
+            result["status"] = "RISK_BLOCKED"
+            result["combined_reason"] = "GLOBAL_RISK_UNAVAILABLE"
+            self.logger.warning(
+                "GLOBAL RISK UNAVAILABLE for %s: drawdown unknown — "
+                "trading blocked (fail closed)", self.symbol)
             return
 
         kill_prior = get_kill_state(db_path)
@@ -361,6 +424,7 @@ class SymbolCycleRunner:
                 "bridge_cancels": bridge_cancels,
                 "note": "restart recovery: kill state remains active",
             })
+            self._transition_state(StrategyState.BLOCKED, "KILL_STATE_ACTIVE")
             result["status"] = "KILL_ACTIVE"
             result["combined_reason"] = "KILL_STATE_ACTIVE"
             result["pending_cancels"] = int(report.pending)
@@ -425,14 +489,19 @@ class SymbolCycleRunner:
                 "price": str(current_price),
                 "range": [str(lower), str(upper)],
             })
+            self._transition_state(
+                StrategyState.BLOCKED, f"RANGE:{range_reason}")
             result["status"] = "RANGE_BLOCKED"
             result["combined_reason"] = f"RANGE:{range_reason}"
             self.logger.info("RANGE BLOCKED for %s: %s (range=%s..%s)",
                              self.symbol, range_reason, lower, upper)
             return
 
-        # -- market intelligence (diagnostics + planner inputs) -----------------
-        mi_decision = None
+        # -- market features / indicators (planner inputs; no strategy gating) ---
+        # The indicator layer supplies ADX/RSI/%B/VolOsc/Z for the strategy
+        # decision below.  The legacy market-intelligence eligibility gate was
+        # removed with the old strategy: entry/exit is decided exclusively by
+        # the locked indicator rules in strategy.py.
         regime = MarketRegime.RANGE
         range_quality_score = Decimal("80")
         features = None
@@ -445,14 +514,8 @@ class SymbolCycleRunner:
                 regime, _ = classify_market_regime(features, cfg)
                 quality_res = calculate_range_quality(features, cfg)
                 range_quality_score = quality_res.score
-                from grid_eligibility import evaluate_grid_eligibility
-                mi_decision = evaluate_grid_eligibility(
-                    features=features, regime=regime,
-                    range_quality=quality_res, current_price=current_price,
-                    lower_price=lower, upper_price=upper, config=cfg,
-                )
             except Exception as exc:
-                self.logger.warning("MARKET INTELLIGENCE ERROR for %s: %s",
+                self.logger.warning("MARKET FEATURES ERROR for %s: %s",
                                     self.symbol, exc)
                 features = None
 
@@ -512,8 +575,49 @@ class SymbolCycleRunner:
                 "reasons": ["MARKET_FEATURES_UNAVAILABLE"],
             }
 
+        # Persist the per-symbol signal snapshot (dashboard + audit):
+        # indicator values, entry/exit decisions, cooldown, timeframe.
+        def _ind(value):
+            return str(value) if value is not None else None
+
+        signal_snapshot = {
+            "symbol": self.symbol,
+            "timeframe": cfg["timeframe"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "indicators": {
+                "rsi": _ind(features.rsi) if features is not None else None,
+                "adx": _ind(features.adx) if features is not None else None,
+                "percent_b": (
+                    str(calculate_percent_b(
+                        features.close_price, features.bb_upper,
+                        features.bb_lower, features.bb_middle))
+                    if features is not None else None),
+                "volume_oscillator": (
+                    _ind(features.volume_oscillator)
+                    if features is not None else None),
+                "z_score": _ind(features.z_score) if features is not None else None,
+                "atr_pct": _ind(features.atr_pct) if features is not None else None,
+            },
+            "entry_signal": (
+                {"signal": entry_decision.signal.value,
+                 "allowed": entry_decision.allowed,
+                 "reasons": list(entry_decision.reasons)}
+                if entry_decision is not None else None),
+            "exit_signal": (
+                {"signal": exit_decision.signal.value,
+                 "should_exit": exit_decision.should_exit,
+                 "triggered_reasons": list(exit_decision.triggered_reasons)}
+                if exit_decision is not None else None),
+            "in_cooldown": in_cooldown,
+            "has_active_grid": has_active_grid,
+        }
+        set_state(db_path, "last_signal", signal_snapshot)
+
         # -- strategy auto-exit: cancel all + liquidate + cooldown ----------------
         if exit_decision is not None and exit_decision.should_exit:
+            self._transition_state(
+                StrategyState.EXIT_SIGNAL,
+                " | ".join(exit_decision.triggered_reasons))
             self._execute_strategy_exit(exit_decision, current_price, rules,
                                         result)
             return
@@ -523,6 +627,8 @@ class SymbolCycleRunner:
             if features is None:
                 set_state(db_path, "last_risk_decision",
                           {"allowed": False, "reason": "ENTRY_BLOCKED"})
+                self._transition_state(StrategyState.BLOCKED,
+                                       "MARKET_FEATURES_UNAVAILABLE")
                 result["status"] = "ENTRY_BLOCKED"
                 result["combined_reason"] = "MARKET_FEATURES_UNAVAILABLE"
                 self.logger.info(
@@ -541,6 +647,11 @@ class SymbolCycleRunner:
                     "ENTRY_COOLDOWN" if result["status"] == "ENTRY_COOLDOWN"
                     else " | ".join(entry_decision.reasons)
                 )
+                self._transition_state(
+                    StrategyState.COOLDOWN
+                    if result["status"] == "ENTRY_COOLDOWN"
+                    else StrategyState.WAITING_FOR_ENTRY,
+                    result["combined_reason"][:200])
                 self.logger.info("AUTO-ENTRY BLOCKED for %s: %s", self.symbol,
                                  result["combined_reason"])
                 return
@@ -575,14 +686,29 @@ class SymbolCycleRunner:
             cfg["fees"]["taker_fee_fallback"],
         )
 
-        atr_pct = Decimal(str(last.get("atr_pct", "0.01")))
-        dynamic_step = calculate_dynamic_step_pct(
-            atr_pct,
-            self._get_min_gross_profit(),
-            fees.maker,
-            fees.taker,
-            Decimal(str(cfg["fees"]["slippage_roundtrip_pct"])),
-        )
+        # Locked grid step = GRID_STEP_ATR_MULTIPLIER x ATR(14) — no fixed
+        # floor, no silent cap.  An invalid ATR fails closed (explicit block).
+        # Prefer the features-path ATR (honors the configured periods); the
+        # enrich-path ATR (period 14) is the fallback.
+        if features is not None and features.atr_pct is not None:
+            atr_pct = Decimal(str(features.atr_pct))
+        else:
+            atr_pct = Decimal(str(last.get("atr_pct", "0.01")))
+        atr_multiplier = Decimal(str(cfg["grid"].get("atr_multiplier", "1.0")))
+        try:
+            dynamic_step = atr_grid_step_pct(atr_pct, atr_multiplier)
+        except ValueError as exc:
+            set_state(db_path, "last_risk_decision",
+                      {"allowed": False, "reason": f"GRID:{exc}"})
+            record_risk_event(db_path, False, "GRID_ATR_INVALID", {
+                "symbol": self.symbol, "atr_pct": str(atr_pct),
+                "reason": str(exc),
+            })
+            self._transition_state(StrategyState.BLOCKED, f"GRID:{exc}")
+            result["status"] = "RISK_BLOCKED"
+            result["combined_reason"] = f"GRID:{exc}"
+            self.logger.warning("GRID BLOCKED for %s: %s", self.symbol, exc)
+            return
         result["dynamic_step_pct"] = str(dynamic_step)
 
         grid_mode = self._get_grid_mode()
@@ -593,6 +719,15 @@ class SymbolCycleRunner:
         )
         result["range"] = [str(lower), str(grid_result.effective_upper)]
         result["grid_cells"] = int(grid_result.cells)
+
+        # Gross economics gate: every adjacent spacing must clear the
+        # configured minimum GROSS profit (0.5%).  With a pure-ATR step this
+        # is what BLOCKS low-volatility grids (recorded, never widened).
+        min_spacing = min(
+            (b.price / a.price) - Decimal("1")
+            for a, b in zip(grid_result.levels[:-1], grid_result.levels[1:])
+        )
+        gross_ok = min_spacing >= self._get_min_gross_profit()
 
         sell_fee = fees.maker if cfg["execution"]["prefer_limit_maker"] else fees.taker
         pre_quant_validation = validate_grid_profit(
@@ -612,13 +747,15 @@ class SymbolCycleRunner:
         )
 
         # -- risk gates ---------------------------------------------------------------
+        # NOTE: the legacy market_filter gate (ADX/ATR/BB-width/volume-spike
+        # caps) was removed with the old strategy.  Entry is decided solely by
+        # the locked indicator rules; safety is enforced by the gates below.
         close_15m = fetch_15m_closed_close(self.client, self.symbol)
         decisions = [
             profit_gate(
                 plan_validation.min_net_pct,
                 self._get_hard_min_net(),
             ),
-            market_gate(last, cfg["market_filter"]),
             strict_order_price_gate(lower, grid_result.effective_upper, current_price),
             range_break_kill(lower, grid_result.effective_upper, current_price,
                              cfg["risk"]["range_break_buffer_pct"]),
@@ -640,6 +777,8 @@ class SymbolCycleRunner:
         if not plan_validation.allowed:
             decisions.append(RiskDecision(
                 False, (f"PLAN_VALIDATION:{plan_validation.reason}",)))
+        if not gross_ok:
+            decisions.append(RiskDecision(False, ("GRID_GROSS_BELOW_MIN",)))
         if account_risk is not None:
             decisions.extend([
                 equity_dd_kill(account_risk.drawdown_pct,
@@ -701,6 +840,8 @@ class SymbolCycleRunner:
                 "pending_orders": report.pending,
                 "bridge_cancels": bridge_cancels,
             })
+            self._transition_state(StrategyState.BLOCKED,
+                                   " | ".join(kill_triggers))
             result["status"] = "KILL_TRIGGERED"
             result["kill_triggered"] = True
             result["combined_reason"] = combined.reason
@@ -727,18 +868,29 @@ class SymbolCycleRunner:
             "min_net_pct": str(plan_validation.min_net_pct),
             "pre_quant_min_net_pct": str(pre_quant_validation.min_net_pct),
             "pre_quant_allowed": pre_quant_validation.allowed,
+            "min_spacing_pct": str(min_spacing),
+            "gross_ok": gross_ok,
             "bridge_reconcile": bridge_reconcile,
             "unknown_remote": unknown_remote,
-            "mi_eligibility": (
-                mi_decision.status.value if mi_decision is not None else None
-            ),
         })
 
         result["combined_allowed"] = bool(combined.allowed)
         result["combined_reason"] = combined.reason
         if not combined.allowed:
-            result["status"] = "RISK_BLOCKED"
+            # With an active grid the plan keeps running (fills/cancels are
+            # still managed); only NEW deployment is blocked.
+            self._transition_state(
+                StrategyState.GRID_ACTIVE if has_active_grid
+                else StrategyState.BLOCKED,
+                combined.reason)
+            result["status"] = "RISK_BLOCKED" if not has_active_grid                 else "GRID_ACTIVE"
             return
+        if has_active_grid:
+            self._transition_state(StrategyState.GRID_ACTIVE,
+                                   "grid active, no exit signal")
+        else:
+            self._transition_state(StrategyState.ENTRY_SIGNAL,
+                                   "entry conditions met")
 
         # -- paper cycle (dry-run only, idempotent per cycle index) ----------------------
         if not self.shutdown.is_requested:
@@ -759,6 +911,8 @@ class SymbolCycleRunner:
                 Decimal(str(cfg["paper"]["taker_fee"])),
                 str(cfg["paper"]["fee_asset"]),
             )
+            self._transition_state(StrategyState.DEPLOYING_GRID,
+                                   "deploying risk-vetted grid")
             session = PaperSession(db_path, db_path, accounting,
                                    client_order_prefix=f"AG{self.symbol[:3]}")
             timeframe_seconds = int(
@@ -799,6 +953,12 @@ class SymbolCycleRunner:
                 self.logger.warning(
                     "PAPER CYCLE INCOMPLETE for %s: blocked=%s error=%s",
                     self.symbol, cycle_result.blocked_reason, cycle_result.error)
+                self._transition_state(
+                    StrategyState.BLOCKED,
+                    f"paper cycle blocked: {cycle_result.blocked_reason}")
+            else:
+                self._transition_state(StrategyState.GRID_ACTIVE,
+                                       "grid deployed (paper cycle ok)")
             # Bridge: mirror every risk-gated paper submission as a real
             # testnet LIMIT_MAKER order (no-op when the bridge is disabled).
             if self.bridge is not None and cycle_result.order_intents:
@@ -872,10 +1032,35 @@ class SymbolCycleRunner:
             and liquidation.get("liquidated") is False
             and not plan_closed
         )
+        # Persist the full exit signal (locked spec): indicator values,
+        # thresholds, exit reason, timestamp, symbol.
+        exit_signal = {
+            "symbol": self.symbol,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "triggered_reasons": list(exit_decision.triggered_reasons),
+            "indicators": {
+                "rsi": str(exit_decision.rsi),
+                "adx": str(exit_decision.adx),
+                "percent_b": str(exit_decision.percent_b),
+                "z_score": str(exit_decision.z_score),
+            },
+            "thresholds": {
+                "rsi_min": str(exit_decision.rsi_threshold),
+                "adx_min": str(exit_decision.adx_threshold),
+                "bb_percent_b_min": str(exit_decision.bb_threshold),
+                "zscore_threshold": str(exit_decision.zscore_threshold),
+            },
+            "price": str(current_price),
+            "cancel_status": cancel_report.overall_status,
+            "liquidation": liquidation,
+        }
+        set_state(self.db_path, "last_exit_signal", exit_signal)
         record_risk_event(self.db_path, False, "AUTO_EXIT_LIQUIDATION", {
             "symbol": self.symbol,
             "price": str(current_price),
             "triggered_reasons": list(exit_decision.triggered_reasons),
+            "indicators": exit_signal["indicators"],
+            "thresholds": exit_signal["thresholds"],
             "cancel_status": cancel_report.overall_status,
             "pending_cancels": int(cancel_report.pending),
             "liquidation": liquidation,
@@ -886,6 +1071,14 @@ class SymbolCycleRunner:
         set_state(self.db_path, "last_risk_decision",
                   {"allowed": False, "reason": "AUTO_EXIT_LIQUIDATION"})
 
+        self._transition_state(StrategyState.AUTO_EXIT,
+                               f"auto-exit: {reasons}")
+        self._transition_state(StrategyState.LIQUIDATING,
+                               "liquidating held base inventory")
+        cooldown_hours = int(self.cfg.get("strategy", {}).get("cooldown_hours", 3))
+        self._transition_state(
+            StrategyState.COOLDOWN,
+            f"cooldown {cooldown_hours}h started (symbol-specific)")
         result["status"] = "AUTO_EXIT"
         result["combined_reason"] = f"AUTO_EXIT: {reasons}"
         result["exit_reasons"] = list(exit_decision.triggered_reasons)
@@ -934,6 +1127,44 @@ def run_once(cfg, logger, client, symbols, shutdown,
     """
     base_db_path = cfg["logging"]["sqlite_path"]
     bridges = bridges or {}
+    # The base database carries the GLOBAL risk state (reference equity,
+    # global kill latch); ensure its schema exists.
+    init_db(base_db_path)
+
+    # -- GLOBAL account risk (locked spec section 17) -------------------------
+    # Shared equity = USDT total + sum(base totals x price) across ALL
+    # symbols; reference is a persistent high-water-mark in the base DB;
+    # drawdown >= 2% latches the GLOBAL kill.  Unknown equity with an
+    # existing reference FAILS CLOSED (blocks every symbol this pass).
+    global_risk_allowed = True
+    try:
+        equity_total = Decimal("0")
+        quote_total = None
+        for symbol in symbols:
+            info = fetch_symbol_info(client, symbol)
+            rules_s = parse_symbol_info(info)
+            snapshot = fetch_account_snapshot(
+                client, rules_s.base_asset, rules_s.quote_asset)
+            ticker = fetch_ticker_price(client, symbol)
+            if quote_total is None:
+                quote_total = snapshot.quote_total
+            equity_total += snapshot.base_total * ticker.price
+        if quote_total is not None:
+            equity_total += quote_total
+        global_eval = global_risk_evaluate(base_db_path, equity_total)
+    except Exception as exc:
+        logger.warning("GLOBAL RISK evaluation failed (%s); failing closed",
+                       type(exc).__name__)
+        global_eval = global_risk_evaluate(base_db_path, None)
+    global_risk_allowed = bool(global_eval.get("allowed"))
+    logger.info(
+        "DRAWDOWN_UPDATE symbol=GLOBAL allowed=%s equity=%s reference=%s "
+        "drawdown=%s reason=%s",
+        global_eval.get("allowed"), global_eval.get("equity"),
+        global_eval.get("reference"), global_eval.get("drawdown_pct"),
+        global_eval.get("reason"))
+    if global_eval.get("kill_triggered"):
+        logger.warning("GLOBAL_KILL triggered: %s", global_eval)
     logger.info(
         "=== Multi-Symbol Adaptive Grid pass started: mode=testnet "
         "dry_run=%s symbols=%s timeframe=%s testnet_execution=%s ===",
@@ -949,7 +1180,9 @@ def run_once(cfg, logger, client, symbols, shutdown,
         Path(symbol_db).parent.mkdir(parents=True, exist_ok=True)
 
         runner = SymbolCycleRunner(symbol, cfg, symbol_db, client, logger,
-                                   shutdown, bridge=bridges.get(symbol))
+                                   shutdown, bridge=bridges.get(symbol),
+                                   global_db_path=base_db_path,
+                                   global_risk_allowed=global_risk_allowed)
         result = runner.run_cycle()
         all_results.append(result)
 

@@ -13,12 +13,104 @@ class ConfigError(ValueError):
     pass
 
 
+def _env(key: str) -> str | None:
+    import os
+    value = os.getenv(key)
+    return value if value not in (None, "") else None
+
+
+def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Overlay .env strategy parameters onto the loaded config (env wins).
+
+    Locked specification keys: PAIR_LIST, INDICATOR_TIMEFRAME, the indicator
+    periods, entry/exit thresholds, the ATR multiplier, economics, cooldown,
+    and the risk limits.  config.yaml values are documented fallbacks; .env
+    is the operator-facing source of truth.
+    """
+    # Symbols: PAIR_LIST (PAIR/QUOTE form) takes precedence, then SYMBOLS.
+    pair_list = _env("PAIR_LIST")
+    if pair_list:
+        cfg["symbols"] = ",".join(
+            pair.strip().replace("/", "").upper()
+            for pair in pair_list.split(",") if pair.strip())
+    symbols_env = _env("SYMBOLS")
+    if symbols_env:
+        cfg["symbols"] = symbols_env
+
+    timeframe = _env("INDICATOR_TIMEFRAME")
+    if timeframe:
+        cfg["timeframe"] = str(timeframe).strip().lower()
+
+    mi = cfg.setdefault("market_intelligence", {})
+    for env_key, cfg_key, cast in (
+        ("ADX_PERIOD", "adx_period", int),
+        ("ATR_PERIOD", "atr_period", int),
+        ("BB_PERIOD", "bb_length", int),
+        ("VO_FAST", "volume_osc_fast", int),
+        ("VO_SLOW", "volume_osc_slow", int),
+    ):
+        value = _env(env_key)
+        if value is not None:
+            mi[cfg_key] = cast(value)
+    bb_std = _env("BB_STDDEV")
+    if bb_std is not None:
+        mi["bb_std_mult"] = float(bb_std)
+
+    strategy = cfg.setdefault("strategy", {})
+    entry = strategy.setdefault("entry", {})
+    for env_key, cfg_key in (
+        ("ADX_ENTRY_MAX", "adx_max"),
+        ("RSI_ENTRY_MAX", "rsi_max"),
+        ("BB_ENTRY_MAX_PERCENT_B", "bb_percent_b_max"),
+        ("VOLUME_OSCILLATOR_MIN", "volume_oscillator_min"),
+    ):
+        value = _env(env_key)
+        if value is not None:
+            entry[cfg_key] = value  # validated as Decimal downstream
+    exit_cfg = strategy.setdefault("exit", {})
+    for env_key, cfg_key in (
+        ("ADX_EXIT_MIN", "adx_min"),
+        ("RSI_EXIT_MIN", "rsi_min"),
+        ("BB_EXIT_MIN_PERCENT_B", "bb_percent_b_min"),
+        ("ZSCORE_ABS_EXIT", "zscore_threshold"),
+    ):
+        value = _env(env_key)
+        if value is not None:
+            exit_cfg[cfg_key] = value
+    cooldown = _env("COOLDOWN_HOURS")
+    if cooldown is not None:
+        strategy["cooldown_hours"] = cooldown
+
+    grid = cfg.setdefault("grid", {})
+    atr_mult = _env("GRID_STEP_ATR_MULTIPLIER")
+    if atr_mult is not None:
+        grid["atr_multiplier"] = atr_mult
+    gross_min = _env("GRID_GROSS_MIN")
+    if gross_min is not None:
+        grid["min_gross_profit_pct"] = gross_min
+    net_min = _env("MIN_NET_PROFIT_PER_GRID")
+    if net_min is not None:
+        grid["hard_min_net_pct"] = net_min
+
+    risk = cfg.setdefault("risk", {})
+    max_dd = _env("MAX_DRAWDOWN_PERCENT")
+    if max_dd is not None:
+        # Percent form (2 => 0.02)
+        risk["max_equity_drawdown_pct"] = str(float(max_dd) / 100.0)
+    stop_below = _env("STOP_IF_BELOW_LOWER_PERCENT")
+    if stop_below is not None:
+        risk["stop_if_below_lower_pct"] = str(float(stop_below) / 100.0)
+
+    return cfg
+
+
 def load_config(path: str = "config.yaml") -> dict[str, Any]:
     p = Path(path)
     if not p.exists():
         raise ConfigError(f"Config file not found: {p}")
     with p.open("r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
+    apply_env_overrides(cfg)
     validate_config(cfg)
     return cfg
 
@@ -174,11 +266,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
         if lo <= 0 or hi <= lo:
             raise ConfigError("Manual range requires 0 < lower_price < upper_price")
 
-    # Strategy validation
+    # Strategy validation (thresholds come from .env overrides applied in
+    # apply_env_overrides before validation).
     strategy = cfg.get("strategy", {})
     entry = strategy.get("entry", {})
     exit_cfg = strategy.get("exit", {})
-    for key in ("adx_max", "rsi_max", "bb_percent_b_max", "volume_oscillator_min"):
+    for key in ("adx_max", "rsi_max", "bb_percent_b_max"):
         if key not in entry:
             raise ConfigError(f"strategy.entry.{key} is required")
     for key in ("rsi_min", "adx_min", "bb_percent_b_min", "zscore_threshold"):

@@ -1412,16 +1412,16 @@ def test_capacity_event_deterministic(tmp_path):
     assert r1 == r2
 
 
-def test_main_py_gate_unchanged(tmp_path):
-    """G. main.py open-order gate remains unchanged (legacy path).
-
-    main.py keeps its own gate; the orchestrator's gate is independent.
-    This test only asserts the orchestrator gate does not touch main.py.
-    """
+def test_authoritative_entrypoint_open_order_gate_unchanged(tmp_path):
+    """G. The authoritative multi-symbol entrypoint keeps its open-order
+    gate (the legacy single-symbol main.py was removed with the old
+    strategy); the orchestrator's gate is independent of it."""
     import os
-    main_src = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "main.py")).read()
-    # main.py still contains its open-order gate (string check, no execution).
-    assert "open_order" in main_src or "max_open" in main_src or "existing_open" in main_src or "capacity" in main_src.lower()
+    entry_src = open(os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                  "multi_symbol_main.py")).read()
+    # The authoritative path still contains its open-order gate (string
+    # check, no execution).
+    assert "open_order" in entry_src or "max_open" in entry_src or "existing_open" in entry_src or "capacity" in entry_src.lower()
 
 
 # ---------------------------------------------------------------------------

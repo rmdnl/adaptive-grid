@@ -6,7 +6,7 @@ environment:
 # Multi-symbol configuration (comma-separated, e.g., "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT")
 # Can also be set via SYMBOLS env var
 symbols: "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT"
-timeframe: "4h"
+timeframe: "1h"
 
 grid:
   # Arithmetic for BTC/ETH/BNB, Geometric for SOL
@@ -18,11 +18,10 @@ grid:
   # Legacy fixed step for the single-symbol path (main.py); the multi-symbol
   # path uses the dynamic ATR step below.
   step_pct: 0.006
-  # Grid step = 1x ATR(14) percentage (dynamic per symbol), floored so every
-  # grid gross profit is >= 0.5% (maker+taker 0.1% each + conservative
-  # slippage).  NOTE: with the conservative 0.05% round-trip slippage a
-  # 0.5%-gross step nets 0.25% and is correctly REJECTED by the hard
-  # minimum-net gate, so the effective gross floor is ~0.55%.
+  # Grid step = GRID_STEP_ATR_MULTIPLIER x ATR(14) (default 1.0) — no fixed
+  # floor, no silent cap.  The gross minimum below is a GATE: an ATR step
+  # that cannot clear 0.5% gross BLOCKS the grid (recorded, never widened).
+  atr_multiplier: 1.0
   min_gross_profit_pct: 0.005
   # Minimum net profit per grid = 0.3% (after fees) — hard floor.
   hard_min_net_pct: 0.003
@@ -48,24 +47,19 @@ range:
 strategy:
   # Auto-entry: Bot ONLY starts grid if ALL conditions met (AND logic)
   entry:
-    adx_max: 20                    # ADX(14) < 20 (sideways market)
-    rsi_max: 35                    # RSI(14) < 35 (oversold)
-    bb_percent_b_max: 0.0          # %B <= 0 (price at/below lower Bollinger Band)
-    volume_oscillator_min: 0.0     # Volume Oscillator(5,10) > 0 (volume expanding)
+    adx_max: 25                    # ENTRY: ADX(14) < 25
+    rsi_max: 40                    # ENTRY: RSI(14) < 40
+    bb_percent_b_max: 0.0          # ENTRY: %B <= 0 (at/below lower Bollinger Band)
+    # NOTE: the Volume Oscillator is diagnostics only and NEVER gates entry
+    # (locked specification).  The previous ADX<20/RSI<35/VO>0 logic is removed.
   # Auto-exit: Bot MUST exit if ANY condition met (OR logic)
   exit:
-    rsi_min: 70                    # RSI(14) >= 70 (overbought)
-    adx_min: 25                    # ADX(14) > 25 (strong trend breakout)
-    bb_percent_b_min: 1.0          # %B > 1 (price above upper Bollinger Band)
-    zscore_threshold: 2.5          # |Z-Score(20)| > 2.5 (extreme deviation)
+    rsi_min: 70                    # EXIT: RSI(14) >= 70
+    adx_min: 25                    # EXIT: ADX(14) >= 25
+    bb_percent_b_min: 1.0          # EXIT: %B >= 1
+    zscore_threshold: 2.5          # EXIT: |Z-Score(20)| >= 2.5 (either extreme)
   # Cooldown after auto-exit
   cooldown_hours: 3                # Hours to wait before new auto-entry allowed
-
-market_filter:
-  adx_max: 28
-  atr_pct_max: 0.025
-  bb_width_max: 0.06
-  volume_spike_max: 2.5
 
 adaptive_planner:
   cooldown_candles: 4
@@ -77,7 +71,7 @@ adaptive_planner:
     regime_change: true
 
 market_intelligence:
-  timeframe: "4h"
+  timeframe: "1h"
   min_candles: 60
   max_candle_age_seconds: 5400
   atr_period: 14

@@ -89,22 +89,26 @@ def volume_ratio(df, length=20):
     return df["volume"] / baseline.replace(0, np.nan)
 
 def volume_oscillator(df, short_period=5, long_period=10):
-    """Volume Oscillator: (Short MA - Long MA) / Long MA * 100
-    
-    Positive values indicate increasing volume trend (bullish volume)
-    Negative values indicate decreasing volume trend (bearish volume)
+    """Volume Oscillator: (fast_volume_average / slow_volume_average) - 1
+
+    Locked specification (section 10 of the strategy): SMA(volume, 5) and
+    SMA(volume, 10); the oscillator is the RATIO minus one.  Positive values
+    indicate expanding volume.  Zero does NOT satisfy an entry requirement
+    of "> 0".  NaN rows (insufficient history) must be treated as
+    INSUFFICIENT_DATA by the caller — never as 0.
     """
     _require_columns(df, ("volume",))
     if short_period >= long_period:
         raise ValueError("short_period must be < long_period")
     if short_period <= 0 or long_period <= 0:
         raise ValueError("periods must be > 0")
-    
-    short_ma = df["volume"].rolling(short_period).mean()
-    long_ma = df["volume"].rolling(long_period).mean()
-    
-    # Avoid division by zero
-    osc = (short_ma - long_ma) / long_ma.replace(0, np.nan) * 100
+
+    fast_ma = df["volume"].rolling(short_period).mean()
+    slow_ma = df["volume"].rolling(long_period).mean()
+
+    # NaN (insufficient data) propagates; division by zero yields inf/NaN,
+    # which the strategy layer treats as invalid, never as a signal.
+    osc = (fast_ma / slow_ma) - 1
     return osc
 
 def z_score(df, length=20):

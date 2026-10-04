@@ -1,8 +1,10 @@
 """Production runtime for the adaptive-grid bot (TESTNET/PAPER only).
 
-A long-running orchestration wrapper that repeatedly invokes the existing
-authoritative single-cycle entrypoint (``main.main``) at a controlled
-cadence, with graceful SIGTERM/SIGINT shutdown and systemd compatibility.
+A reusable candle-cadence orchestration loop with graceful SIGTERM/SIGINT
+shutdown and systemd compatibility.  The authoritative multi-symbol
+entrypoint (``multi_symbol_main.py``) builds :class:`GridRuntime` on top of
+this module; the old single-symbol cycle it once wrapped was removed with
+the legacy strategy.
 
 Architecture rules (enforced by construction, see tests):
 
@@ -268,45 +270,12 @@ class GridRuntime:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Runtime process entrypoint (testnet/paper only)."""
-    import argparse
-
-    from dotenv import load_dotenv
-
-    from config_loader import ConfigError, load_config, validate_config
-
-    parser = argparse.ArgumentParser(
-        description="Adaptive-grid continuous runtime (testnet/paper only).")
-    parser.add_argument("--max-cycles", type=int, default=None,
-                        help="stop after N cycles (bounded observation only)")
-    args = parser.parse_args(argv)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-
-    load_dotenv()
-    try:
-        cfg = load_config()
-        validate_config(cfg)
-        runtime_cfg = load_runtime_config(cfg)
-    except (ConfigError, RuntimeConfigError) as exc:
-        print(f"RUNTIME CONFIG BLOCK: {exc}")
-        return EXIT_CONFIG
-
-    # Belt and braces: the daemon is paper/testnet-only by construction.
-    if not cfg["environment"]["dry_run"] or \
-            cfg["environment"].get("allow_live_execution", True):
-        print("RUNTIME CONFIG BLOCK: dry_run must be true and "
-              "allow_live_execution false")
-        return EXIT_CONFIG
-
-    # Invoke the existing authoritative single-cycle entrypoint in-process.
-    # Imported lazily so --help/config errors never touch trading modules.
-    from main import main as cycle_main
-
-    runtime = GridRuntime(runtime_cfg, cycle=cycle_main)
-    return runtime.run(max_cycles=args.max_cycles)
+    """Deprecated legacy entrypoint removed with the old single-symbol
+    strategy.  The continuous runtime loop lives in ``multi_symbol_main.py``
+    (built on :class:`GridRuntime`)."""
+    print("runtime.py is no longer an entrypoint: use multi_symbol_main.py "
+          "(the authoritative multi-symbol runtime loop).")
+    return 2
 
 
 if __name__ == "__main__":

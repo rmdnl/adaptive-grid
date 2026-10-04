@@ -33,9 +33,26 @@ from storage import (
     init_db,
 )
 from symbol_rules import parse_symbol_info
-from tests.test_main_order_integration import _symbol_info
 
 DB = "grid.sqlite3"
+
+
+def _symbol_info():
+    return {
+        "symbol": "BNBUSDT",
+        "baseAsset": "BNB",
+        "quoteAsset": "USDT",
+        "status": "TRADING",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "100000", "tickSize": "0.01"},
+            {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "10000", "stepSize": "0.001"},
+            {"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "maxQty": "5000", "stepSize": "0.001"},
+            {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+            {"filterType": "NOTIONAL", "minNotional": "10", "maxNotional": "100000"},
+            {"filterType": "PERCENT_PRICE", "multiplierUp": "1.05", "multiplierDown": "0.95", "avgPriceMins": 5},
+            {"filterType": "MAX_NUM_ORDERS", "maxNumOrders": 40},
+        ],
+    }
 
 
 def _config(tmp_path):

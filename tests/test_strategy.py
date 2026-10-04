@@ -1,22 +1,25 @@
-"""Auto-entry / auto-exit strategy engine: specification tests.
+"""Auto-entry / auto-exit strategy engine: specification tests (NEW strategy).
 
-Pins the locked v4.0 strategy exactly as specified:
+Pins the locked v5 strategy exactly:
 
-- Auto-entry (ALL must hold, AND logic): ADX(14) < 20; RSI(14) < 35
-  OR %B <= 0 (alternative lower-Bollinger trigger); Volume
-  Oscillator(5,10) > 0.
-- Auto-exit (ANY triggers, OR logic): RSI(14) >= 70; ADX(14) > 25;
-  %B > 1; |Z-Score(20)| > 2.5.
-- Cooldown blocks entry evaluation but never exit evaluation.
+- ENTRY (the ONLY mandatory filters, AND logic):
+    ADX(14) < 25 AND RSI(14) < 40 AND Bollinger %B <= 0.
+  The Volume Oscillator has NO influence on entry (diagnostics only).
+- EXIT (OR logic, at-or-beyond the threshold):
+    RSI >= 70; ADX >= 25; %B >= 1; |Z-Score(20)| >= 2.5.
+- Boundary table from the specification:
+    entry:  ADX 24.99 PASS / 25.00 FAIL; RSI 39.99 PASS / 40.00 FAIL;
+            %B -0.01 PASS / 0.00 PASS / 0.01 FAIL
+    exit:   RSI 70.00 EXIT; ADX 25.00 EXIT; %B 1.00 EXIT;
+            Z +2.5 EXIT; Z -2.5 EXIT
+- INSUFFICIENT_DATA: no signal from missing/NaN indicators.
+- Exit priority over entry is structural (mutually exclusive thresholds).
 """
 from __future__ import annotations
 
 from decimal import Decimal
 
-import pytest
-
 from market_features import MarketFeatures
-from market_regime import MarketRegime
 from strategy import (
     EntrySignal,
     ExitSignal,
@@ -31,16 +34,15 @@ def _config() -> dict:
     return {
         "strategy": {
             "entry": {
-                "adx_max": 20,
-                "rsi_max": 35,
-                "bb_percent_b_max": 0.0,
-                "volume_oscillator_min": 0.0,
+                "adx_max": "25",
+                "rsi_max": "40",
+                "bb_percent_b_max": "0",
             },
             "exit": {
-                "rsi_min": 70,
-                "adx_min": 25,
-                "bb_percent_b_min": 1.0,
-                "zscore_threshold": 2.5,
+                "rsi_min": "70",
+                "adx_min": "25",
+                "bb_percent_b_min": "1",
+                "zscore_threshold": "2.5",
             },
             "cooldown_hours": 3,
         },
@@ -55,7 +57,7 @@ def _features(
     bb_lower: str = "100",
     bb_upper: str = "104",
     bb_middle: str = "102",
-    volume_oscillator: str = "1.5",
+    volume_oscillator: str = "-5",  # VO must have NO influence on entry
     z_score: str = "0",
 ) -> MarketFeatures:
     return MarketFeatures(
@@ -94,15 +96,14 @@ def test_percent_b_values():
     assert calculate_percent_b(Decimal("100"), Decimal("104"), Decimal("100"), Decimal("102")) == Decimal("0")
     assert calculate_percent_b(Decimal("104"), Decimal("104"), Decimal("100"), Decimal("102")) == Decimal("1")
     assert calculate_percent_b(Decimal("102"), Decimal("104"), Decimal("100"), Decimal("102")) == Decimal("0.5")
-    # Below the lower band is negative; above the upper band is > 1.
     assert calculate_percent_b(Decimal("99"), Decimal("104"), Decimal("100"), Decimal("102")) < 0
     assert calculate_percent_b(Decimal("105"), Decimal("104"), Decimal("100"), Decimal("102")) > 1
-    # Degenerate band falls back to mid.
+    # Zero-width bands never divide by zero.
     assert calculate_percent_b(Decimal("100"), Decimal("100"), Decimal("100"), Decimal("102")) == Decimal("0.5")
 
 
 # ---------------------------------------------------------------------------
-# Auto-entry: AND logic with the %B alternative trigger
+# ENTRY: the three mandatory filters (AND logic)
 # ---------------------------------------------------------------------------
 
 def test_entry_allowed_when_all_conditions_met():
@@ -112,34 +113,52 @@ def test_entry_allowed_when_all_conditions_met():
     assert decision.reasons == ()
 
 
-def test_entry_blocked_when_adx_too_high():
-    decision = evaluate_entry_signal(_features(adx="20"), _config())
+def test_entry_boundary_adx():
+    # ADX 24.99 -> PASS, ADX 25.00 -> FAIL (strict <)
+    assert evaluate_entry_signal(_features(adx="24.99"), _config()).allowed is True
+    blocked = evaluate_entry_signal(_features(adx="25"), _config())
+    assert blocked.allowed is False
+    assert any("ADX" in reason for reason in blocked.reasons)
+
+
+def test_entry_boundary_rsi():
+    # RSI 39.99 -> PASS, RSI 40.00 -> FAIL (strict <)
+    assert evaluate_entry_signal(_features(rsi="39.99"), _config()).allowed is True
+    blocked = evaluate_entry_signal(_features(rsi="40"), _config())
+    assert blocked.allowed is False
+    assert any("RSI" in reason for reason in blocked.reasons)
+
+
+def test_entry_boundary_percent_b():
+    # %B -0.01 -> PASS, 0.00 -> PASS, 0.01 -> FAIL (<= 0)
+    assert evaluate_entry_signal(
+        _features(close="99.96", bb_lower="100", bb_upper="104"), _config()
+    ).allowed is True
+    assert evaluate_entry_signal(
+        _features(close="100", bb_lower="100", bb_upper="104"), _config()
+    ).allowed is True
+    blocked = evaluate_entry_signal(
+        _features(close="100.04", bb_lower="100", bb_upper="104"), _config())
+    assert blocked.allowed is False
+    assert any("%B" in reason for reason in blocked.reasons)
+
+
+def test_volume_oscillator_has_no_influence_on_entry():
+    """VO is diagnostics only: strongly negative and strongly positive VO
+    must both leave the entry decision unchanged."""
+    cfg = _config()
+    assert evaluate_entry_signal(_features(volume_oscillator="-50"), cfg).allowed is True
+    assert evaluate_entry_signal(_features(volume_oscillator="50"), cfg).allowed is True
+    # ...and VO alone can never make a blocked entry allowed.
+    assert evaluate_entry_signal(
+        _features(adx="30", volume_oscillator="50"), cfg).allowed is False
+
+
+def test_entry_blocked_when_every_condition_fails_lists_all_reasons():
+    decision = evaluate_entry_signal(_features(adx="40", rsi="60"), _config())
     assert decision.allowed is False
-    assert decision.signal is EntrySignal.BLOCKED
-    assert any("ADX" in reason for reason in decision.reasons)
-
-
-def test_entry_blocked_when_rsi_and_percent_b_both_fail():
-    # RSI 40 >= 35 and %B 0.5 > 0 -> no oversold trigger.
-    decision = evaluate_entry_signal(
-        _features(rsi="40", close="102", bb_lower="100", bb_upper="104"),
-        _config())
-    assert decision.allowed is False
-    assert any("RSI" in reason for reason in decision.reasons)
-
-
-def test_entry_allowed_via_percent_b_alternative_trigger():
-    # RSI 40 (>= 35) but price AT the lower band (%B == 0 <= 0) -> allowed.
-    decision = evaluate_entry_signal(
-        _features(rsi="40", close="100", bb_lower="100", bb_upper="104"),
-        _config())
-    assert decision.allowed is True
-
-
-def test_entry_blocked_when_volume_oscillator_not_positive():
-    decision = evaluate_entry_signal(_features(volume_oscillator="0"), _config())
-    assert decision.allowed is False
-    assert any("Volume Oscillator" in reason for reason in decision.reasons)
+    assert any("ADX" in r for r in decision.reasons)
+    assert any("RSI" in r for r in decision.reasons)
 
 
 def test_entry_blocked_on_cooldown_regardless_of_indicators():
@@ -148,8 +167,16 @@ def test_entry_blocked_on_cooldown_regardless_of_indicators():
     assert decision.signal is EntrySignal.COOLDOWN
 
 
+def test_entry_insufficient_data_blocks():
+    features = _features(rsi="NaN")
+    decision = evaluate_entry_signal(features, _config())
+    assert decision.allowed is False
+    assert decision.signal is EntrySignal.INSUFFICIENT_DATA
+    assert any("INSUFFICIENT_DATA" in reason for reason in decision.reasons)
+
+
 # ---------------------------------------------------------------------------
-# Auto-exit: OR logic
+# EXIT: OR logic at-or-beyond the threshold
 # ---------------------------------------------------------------------------
 
 def test_exit_hold_when_no_condition_triggers():
@@ -159,30 +186,42 @@ def test_exit_hold_when_no_condition_triggers():
     assert decision.triggered_reasons == ()
 
 
-def test_exit_on_rsi_overbought():
+def test_exit_boundary_rsi_70():
     decision = evaluate_exit_signal(_features(rsi="70"), _config())
     assert decision.should_exit is True
     assert any("RSI" in reason for reason in decision.triggered_reasons)
 
 
-def test_exit_on_adx_breakout():
-    decision = evaluate_exit_signal(_features(adx="25.1"), _config())
+def test_exit_boundary_adx_25():
+    decision = evaluate_exit_signal(_features(adx="25"), _config())
     assert decision.should_exit is True
     assert any("ADX" in reason for reason in decision.triggered_reasons)
 
 
-def test_exit_on_price_above_upper_band():
+def test_exit_boundary_percent_b_1():
     decision = evaluate_exit_signal(
-        _features(close="105", bb_lower="100", bb_upper="104"), _config())
+        _features(close="104", bb_lower="100", bb_upper="104"), _config())
     assert decision.should_exit is True
     assert any("%B" in reason for reason in decision.triggered_reasons)
 
 
-def test_exit_on_extreme_zscore_both_directions():
-    for z in ("2.6", "-2.6"):
+def test_exit_boundary_zscore_both_extremes():
+    for z in ("2.5", "-2.5"):
         decision = evaluate_exit_signal(_features(z_score=z), _config())
         assert decision.should_exit is True
         assert any("Z-Score" in reason for reason in decision.triggered_reasons)
+
+
+def test_exit_beyond_thresholds_also_triggers():
+    for features in (
+        _features(rsi="75"),
+        _features(adx="30"),
+        _features(close="105", bb_lower="100", bb_upper="104"),
+        _features(z_score="3.0"),
+        _features(z_score="-3.0"),
+    ):
+        decision = evaluate_exit_signal(features, _config())
+        assert decision.should_exit is True
 
 
 def test_exit_triggers_collect_all_simultaneous_reasons():
@@ -192,8 +231,14 @@ def test_exit_triggers_collect_all_simultaneous_reasons():
     assert len(decision.triggered_reasons) == 3
 
 
+def test_exit_insufficient_data_never_liquidates():
+    decision = evaluate_exit_signal(_features(z_score="NaN"), _config())
+    assert decision.should_exit is False
+    assert decision.signal is ExitSignal.INSUFFICIENT_DATA
+
+
 # ---------------------------------------------------------------------------
-# Combined evaluation
+# Combined evaluation / priority
 # ---------------------------------------------------------------------------
 
 def test_evaluate_strategy_without_grid_evaluates_entry_only():
@@ -208,3 +253,12 @@ def test_evaluate_strategy_with_grid_evaluates_exit_only():
                                       has_active_grid=True)
     assert entry is None
     assert exit_d is not None and exit_d.should_exit is False
+
+
+def test_entry_and_exit_thresholds_are_mutually_exclusive():
+    """Structural exit priority: no indicator value can satisfy entry AND
+    exit at the same time (ADX<25 vs >=25, RSI<40 vs >=70, %B<=0 vs >=1)."""
+    for adx in ("24.99", "25", "30"):
+        entry_allowed = Decimal(adx) < Decimal("25")
+        exit_fires = Decimal(adx) >= Decimal("25")
+        assert entry_allowed != exit_fires

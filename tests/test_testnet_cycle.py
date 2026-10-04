@@ -378,8 +378,9 @@ def test_paper_production_files_never_import_cycle_modules():
     """Production boundary: main/paper paths stay exchange-write-free."""
     import pathlib
     repo = pathlib.Path(__file__).resolve().parent.parent
-    for name in ("main.py", "paper_orchestrator.py", "order_engine.py",
-                 "paper_accounting.py", "paper_validation.py"):
+    for name in ("multi_symbol_main.py", "paper_orchestrator.py",
+                 "order_engine.py", "paper_accounting.py",
+                 "paper_validation.py"):
         source = (repo / name).read_text(encoding="utf-8")
         assert "testnet_cycle" not in source, name
         assert "testnet_orders" not in source, name

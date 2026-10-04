@@ -984,7 +984,6 @@ def test_soak_I_persistence_corruption_fails_closed(tmp_path):
     I5. Non-zero reservation for CANCELED order → recovery unhealthy
     """
     from order_engine import PaperStateUnhealthyError
-    import main as main_module
 
     order_db = str(tmp_path / "corrupt.db")
     init_db(order_db)
@@ -996,7 +995,8 @@ def test_soak_I_persistence_corruption_fails_closed(tmp_path):
         )
         con.commit()
     # load_peak_equity must return None (fail-closed), not raise
-    result_peek = main_module.load_peak_equity(order_db)
+    from multi_symbol_main import _load_peak_equity
+    result_peek = _load_peak_equity(order_db)
     assert result_peek is None, "Corrupt reference equity must return None"
 
     # I2: Submit a valid order, then corrupt its status

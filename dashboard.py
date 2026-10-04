@@ -429,15 +429,6 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
     last_ranges = {sym: data.get("last_range")
                    for sym, data in per_symbol_data.items()
                    if data.get("last_range") is not None}
-    market_filter = {
-        sym: {
-            "blocked": bool(data.get("market_filter_blocked")),
-            "reasons": data.get("market_filter_reasons") or [],
-        }
-        for sym, data in per_symbol_data.items()
-        if data.get("market_filter_blocked") is not None
-    }
-
     snapshot: dict[str, Any] = {
         "dashboard": {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -486,7 +477,6 @@ def build_snapshot(db_path: str, bot: dict[str, Any]) -> dict[str, Any]:
             "last_symbol": legacy["last_symbol"],
             "last_adaptive_plan": (legacy["last_adaptive_plan"]),
             "last_market_intelligence": legacy["last_market_intelligence"],
-            "market_filter": market_filter or None,
             "per_symbol": per_symbol_data,
         },
         "orders": {
@@ -611,6 +601,13 @@ def _read_symbol_db(base_db_path: str, symbol: str) -> dict[str, Any]:
     _guarded("last_auto_exit_ts", None,
              lambda c: _state_raw(c, "last_auto_exit_ts"))
     _guarded("run_state", None, _run_state)
+    # Strategy signal snapshots (NEW strategy: indicators, entry/exit
+    # decisions, cooldown, explicit strategy state machine).
+    _guarded("last_signal", None, lambda c: _state_json(c, "last_signal"))
+    _guarded("last_exit_signal", None,
+             lambda c: _state_json(c, "last_exit_signal"))
+    _guarded("last_strategy_state", None,
+             lambda c: _state_json(c, "last_strategy_state"))
 
     # Risk + account + orders + fills
     _guarded("kill_state", None, _kill)
@@ -664,7 +661,6 @@ def _read_symbol_db(base_db_path: str, symbol: str) -> dict[str, Any]:
 
     # Derived per-symbol views (real persisted fields only — no invention).
     decision = data.get("last_risk_decision") or {}
-    reason_text = str(decision.get("reason") or "")
     if bool((data.get("kill_state") or {}).get("active")):
         data["status"] = "KILL_ACTIVE"
     elif decision.get("allowed") is True:
@@ -674,11 +670,6 @@ def _read_symbol_db(base_db_path: str, symbol: str) -> dict[str, Any]:
     else:
         data["status"] = "NO_DATA" if sym_con is None or not data.get("last_price") \
             else "NO_DECISION"
-    data["market_filter_blocked"] = ("MARKET_FILTER_BLOCK" in reason_text) \
-        if reason_text else None
-    data["market_filter_reasons"] = (
-        [part.strip() for part in reason_text.split("|")
-         if "MARKET_FILTER_BLOCK" in part] if reason_text else [])
 
     economics: dict[str, Any] = {}
     for event in (data.get("risk_events") or []):
@@ -1872,6 +1863,32 @@ def render_html(snap: dict[str, Any]) -> str:
         sym_open = len(sym_data.get("open_orders") or [])
         sym_fills = len(sym_data.get("recent_fills") or [])
         sym_ref = sym_data.get("paper_reference_equity")
+        # Per-symbol indicator snapshot + strategy state (NEW strategy).
+        signal = sym_data.get("last_signal") or {}
+        ind = signal.get("indicators") or {}
+        sym_adx = ind.get("adx")
+        sym_rsi = ind.get("rsi")
+        sym_pb = ind.get("percent_b")
+        sym_z = ind.get("z_score")
+        sym_atr = ind.get("atr_pct")
+        strat_state = str((sym_data.get("last_strategy_state") or {})
+                          .get("state") or sym_data.get("status") or "N/A")
+        entry_sig = str((signal.get("entry_signal") or {}).get("signal")
+                        or "N/A")
+        exit_sig = str((sym_data.get("last_exit_signal") or {})
+                       .get("triggered_reasons") or "N/A")
+        cooldown_until = "N/A"
+        last_exit_ts = sym_data.get("last_auto_exit_ts")
+        cooldown_hours = 3
+        if last_exit_ts:
+            try:
+                from datetime import timedelta
+                last_dt = datetime.fromisoformat(
+                    str(last_exit_ts).replace("Z", "+00:00"))
+                cooldown_until = _wib(
+                    (last_dt + timedelta(hours=cooldown_hours)).isoformat())
+            except (ValueError, TypeError):
+                cooldown_until = "N/A"
         db_ok = bool(sym_data.get("db_healthy"))
         db_note = "" if db_ok else " · DB unavailable"
         missing = sym_data.get("missing_tables") or []
@@ -1885,7 +1902,10 @@ def render_html(snap: dict[str, Any]) -> str:
             <div class="card-sub">Range: {_fmt(sym_lower)} \u2013 {_fmt(sym_upper)}</div>
             <div class="card-sub">Grid: {_fmt(sym_cells)} cells @ {_pct(sym_step)} | Net/grid: {_pct(sym_net)}</div>
             <div class="card-sub">Mode: {_human(sym_regime)} | Ref equity: {_fmt(sym_ref)}</div>
+            <div class="card-sub">State: {_esc(strat_state)} | Entry: {_esc(entry_sig)} | Cooldown end: {cooldown_until}</div>
+            <div class="card-sub">ADX: {_fmt(sym_adx)} | RSI: {_fmt(sym_rsi)} | %B: {_fmt(sym_pb)} | Z: {_fmt(sym_z)} | ATR%: {_fmt(sym_atr)}</div>
             <div class="card-sub">Open orders: {sym_open} | Recent fills: {sym_fills}</div>
+            <div class="card-sub">Last exit: {_esc(exit_sig if isinstance(exit_sig, str) else ", ".join(exit_sig))}</div>
             <div class="card-sub">Risk: {_esc(sym_reason or "N/A")}{_esc(db_note)}</div>
         </div>""")
     
