@@ -159,6 +159,23 @@ cooldown. Any failed verification is fail-closed: the symbol stops in `ERROR`.
 After an automatic exit the symbol cannot start a new grid until the cooldown
 expires. Cooldown survives process restart.
 
+A read-only `--check-grid` command validates the grid and its executable
+net economics for every configured symbol before execution:
+
+```bash
+python bot.py --check-grid
+```
+
+It reuses the exact production grid-building path (`MarketData` +
+`grid.build_grid`): it fetches the exchange filters, the weighted-average
+reference price, and closed-candle ATR, builds the plan with the same
+quantization / fee / slippage / PERCENT_PRICE_BY_SIDE logic as live
+execution, then prints an ACCEPTED/REJECTED result per symbol with the
+minimum/maximum/average executable net profit and any level below the
+required minimum. It submits, cancels and modifies nothing and never opens
+the state database; it exits non-zero if any configured symbol fails the
+minimum net-profit gate.
+
 ## Grid economics
 
 - Grid step = `GRID_STEP_ATR_MULTIPLIER × ATR(14)` (default 1.0).
@@ -299,6 +316,7 @@ refuses to start on any configuration problem.
 
 ```bash
 python bot.py --check-exchange                       # connectivity/auth/filters (read-only)
+python bot.py --check-grid                           # validate grid construction + executable net economics (read-only, no orders)
 python bot.py --testnet-order-selftest BTC/USDT      # place + verify + cancel one far-from-market order
 python bot.py                                        # run testnet execution
 ```

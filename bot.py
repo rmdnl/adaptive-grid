@@ -572,6 +572,150 @@ def reset_execution_session(cfg: Config, store: StateStore) -> None:
     )
 
 
+# block_reason -> operator-facing rejection phrase
+GRID_REJECT_PHRASES = {
+    "invalid_mode": "invalid grid mode",
+    "insufficient_data": "insufficient data (no closed candles / no ATR)",
+    "invalid_filters": "invalid exchange filters",
+    "reference_price_unavailable": "reference price unavailable",
+    "percent_price_band": "percent price band",
+    "no_valid_levels": "insufficient valid levels",
+    "gross_below_minimum": "gross profit below minimum",
+    "net_below_minimum": "net profit below minimum",
+}
+
+
+def _fmt_pct(value: Optional[float], digits: int = 4) -> str:
+    return "—" if value is None else f"{value * 100:.{digits}f}%"
+
+
+def _print_grid_report(
+    cfg: Config,
+    symbol: str,
+    spot,
+    view,
+    filters,
+    reference: Optional[float],
+    plan,
+    out,
+) -> None:
+    """Render one symbol's grid economics report. All values come from the
+    production grid build (plan) and the production market view - no
+    duplicated economics."""
+    snap = view.snapshot
+    levels = plan.levels
+    status = "ACCEPTED" if plan.executable else "REJECTED"
+    upper = max((lvl.sell_price for lvl in levels), default=None)
+
+    print(f"SYMBOL: {symbol}", file=out)
+    print(f"MODE: {spot.environment}", file=out)
+    print(f"GRID MODE: {plan.mode}", file=out)
+    print(f"CURRENT PRICE: {snap.last_close if snap.last_close is not None else '—'}", file=out)
+    print(f"REFERENCE PRICE: {reference if reference is not None else '—'}", file=out)
+    lower = plan.lower_price
+    print(f"LOWER PRICE: {lower if lower is not None else '—'}", file=out)
+    print(f"UPPER PRICE: {upper if upper is not None else '—'}", file=out)
+    print(f"TOTAL GRIDS: {grid_mod.GRID_LEVELS}", file=out)
+    print(f"VALID GRID LEVELS: {len(levels)}", file=out)
+    print("", file=out)
+    print("STEP / SPACING:", file=out)
+    if plan.step and snap.last_close:
+        spacing_pct = (plan.step / snap.last_close) * 100.0
+        print(f"  step = {plan.step:.8g} ({spacing_pct:.4f}% of current price)", file=out)
+    else:
+        print("  —", file=out)
+    print("", file=out)
+    print("GROSS PROFIT PER GRID:", file=out)
+    if levels:
+        print(f"  min = {_fmt_pct(min(l.gross_pct for l in levels))}", file=out)
+        print(f"  max = {_fmt_pct(max(l.gross_pct for l in levels))}", file=out)
+    else:
+        print("  —", file=out)
+    print("", file=out)
+    print("BUY FEE:", file=out)
+    print(f"  maker = {_fmt_pct(cfg.maker_fee, 3)}  taker = {_fmt_pct(cfg.taker_fee, 3)}", file=out)
+    print("SELL FEE:", file=out)
+    print(f"  maker = {_fmt_pct(cfg.maker_fee, 3)}  taker = {_fmt_pct(cfg.taker_fee, 3)}", file=out)
+    print("SLIPPAGE:", file=out)
+    print(f"  estimate = {_fmt_pct(cfg.slippage_estimate, 3)}", file=out)
+    print("", file=out)
+    print("NET PROFIT PER GRID:", file=out)
+    if levels:
+        nets = [l.net_pct for l in levels]
+        print(f"  min = {_fmt_pct(min(nets))}", file=out)
+        if len(nets) > 1:
+            print(f"  max = {_fmt_pct(max(nets))}", file=out)
+            print(f"  average = {_fmt_pct(sum(nets) / len(nets))}", file=out)
+        flagged = [lvl for lvl in levels if lvl.net_pct < cfg.min_net_profit_per_grid]
+        if flagged:
+            print("  below minimum:", file=out)
+            for lvl in flagged:
+                print(
+                    f"    level {lvl.index}: buy {lvl.buy_price:.8g} -> sell {lvl.sell_price:.8g} "
+                    f"net {_fmt_pct(lvl.net_pct)}",
+                    file=out,
+                )
+    else:
+        print("  — (no valid levels)", file=out)
+    print("", file=out)
+    print(f"MINIMUM REQUIRED NET: {_fmt_pct(cfg.min_net_profit_per_grid, 2)}", file=out)
+    print("", file=out)
+    print(f"GRID STATUS: {status}", file=out)
+    if not plan.executable:
+        phrase = GRID_REJECT_PHRASES.get(plan.block_reason, plan.block_reason or "unknown")
+        print(f"REASON: {phrase}", file=out)
+    print("", file=out)
+
+
+def _check_grid(cfg: Config, spot: "BinanceSpot", out=None) -> int:
+    """Read-only grid economics validation for every configured symbol.
+
+    Uses the exact production path: MarketData (filters, avg price, closed
+    candle ATR) + grid_mod.build_grid (quantization, fees, slippage,
+    PERCENT_PRICE_BY_SIDE band). No order is submitted, cancelled or
+    created; no state is mutated. Exit code: 0 when every symbol is
+    ACCEPTED, 1 otherwise."""
+    import sys
+
+    if out is None:
+        out = sys.stdout
+    market = MarketData(spot)
+    now_ms = int(time.time() * 1000)
+    results = []
+    for symbol in cfg.pair_list:
+        try:
+            view = market.snapshot(symbol, cfg, now_ms)
+            filters = market.filters(symbol)
+            reference = market.avg_price(symbol)
+        except ExchangeError as exc:
+            print(f"SYMBOL: {symbol}", file=out)
+            print(f"GRID STATUS: REJECTED", file=out)
+            print(f"REASON: market data unavailable ({exc})", file=out)
+            print("", file=out)
+            results.append((symbol, "REJECTED", None))
+            continue
+        plan = grid_mod.build_grid(
+            symbol,
+            cfg.grid_mode(symbol),
+            view.snapshot.last_close,
+            view.snapshot.atr,
+            filters,
+            cfg,
+            reference_price=reference,
+        )
+        _print_grid_report(cfg, symbol, spot, view, filters, reference, plan, out)
+        worst_net = min((lvl.net_pct for lvl in plan.levels), default=None)
+        results.append((symbol, "ACCEPTED" if plan.executable else "REJECTED", worst_net))
+
+    print("GRID VALIDATION SUMMARY", file=out)
+    for symbol, status, net in results:
+        net_text = _fmt_pct(net) if net is not None else "—"
+        print(f"  {symbol:<12} {status:<8} net={net_text}", file=out)
+    overall = "REJECTED" if any(s != "ACCEPTED" for _, s, _ in results) else "ACCEPTED"
+    print(f"OVERALL: {overall}", file=out)
+    return 0 if overall == "ACCEPTED" else 1
+
+
 def _validate_exchange_access(cfg: Config, spot: BinanceSpot) -> Dict:
     """Startup gate for trading modes: connectivity, auth, permissions,
     clock skew, USDT balance and per-symbol filters. Raises on failure."""
@@ -736,6 +880,10 @@ def main(argv=None) -> int:
         help="validate exchange connectivity/auth/filters (read-only) and exit",
     )
     parser.add_argument(
+        "--check-grid", action="store_true",
+        help="check grid construction and executable net economics (read-only) and exit",
+    )
+    parser.add_argument(
         "--testnet-order-selftest", metavar="SYMBOL",
         help="place and cancel one far-from-market LIMIT_MAKER order on Binance Spot Testnet, then exit",
     )
@@ -756,6 +904,16 @@ def main(argv=None) -> int:
     )
     if cfg.execution_mode == "paper":
         log.info("PAPER mode: orders are simulated internally; no Binance orders will be submitted")
+
+    # --check-grid is strictly read-only: it must not open the state
+    # database, create/resume a session, or submit any order.
+    if args.check_grid:
+        spot = BinanceSpot(cfg)
+        try:
+            return _check_grid(cfg, spot)
+        except (ExchangeError, SessionError) as exc:
+            log.error("grid check failed (fail-closed): %s", exc)
+            return 1
 
     store = StateStore(args.db)
     store.ensure_symbols(list(cfg.pair_list))
