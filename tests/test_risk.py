@@ -1,46 +1,111 @@
-from risk_engine import (
-    combine, cooldown_gate, daily_profit_lock, equity_dd_kill, inventory_gate,
-    market_gate, open_orders_gate, profit_gate, range_break_kill, strict_order_price_gate
-)
+"""Risk tests: 2% drawdown kill, kill persistence, 15m lower-boundary
+protection, order vetoes, fail-closed behavior."""
 
-def test_profit_gate_blocks():
-    assert not profit_gate(0.0019,0.002).allowed
-    assert not profit_gate(0.002,0.002).allowed          # 0.200% == floor -> REJECT
-    assert profit_gate(0.00201,0.002).allowed            # 0.201% -> PASS
+from __future__ import annotations
 
-def test_dd_kill_exact_threshold_blocks():
-    # Exactly at 2% threshold (>= is the comparator) → BLOCKED.
-    assert not equity_dd_kill(0.02,0.02).allowed
-    # Just below 2% → allowed (market recovered, not at the kill boundary).
-    assert equity_dd_kill(0.0199,0.02).allowed
-    # Just above 2% → BLOCKED (the kill must catch breaches immediately).
-    assert not equity_dd_kill(0.0201,0.02).allowed
-    # Just barely above the exact threshold (Decimal boundary) → BLOCKED.
-    from decimal import Decimal
-    assert not equity_dd_kill(Decimal("0.0200000001"), Decimal("0.02")).allowed
+import pytest
 
-def test_strict_order_range_blocks_outside():
-    assert not strict_order_price_gate(100,110,99.5).allowed
-    assert not strict_order_price_gate(100,110,110.1).allowed
-    assert strict_order_price_gate(100,110,110).allowed
+import risk as risk_mod
+from risk import RiskEngine
+from state import StateStore
 
-def test_buffer_kill_is_separate():
-    assert range_break_kill(100,110,100.5,0.01).allowed
-    assert range_break_kill(100,110,98.9,0.01).allowed is False
 
-def test_inventory_and_order_limits():
-    assert not inventory_gate(0.71,0.70).allowed
-    assert not open_orders_gate(40,40).allowed
+@pytest.fixture
+def store(tmp_path):
+    return StateStore(str(tmp_path / "state.db"))
 
-def test_cooldown_and_daily_lock():
-    assert not cooldown_gate(True).allowed
-    assert not daily_profit_lock(0.01,0.01).allowed
 
-def test_market_gate_blocks_adx():
-    row={"adx":30,"atr_pct":0.01,"bb_width":0.03,"volume_ratio":1.0}
-    assert not market_gate(row,{"adx_max":28,"atr_pct_max":0.025,"bb_width_max":0.06,"volume_spike_max":2.5}).allowed
+@pytest.fixture
+def engine(cfg, store):
+    return RiskEngine(cfg, store)
 
-def test_combine_is_veto():
-    result=combine(profit_gate(0.004,0.002),equity_dd_kill(0.02,0.02))
-    assert not result.allowed
-    assert "EQUITY_DRAWDOWN_KILL" in result.reasons
+
+# ----- drawdown kill -----
+
+def test_drawdown_at_two_percent_breaches(engine):
+    assert engine.drawdown_breach(98.0, 100.0) is True      # (100-98)/100 = 2%
+
+
+def test_drawdown_just_below_two_percent_does_not_breach(engine):
+    assert engine.drawdown_breach(98.01, 100.0) is False
+
+
+def test_drawdown_with_zero_reference_is_safe(engine):
+    assert engine.drawdown_breach(-5.0, 0.0) is False
+
+
+def test_drawdown_with_profit_above_reference_is_safe(engine):
+    assert engine.drawdown_breach(105.0, 100.0) is False
+
+
+def test_global_kill_persists_across_restart(engine, store, tmp_path):
+    engine.trigger_global_kill("max_drawdown_breach dd=2.31%")
+    assert store.global_kill() == (True, "max_drawdown_breach dd=2.31%")
+
+    reopened = StateStore(str(tmp_path / "state.db"))
+    assert reopened.global_kill() == (True, "max_drawdown_breach dd=2.31%")
+
+
+def test_kill_switch_records_risk_event(engine, store):
+    engine.trigger_global_kill("test reason")
+    events = store.recent_risk_events()
+    assert any(e["event"] == "kill_switch" and "test reason" in e["details"] for e in events)
+
+
+# ----- order vetoes -----
+
+def test_no_veto_in_normal_conditions(engine):
+    assert engine.order_veto("BTC/USDT").allowed is True
+
+
+def test_veto_every_order_when_global_kill_active(engine):
+    engine.trigger_global_kill("drawdown")
+    decision = engine.order_veto("BTC/USDT")
+    assert decision.allowed is False
+    assert decision.reason.startswith("global_kill:")
+
+
+def test_veto_orders_for_stopped_symbol(engine, store):
+    store.ensure_symbols(["BTC/USDT", "ETH/USDT"])
+    store.stop_symbol("BTC/USDT", "lower_boundary_breach")
+    assert engine.order_veto("BTC/USDT").allowed is False
+    assert engine.order_veto("BTC/USDT").reason == "symbol_stopped"
+    # other symbols unaffected
+    assert engine.order_veto("ETH/USDT").allowed is True
+
+
+# ----- 15m lower-boundary protection -----
+
+def test_boundary_breach_at_exact_threshold(engine):
+    # close <= lower * (1 - 2%) -> 98.0 <= 98.0 -> breach
+    assert engine.boundary_status(98.0, 100.0) == risk_mod.BREACH
+
+
+def test_boundary_ok_just_above_threshold(engine):
+    assert engine.boundary_status(98.01, 100.0) == risk_mod.OK
+
+
+def test_boundary_uses_closed_candle_close_only(engine):
+    # Only the CLOSED candle close is ever passed in; an intrabar wick
+    # cannot trigger the gate by construction.
+    assert engine.boundary_status(97.0, 100.0) == risk_mod.BREACH
+    assert engine.boundary_status(99.0, 100.0) == risk_mod.OK
+
+
+def test_boundary_fail_closed_on_missing_data(engine):
+    assert engine.boundary_status(None, 100.0) == risk_mod.UNKNOWN
+    assert engine.boundary_status(98.0, None) == risk_mod.UNKNOWN
+    assert engine.boundary_status(0.0, 100.0) == risk_mod.UNKNOWN
+    assert engine.boundary_status(98.0, -1.0) == risk_mod.UNKNOWN
+
+
+def test_stop_symbol_persists(engine, store):
+    store.ensure_symbols(["BTC/USDT"])
+    engine.stop_symbol("BTC/USDT", "lower_boundary_breach")
+    st = store.get_symbol("BTC/USDT")
+    assert st.risk_status == "stopped"
+    assert st.strategy_state == "STOPPED"
+    assert st.exit_reason == "lower_boundary_breach"
+    # survives restart
+    reopened = StateStore(store.path)
+    assert reopened.get_symbol("BTC/USDT").risk_status == "stopped"

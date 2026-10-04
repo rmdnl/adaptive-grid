@@ -1,0 +1,399 @@
+"""SQLite state persistence.
+
+A single database holds global bot state, per-symbol state, cooldown,
+grid plan values, orders, fills, fees, realized PnL, risk events and the
+kill state. Kill state and cooldown survive process restart; nothing
+resets them automatically. Schema is intentionally minimal — no
+compatibility tables for any deleted architecture.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import time
+from dataclasses import dataclass, fields as dc_fields
+from typing import Dict, List, Optional, Tuple
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS symbols (
+    symbol TEXT PRIMARY KEY,
+    timeframe TEXT,
+    last_price REAL,
+    adx REAL, rsi REAL, percent_b REAL, volume_osc REAL, zscore REAL, atr REAL,
+    strategy_state TEXT DEFAULT 'WAITING',
+    entry_blocker TEXT,
+    block_reason TEXT,
+    exit_status INTEGER DEFAULT 0,
+    exit_reason TEXT,
+    cooldown_until REAL,
+    grid_mode TEXT, grid_step REAL, grid_lower REAL,
+    gross_pct REAL, net_pct REAL,
+    inventory_qty REAL DEFAULT 0, avg_cost REAL DEFAULT 0,
+    risk_status TEXT DEFAULT 'ok',
+    updated_at REAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_order_id TEXT UNIQUE,
+    symbol TEXT, side TEXT, type TEXT,
+    price REAL, qty REAL, filled_qty REAL DEFAULT 0,
+    status TEXT DEFAULT 'NEW',
+    mode TEXT,
+    parent_order_id INTEGER,
+    target_sell_price REAL,
+    created_at REAL, updated_at REAL
+);
+CREATE TABLE IF NOT EXISTS fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    symbol TEXT, side TEXT,
+    price REAL, qty REAL,
+    fee REAL DEFAULT 0,
+    realized_pnl REAL DEFAULT 0,
+    trade_id TEXT UNIQUE,
+    ts REAL
+);
+CREATE TABLE IF NOT EXISTS risk_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, scope TEXT, event TEXT, details TEXT
+);
+"""
+
+_SYMBOL_COLUMNS = {
+    "timeframe", "last_price", "adx", "rsi", "percent_b", "volume_osc",
+    "zscore", "atr", "strategy_state", "entry_blocker", "block_reason",
+    "exit_status", "exit_reason", "cooldown_until", "grid_mode", "grid_step",
+    "grid_lower", "gross_pct", "net_pct", "inventory_qty", "avg_cost",
+    "risk_status",
+}
+
+OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
+
+
+@dataclass
+class SymbolState:
+    symbol: str
+    timeframe: Optional[str] = None
+    last_price: Optional[float] = None
+    adx: Optional[float] = None
+    rsi: Optional[float] = None
+    percent_b: Optional[float] = None
+    volume_osc: Optional[float] = None
+    zscore: Optional[float] = None
+    atr: Optional[float] = None
+    strategy_state: str = "WAITING"
+    entry_blocker: Optional[str] = None
+    block_reason: Optional[str] = None
+    exit_status: int = 0
+    exit_reason: Optional[str] = None
+    cooldown_until: Optional[float] = None
+    grid_mode: Optional[str] = None
+    grid_step: Optional[float] = None
+    grid_lower: Optional[float] = None
+    gross_pct: Optional[float] = None
+    net_pct: Optional[float] = None
+    inventory_qty: float = 0.0
+    avg_cost: float = 0.0
+    risk_status: str = "ok"
+    updated_at: float = 0.0
+
+
+def _row_to_symbol(row: sqlite3.Row) -> SymbolState:
+    known = {f.name for f in dc_fields(SymbolState)}
+    data = {k: row[k] for k in row.keys() if k in known}
+    return SymbolState(**data)
+
+
+class StateStore:
+    def __init__(self, path: str = "state.db", read_only: bool = False):
+        self.path = path
+        self.read_only = read_only
+        if not read_only:
+            self._connect().close()
+            conn = self._connect()
+            conn.executescript(_SCHEMA)
+            conn.commit()
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.commit()
+            conn.close()
+
+    def _connect(self) -> sqlite3.Connection:
+        if self.read_only:
+            # Dashboard access: refuse to create or modify anything.
+            if not os.path.exists(self.path):
+                raise FileNotFoundError(f"state database not found: {self.path}")
+            conn = sqlite3.connect(self.path, timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=1")
+            return conn
+        conn = sqlite3.connect(self.path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    # ----- meta / global state -----
+
+    def set_meta(self, key: str, value: str) -> None:
+        conn = self._connect()
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_meta(self, key: str) -> Optional[str]:
+        conn = self._connect()
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return row["value"] if row else None
+
+    def set_meta_float(self, key: str, value: float) -> None:
+        self.set_meta(key, repr(float(value)))
+
+    def get_meta_float(self, key: str) -> Optional[float]:
+        raw = self.get_meta(key)
+        if raw is None:
+            return None
+        return float(raw)
+
+    def set_global_kill(self, reason: str) -> None:
+        self.set_meta("kill_active", "1")
+        self.set_meta("kill_reason", reason)
+
+    def global_kill(self) -> Tuple[bool, Optional[str]]:
+        active = self.get_meta("kill_active") == "1"
+        return active, self.get_meta("kill_reason") if active else None
+
+    def set_runtime(self, status: str, ts: float) -> None:
+        self.set_meta("runtime_status", status)
+        self.set_meta("last_cycle_ts", repr(float(ts)))
+
+    def last_runtime(self) -> Tuple[Optional[str], Optional[float]]:
+        status = self.get_meta("runtime_status")
+        raw_ts = self.get_meta("last_cycle_ts")
+        return status, (float(raw_ts) if raw_ts is not None else None)
+
+    # ----- symbols -----
+
+    def ensure_symbols(self, symbols: List[str]) -> None:
+        conn = self._connect()
+        for symbol in symbols:
+            conn.execute(
+                "INSERT INTO symbols(symbol, updated_at) VALUES(?, ?) "
+                "ON CONFLICT(symbol) DO NOTHING",
+                (symbol, time.time()),
+            )
+        conn.commit()
+        conn.close()
+
+    def get_symbol(self, symbol: str) -> Optional[SymbolState]:
+        conn = self._connect()
+        row = conn.execute("SELECT * FROM symbols WHERE symbol=?", (symbol,)).fetchone()
+        conn.close()
+        return _row_to_symbol(row) if row else None
+
+    def all_symbols(self) -> List[SymbolState]:
+        conn = self._connect()
+        rows = conn.execute("SELECT * FROM symbols ORDER BY symbol").fetchall()
+        conn.close()
+        return [_row_to_symbol(r) for r in rows]
+
+    def update_symbol(self, symbol: str, **values) -> None:
+        cols = [k for k in values if k in _SYMBOL_COLUMNS]
+        if not cols:
+            return
+        assignments = ", ".join(f"{c}=?" for c in cols)
+        params = [values[c] for c in cols] + [time.time(), symbol]
+        conn = self._connect()
+        conn.execute(
+            f"UPDATE symbols SET {assignments}, updated_at=? WHERE symbol=?", params
+        )
+        conn.commit()
+        conn.close()
+
+    def set_symbol_state(self, symbol: str, state: str, **values) -> None:
+        values["strategy_state"] = state
+        self.update_symbol(symbol, **values)
+
+    def set_cooldown(self, symbol: str, until_ts: float) -> None:
+        self.update_symbol(symbol, cooldown_until=until_ts)
+
+    def stop_symbol(self, symbol: str, reason: str) -> None:
+        self.update_symbol(
+            symbol,
+            risk_status="stopped",
+            strategy_state="STOPPED",
+            exit_reason=reason,
+        )
+
+    # ----- orders -----
+
+    def create_order(
+        self,
+        client_order_id: str,
+        symbol: str,
+        side: str,
+        order_type: str,
+        price: float,
+        qty: float,
+        mode: str,
+        parent_order_id: Optional[int] = None,
+        target_sell_price: Optional[float] = None,
+    ) -> int:
+        conn = self._connect()
+        cur = conn.execute(
+            "INSERT INTO orders(client_order_id, symbol, side, type, price, qty, "
+            "status, mode, parent_order_id, target_sell_price, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                client_order_id, symbol, side, order_type, price, qty,
+                "NEW", mode, parent_order_id, target_sell_price,
+                time.time(), time.time(),
+            ),
+        )
+        conn.commit()
+        order_id = int(cur.lastrowid)
+        conn.close()
+        return order_id
+
+    def update_order_status(
+        self, order_id: int, status: str, filled_qty: Optional[float] = None
+    ) -> None:
+        conn = self._connect()
+        if filled_qty is None:
+            conn.execute(
+                "UPDATE orders SET status=?, updated_at=? WHERE id=?",
+                (status, time.time(), order_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE orders SET status=?, filled_qty=?, updated_at=? WHERE id=?",
+                (status, filled_qty, time.time(), order_id),
+            )
+        conn.commit()
+        conn.close()
+
+    def get_order(self, order_id: int) -> Optional[Dict]:
+        conn = self._connect()
+        row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_order_by_client_id(self, client_order_id: str) -> Optional[Dict]:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM orders WHERE client_order_id=?", (client_order_id,)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
+        conn = self._connect()
+        if symbol is None:
+            rows = conn.execute(
+                "SELECT * FROM orders WHERE status IN (?, ?) ORDER BY id",
+                OPEN_ORDER_STATUSES,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM orders WHERE symbol=? AND status IN (?, ?) ORDER BY id",
+                (symbol, *OPEN_ORDER_STATUSES),
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def count_open_orders(self, symbol: Optional[str] = None) -> int:
+        return len(self.open_orders(symbol))
+
+    # ----- fills / pnl / fees -----
+
+    def record_fill(
+        self,
+        order_id: int,
+        symbol: str,
+        side: str,
+        price: float,
+        qty: float,
+        fee: float,
+        realized_pnl: float = 0.0,
+        trade_id: Optional[str] = None,
+    ) -> None:
+        conn = self._connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO fills(order_id, symbol, side, price, qty, fee, "
+            "realized_pnl, trade_id, ts) VALUES(?,?,?,?,?,?,?,?,?)",
+            (order_id, symbol, side, price, qty, fee, realized_pnl, trade_id, time.time()),
+        )
+        conn.commit()
+        conn.close()
+
+    def sum_realized_pnl(self, symbol: Optional[str] = None) -> float:
+        conn = self._connect()
+        if symbol is None:
+            row = conn.execute("SELECT COALESCE(SUM(realized_pnl), 0) AS s FROM fills").fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0) AS s FROM fills WHERE symbol=?",
+                (symbol,),
+            ).fetchone()
+        conn.close()
+        return float(row["s"])
+
+    def sum_fees(self, symbol: Optional[str] = None) -> float:
+        conn = self._connect()
+        if symbol is None:
+            row = conn.execute("SELECT COALESCE(SUM(fee), 0) AS s FROM fills").fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(fee), 0) AS s FROM fills WHERE symbol=?",
+                (symbol,),
+            ).fetchone()
+        conn.close()
+        return float(row["s"])
+
+    def count_completed_grids(self, symbol: str) -> int:
+        """A completed grid = one executed sell closing a bought unit."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM fills WHERE symbol=? AND side='SELL'",
+            (symbol,),
+        ).fetchone()
+        conn.close()
+        return int(row["n"])
+
+    # ----- risk events -----
+
+    def add_risk_event(self, scope: str, event: str, details: str = "") -> None:
+        conn = self._connect()
+        conn.execute(
+            "INSERT INTO risk_events(ts, scope, event, details) VALUES(?,?,?,?)",
+            (time.time(), scope, event, details),
+        )
+        conn.commit()
+        conn.close()
+
+    def recent_risk_events(self, limit: int = 50) -> List[Dict]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM risk_events ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    # ----- health -----
+
+    def database_status(self) -> Dict:
+        try:
+            size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+            conn = self._connect()
+            conn.execute("SELECT 1").fetchone()
+            conn.close()
+            return {"ok": True, "path": self.path, "size_bytes": size}
+        except Exception as exc:  # dashboard must never crash on DB issues
+            return {"ok": False, "path": self.path, "error": str(exc)}

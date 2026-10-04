@@ -1,25 +1,26 @@
+# Secrets / operator configuration
 .env
-.venv/
+
+# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-data/*.sqlite3
-data/*.sqlite3-*
-logs/*.log
-logs/*.csv
-logs/*.jsonl
-*.bak
-.pytest-tmp*/
+.venv/
+venv/
+
+# Runtime state (SQLite) and logs
+*.db
+*.db-*
 *.sqlite3
-
-# CodeBuddy download artifacts — not part of the project
-.codebuddy/skills/Downloads/
-
-# Runtime / validation artifacts
+*.sqlite3-*
 data/
-validation/__pycache__/
+logs/
+*.log
+
+# Local tooling scratch
+.pytest-tmp*/
 
 # Internal AI/autonomous-coding artifacts — local only, not part of the repo
 AGENTS.md

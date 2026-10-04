@@ -1,263 +1,221 @@
-"""Tests for config_loader validation."""
+"""Config tests: .env-only loading, validation, live-safety gates."""
 
-from decimal import Decimal
+from __future__ import annotations
+
 import pytest
 
-from config_loader import ConfigError, validate_config
+from config import ConfigError, load_config
+from conftest import make_config, write_env_file
 
 
-def _base_config():
-    """Minimal valid config for grid trading."""
-    return {
-        "environment": {"mode": "testnet", "dry_run": True, "allow_live_execution": False},
-        "symbols": "BTCUSDT",
-        "timeframe": "4h",
-        "grid": {
-            "mode_by_symbol": {
-                "BTCUSDT": "arithmetic"
-            },
-            "step_pct": Decimal("0.006"),
-            "min_cells": 6,
-            "max_levels": 40,
-            "hard_min_net_pct": Decimal("0.002"),
-            "preferred_net_max_pct": Decimal("0.004"),
-            "min_gross_profit_pct": Decimal("0.005"),
-        },
-        "range": {
-            "mode": "manual",
-            "lower_price": Decimal("98"),
-            "upper_price": Decimal("103"),
-            "lookback": 200,
-            "buffer_pct": Decimal("0.01"),
-            "auto": {},
-        },
-        "strategy": {
-            "entry": {
-                "adx_max": Decimal("20"),
-                "rsi_max": Decimal("35"),
-                "bb_percent_b_max": Decimal("0"),
-                "volume_oscillator_min": Decimal("0"),
-            },
-            "exit": {
-                "rsi_min": Decimal("70"),
-                "adx_min": Decimal("25"),
-                "bb_percent_b_min": Decimal("1"),
-                "zscore_threshold": Decimal("2.5"),
-            },
-            "cooldown_hours": 3,
-        },
-        "market_filter": {
-            "adx_max": Decimal("28"),
-            "atr_pct_max": Decimal("0.025"),
-            "bb_width_max": Decimal("0.06"),
-            "volume_spike_max": Decimal("2.5"),
-        },
-        "execution": {
-            "prefer_limit_maker": True,
-            "stale_order_minutes": 30,
-            "max_open_orders": 40,
-            "order_quote_size": Decimal("25"),
-            "total_quote_budget": Decimal("0"),
-            "max_inventory_pct": Decimal("0.70"),
-        },
-        "fees": {
-            "maker_fee_fallback": Decimal("0.001"),
-            "taker_fee_fallback": Decimal("0.001"),
-            "slippage_roundtrip_pct": Decimal("0.0005"),
-        },
-        "paper": {
-            "initial_base_balance": Decimal("2"),
-            "initial_quote_balance": Decimal("1000"),
-            "maker_fee": Decimal("0.001"),
-            "taker_fee": Decimal("0.001"),
-            "fee_asset": "USDT",
-        },
-        "risk": {
-            "max_equity_drawdown_pct": Decimal("0.02"),
-            "range_break_buffer_pct": Decimal("0.01"),
-            "daily_profit_lock_pct": Decimal("0.01"),
-            "cooldown_minutes": 30,
-            "stop_if_below_lower_pct": Decimal("0.02"),
-        },
-        "logging": {
-            "sqlite_path": "grid.sqlite3",
-            "log_path": "grid.log",
-            "csv_path": "trades.csv",
-        },
-    }
+def test_loads_valid_env_file(tmp_path):
+    path = write_env_file(tmp_path / ".env")
+    cfg = load_config(path)
+    assert cfg.binance_env == "testnet"
+    assert cfg.dry_run is True
+    assert cfg.allow_live_execution is False
+    assert cfg.pair_list == ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT")
+    assert cfg.indicator_timeframe == "4h"
+    assert cfg.adx_period == 14
+    assert cfg.bb_std == 2.0
+    assert cfg.entry_adx_max == 20.0
+    assert cfg.exit_zscore_abs_max == 2.5
+    assert cfg.grid_gross_min == 0.005
+    assert cfg.min_net_profit_per_grid == 0.002
+    assert cfg.maker_fee == 0.001
+    assert cfg.slippage_estimate == 0.0005
+    assert cfg.max_drawdown_percent == 2.0
+    assert cfg.stop_if_below_lower_percent == 2.0
+    assert cfg.cooldown_hours == 3.0
+    assert cfg.max_drawdown == 0.02
+    assert cfg.stop_if_below_lower == 0.02
 
 
-def _planner_section(**overrides):
-    """Return a valid adaptive_planner section with optional overrides."""
-    section = {
-        "cooldown_candles": 4,
-        "hysteresis": {
-            "range_change_pct": Decimal("0.02"),
-            "step_change_pct": Decimal("0.10"),
-            "grid_count_change": 3,
-            "quality_degradation": Decimal("5"),
-            "regime_change": True,
-        },
-    }
-    if "cooldown_candles" in overrides:
-        section["cooldown_candles"] = overrides["cooldown_candles"]
-    if "hysteresis" in overrides:
-        section["hysteresis"] = overrides["hysteresis"]
-    return section
+def test_missing_env_file_fails(tmp_path):
+    with pytest.raises(ConfigError, match="not found"):
+        load_config(str(tmp_path / "does_not_exist.env"))
 
 
-def _intelligence_section():
-    return {
-        "timeframe": "4h",
-        "min_candles": 60,
-        "max_candle_age_seconds": 5400,
-        "atr_period": 14,
-        "adx_period": 14,
-        "bb_length": 20,
-        "bb_std_mult": 2.0,
-        "volume_baseline_period": 20,
-        "range_stability_period": 20,
-        "regime": {
-            "adx_trend_min": 25,
-            "atr_expansion_ratio": 1.5,
-            "price_range_inclusion_min": 0.90,
-            "directional_efficiency_max": 0.60,
-        },
-        "liquidity": {
-            "max_spread_pct": 0.003,
-            "max_quote_ticker_age_seconds": 10,
-        },
-        "quality": {
-            "min_range_quality_score": 60,
-            "weight_trend_stability": 0.25,
-            "weight_volatility_suitability": 0.20,
-            "weight_bb_width_suitability": 0.15,
-            "weight_volume_stability": 0.10,
-            "weight_spread_suitability": 0.10,
-            "weight_range_containment": 0.20,
-        },
-    }
+def test_defaults_for_optional_safety_keys(tmp_path):
+    # DRY_RUN / ALLOW_LIVE_EXECUTION / BINANCE_ENV default to safe values.
+    path = write_env_file(
+        tmp_path / ".env",
+        **{"BINANCE_ENV": None, "DRY_RUN": None, "ALLOW_LIVE_EXECUTION": None},
+    )
+    cfg = load_config(path)
+    assert cfg.dry_run is True
+    assert cfg.allow_live_execution is False
+    assert cfg.binance_env == "testnet"
 
 
-# --- Baseline validation (no adaptive_planner) ---
-
-def test_base_config_passes():
-    cfg = _base_config()
-    # Should not raise
-    validate_config(cfg)
+def test_missing_required_key_fails(tmp_path):
+    path = write_env_file(tmp_path / ".env", RSI_PERIOD=None)
+    with pytest.raises(ConfigError, match="RSI_PERIOD"):
+        load_config(path)
 
 
-# --- adaptive_planner section: missing / malformed ---
-
-def test_missing_section_skipped():
-    """No adaptive_planner key → validation skipped, no error."""
-    cfg = _base_config()
-    # Missing key is fine — just skip
-    validate_config(cfg)
-
-
-def test_not_dict_raises():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = "not_a_dict"
-    with pytest.raises(ConfigError, match="required"):
-        validate_config(cfg)
+def test_missing_key_error_lists_all_problems(tmp_path):
+    path = write_env_file(tmp_path / ".env", RSI_PERIOD=None, ATR_PERIOD=None)
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+    assert "RSI_PERIOD" in str(exc.value)
+    assert "ATR_PERIOD" in str(exc.value)
 
 
-def test_missing_cooldown_candles():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    del cfg["adaptive_planner"]["cooldown_candles"]
-    with pytest.raises(ConfigError, match="cooldown_candles"):
-        validate_config(cfg)
+def test_invalid_bool_fails(tmp_path):
+    path = write_env_file(tmp_path / ".env", DRY_RUN="yes")
+    with pytest.raises(ConfigError, match="DRY_RUN"):
+        load_config(path)
 
 
-def test_cooldown_candles_zero():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section(cooldown_candles=0)
-    with pytest.raises(ConfigError, match="cooldown_candles"):
-        validate_config(cfg)
+def test_invalid_timeframe_fails(tmp_path):
+    path = write_env_file(tmp_path / ".env", INDICATOR_TIMEFRAME="4hh")
+    with pytest.raises(ConfigError, match="INDICATOR_TIMEFRAME"):
+        load_config(path)
 
 
-def test_cooldown_candles_negative():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section(cooldown_candles=-1)
-    with pytest.raises(ConfigError, match="cooldown_candles"):
-        validate_config(cfg)
+def test_timeframe_1h_and_4h_both_accepted(tmp_path):
+    for tf in ("1h", "4h"):
+        path = write_env_file(tmp_path / f".env_{tf}", INDICATOR_TIMEFRAME=tf)
+        assert load_config(path).indicator_timeframe == tf
 
 
-def test_missing_hysteresis():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    del cfg["adaptive_planner"]["hysteresis"]
-    with pytest.raises(ConfigError, match="hysteresis"):
-        validate_config(cfg)
+def test_invalid_number_fails(tmp_path):
+    path = write_env_file(tmp_path / ".env", ATR_PERIOD="fourteen")
+    with pytest.raises(ConfigError, match="ATR_PERIOD"):
+        load_config(path)
 
 
-def test_hysteresis_not_dict():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    cfg["adaptive_planner"]["hysteresis"] = "bad"
-    with pytest.raises(ConfigError, match="hysteresis"):
-        validate_config(cfg)
+def test_invalid_pair_list_fails(tmp_path):
+    path = write_env_file(tmp_path / ".env", PAIR_LIST="BTCUSDT")
+    with pytest.raises(ConfigError, match="PAIR_LIST"):
+        load_config(path)
 
 
-def test_range_change_pct_zero():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    cfg["adaptive_planner"]["hysteresis"]["range_change_pct"] = Decimal("0")
-    with pytest.raises(ConfigError, match="range_change_pct"):
-        validate_config(cfg)
+def test_no_yaml_configuration_source(tmp_path):
+    # A config.yaml placed next to .env must be ignored entirely: .env is
+    # the single source of truth.
+    (tmp_path / "config.yaml").write_text(
+        "DRY_RUN: false\nALLOW_LIVE_EXECUTION: true\nBINANCE_ENV: live\n",
+        encoding="utf-8",
+    )
+    path = write_env_file(tmp_path / ".env")  # dry_run=true, gates closed
+    cfg = load_config(path)
+    assert cfg.dry_run is True
+    assert cfg.allow_live_execution is False
+    assert cfg.binance_env == "testnet"
 
 
-def test_range_change_pct_negative():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    cfg["adaptive_planner"]["hysteresis"]["range_change_pct"] = Decimal("-0.01")
-    with pytest.raises(ConfigError, match="range_change_pct"):
-        validate_config(cfg)
+def test_default_config_never_permits_live(tmp_path):
+    path = write_env_file(tmp_path / ".env")
+    cfg = load_config(path)
+    assert cfg.allow_live is False
 
 
-def test_step_change_pct_zero():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    cfg["adaptive_planner"]["hysteresis"]["step_change_pct"] = Decimal("0")
-    with pytest.raises(ConfigError, match="step_change_pct"):
-        validate_config(cfg)
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "true", "BINANCE_ENV": "live",
+          "BINANCE_LIVE_API_KEY": "k", "BINANCE_LIVE_API_SECRET": "s"}, True),   # all three gates explicit
+        ({"DRY_RUN": "true", "ALLOW_LIVE_EXECUTION": "true", "BINANCE_ENV": "live"}, False),  # dry-run still on
+        ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "false", "BINANCE_ENV": "live"}, None), # contradictory -> ConfigError
+        ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "true", "BINANCE_ENV": "testnet",
+          "BINANCE_TESTNET_API_KEY": "tk", "BINANCE_TESTNET_API_SECRET": "ts"}, False),         # testnet env
+        ({"DRY_RUN": "true", "ALLOW_LIVE_EXECUTION": "false", "BINANCE_ENV": "testnet"}, False),# full defaults
+    ],
+)
+def test_live_requires_all_three_gates(tmp_path, overrides, expected):
+    path = write_env_file(tmp_path / ".env", **overrides)
+    if expected is None:
+        with pytest.raises(ConfigError, match="refusing"):
+            load_config(path)
+    else:
+        assert load_config(path).allow_live is expected
 
 
-def test_grid_count_change_negative():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    cfg["adaptive_planner"]["hysteresis"]["grid_count_change"] = -1
-    with pytest.raises(ConfigError, match="grid_count_change"):
-        validate_config(cfg)
+def test_live_credentials_not_exposed_unless_gated(tmp_path):
+    path = write_env_file(
+        tmp_path / ".env",
+        BINANCE_TESTNET_API_KEY="test-key",
+        BINANCE_TESTNET_API_SECRET="test-secret",
+        BINANCE_LIVE_API_KEY="live-key",
+        BINANCE_LIVE_API_SECRET="live-secret",
+    )
+    cfg = load_config(path)
+    assert cfg.api_credentials == ("test-key", "test-secret")
+
+    live_cfg = make_config(
+        dry_run=False, allow_live_execution=True, binance_env="live",
+        live_api_key="live-key", live_api_secret="live-secret",
+    )
+    assert live_cfg.allow_live is True
+    assert live_cfg.api_credentials == ("live-key", "live-secret")
 
 
-def test_grid_count_change_not_int():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    cfg["adaptive_planner"]["hysteresis"]["grid_count_change"] = "abc"
-    with pytest.raises(ConfigError, match="grid_count_change"):
-        validate_config(cfg)
+def test_live_gate_with_empty_live_credentials_fails(tmp_path):
+    path = write_env_file(
+        tmp_path / ".env",
+        DRY_RUN="false",
+        ALLOW_LIVE_EXECUTION="true",
+        BINANCE_ENV="live",
+    )
+    with pytest.raises(ConfigError, match="live execution enabled"):
+        load_config(path)
 
 
-def test_quality_degradation_negative():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    cfg["adaptive_planner"]["hysteresis"]["quality_degradation"] = Decimal("-1")
-    with pytest.raises(ConfigError, match="quality_degradation"):
-        validate_config(cfg)
+def test_real_testnet_execution_requires_testnet_credentials(tmp_path):
+    path = write_env_file(tmp_path / ".env", DRY_RUN="false")
+    with pytest.raises(ConfigError, match="testnet credentials"):
+        load_config(path)
 
 
-def test_regime_change_not_bool():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    cfg["adaptive_planner"]["hysteresis"]["regime_change"] = "yes"
-    with pytest.raises(ConfigError, match="regime_change"):
-        validate_config(cfg)
+def test_gross_minimum_cannot_go_below_specification_floor(tmp_path):
+    path = write_env_file(tmp_path / ".env", GRID_GROSS_MIN="0.004")
+    with pytest.raises(ConfigError, match="GRID_GROSS_MIN"):
+        load_config(path)
 
 
-def test_valid_config_passes():
-    cfg = _base_config()
-    cfg["adaptive_planner"] = _planner_section()
-    validate_config(cfg)
+def test_net_minimum_cannot_go_below_specification_floor(tmp_path):
+    path = write_env_file(tmp_path / ".env", MIN_NET_PROFIT_PER_GRID="0.001")
+    with pytest.raises(ConfigError, match="MIN_NET_PROFIT_PER_GRID"):
+        load_config(path)
+
+
+def test_drawdown_hard_limit_two_percent(tmp_path):
+    path = write_env_file(tmp_path / ".env", MAX_DRAWDOWN_PERCENT="5")
+    with pytest.raises(ConfigError, match="MAX_DRAWDOWN_PERCENT"):
+        load_config(path)
+
+
+def test_lower_boundary_stop_capped_at_two_percent(tmp_path):
+    path = write_env_file(tmp_path / ".env", STOP_IF_BELOW_LOWER_PERCENT="3")
+    with pytest.raises(ConfigError, match="STOP_IF_BELOW_LOWER_PERCENT"):
+        load_config(path)
+
+
+def test_negative_fee_rejected(tmp_path):
+    path = write_env_file(tmp_path / ".env", MAKER_FEE="-0.001")
+    with pytest.raises(ConfigError, match="MAKER_FEE"):
+        load_config(path)
+
+
+def test_grid_mode_mapping():
+    cfg = make_config()
+    assert cfg.grid_mode("BTC/USDT") == "arithmetic"
+    assert cfg.grid_mode("ETH/USDT") == "arithmetic"
+    assert cfg.grid_mode("BNB/USDT") == "arithmetic"
+    assert cfg.grid_mode("SOL/USDT") == "geometric"
+    assert cfg.grid_mode("DOGE/USDT") == "arithmetic"
+
+
+def test_start_equity_defaults_and_validates(tmp_path):
+    path = write_env_file(tmp_path / ".env")  # key omitted -> safe default
+    assert load_config(path).start_equity == 1000.0
+    path = write_env_file(tmp_path / ".env", START_EQUITY="250")
+    assert load_config(path).start_equity == 250.0
+    path = write_env_file(tmp_path / ".env", START_EQUITY="zero")
+    with pytest.raises(ConfigError, match="START_EQUITY"):
+        load_config(path)
+    path = write_env_file(tmp_path / ".env", START_EQUITY="0")
+    with pytest.raises(ConfigError, match="START_EQUITY"):
+        load_config(path)
