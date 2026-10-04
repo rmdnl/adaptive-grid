@@ -230,3 +230,26 @@ def test_schema_migration_v1_to_v2(tmp_path):
     child = store.create_child_sell_order("cid-c", "BTC/USDT", 2.0, 1.0, parent, "dry_run")
     assert store.get_order(child)["parent_order_id"] == parent
     assert store.get_order(parent)["child_sell_qty"] == pytest.approx(1.0)
+
+
+def test_fresh_database_is_stamped_with_current_schema_version(tmp_path):
+    from state import SCHEMA_VERSION
+
+    store = StateStore(str(tmp_path / "fresh.db"))
+    assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
+
+
+def test_migration_is_idempotent_across_repeated_startups(tmp_path):
+    """Opening an already-migrated database again and again must be a
+    no-op: version stays, columns are not re-added, data intact."""
+    from state import SCHEMA_VERSION
+
+    path = str(tmp_path / "idem.db")
+    first = StateStore(path)
+    first.ensure_symbols(["BTC/USDT"])
+    first.set_symbol_state("BTC/USDT", "ACTIVE", last_price=1.0)
+
+    for _ in range(3):
+        again = StateStore(path)
+        assert again.get_meta("schema_version") == str(SCHEMA_VERSION)
+        assert again.get_symbol("BTC/USDT").strategy_state == "ACTIVE"

@@ -427,3 +427,115 @@ def test_cycle_error_marks_symbol_error_not_crash(env):
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state == "ERROR"
     assert any(e["event"] == "cycle_error" for e in store.recent_risk_events())
+
+
+def test_restart_during_active_grid_does_not_duplicate_orders(tmp_path):
+    """A restart with an open grid resumes management: no accidental grid
+    recreation, no duplicate orders, no duplicate fills."""
+    bot, store, market = _env(tmp_path)
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    before_ids = [o["id"] for o in store.open_orders("BTC/USDT")]
+    assert len(before_ids) == 5
+
+    # restart with a fresh bot over the same database
+    restarted = Bot(bot.cfg, store, market, DryRunExecutor(bot.cfg, store))
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    restarted.run_once()
+
+    after_ids = [o["id"] for o in store.open_orders("BTC/USDT")]
+    assert after_ids == before_ids                    # same orders, no duplicates
+    assert store.get_symbol("BTC/USDT").strategy_state == "ACTIVE"
+    assert store.sum_realized_pnl() == pytest.approx(0.0)
+
+
+def _env(tmp_path):
+    store = StateStore(str(tmp_path / "state.db"))
+    market = StubMarket()
+    cfg = make_config()
+    bot = Bot(cfg, store, market, DryRunExecutor(cfg, store))
+    return bot, store, market
+
+
+def test_interrupted_exit_recovery_liquidates_uncovered_inventory(tmp_path):
+    """A process crash between order cancellation and liquidation leaves
+    inventory without covering sells. After restart the bot must finish
+    the liquidation and stop the symbol — never resume on it."""
+    bot, store, market = _env(tmp_path)
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    fill_candle = {"high": 49990.0, "low": 49600.0, "close": 49900.0}
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=fill_candle)
+    bot.run_once()
+    assert store.get_symbol("BTC/USDT").inventory_qty > 0
+
+    # simulate the crash: exit cancelled the orders but never liquidated
+    assert bot.executor.cancel_all("BTC/USDT") is True
+    store.set_symbol_state("BTC/USDT", "EXITING", exit_reason="rsi_overbought")
+
+    # restart; the market is no longer exit-worthy (rsi back to 30)
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    restarted = Bot(bot.cfg, store, market, DryRunExecutor(bot.cfg, store))
+    restarted.run_once()
+
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "STOPPED"
+    assert st.inventory_qty == pytest.approx(0.0)     # liquidated on recovery
+    assert store.count_open_orders("BTC/USDT") == 0
+    assert any(
+        e["event"] == "interrupted_exit_recovery" for e in store.recent_risk_events()
+    )
+    # the liquidation sale is accounted exactly once (sold at the
+    # recovery cycle's refreshed price 50000, minus slippage)
+    sale_price = 50000.0 * (1.0 - make_config().slippage_estimate)
+    assert store.sum_realized_pnl("BTC/USDT") == pytest.approx(
+        0.00021 * (sale_price - 49650.0), abs=1e-9
+    )
+
+
+def test_stopped_symbol_keeps_exit_reason_across_cycles(tmp_path):
+    """STOPPED remains authoritative: the recorded exit reason survives
+    subsequent cycles and no orders are ever created for the symbol."""
+    bot, store, market = _env(tmp_path)
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    # closed 15m candle 4% below the lower boundary (48250)
+    market.set("BTC/USDT", snap_entry(), close_15m=46320.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    assert store.get_symbol("BTC/USDT").exit_reason == "lower_boundary_breach"
+
+    # later cycles must not wipe the stop reason nor place orders
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "STOPPED"
+    assert st.exit_reason == "lower_boundary_breach"
+    assert store.count_open_orders("BTC/USDT") == 0
+
+
+def test_service_loop_survives_cycle_exceptions(monkeypatch):
+    """Anything escaping run_once (e.g. a database blip during the equity
+    update) is logged and retried next cycle instead of killing the bot."""
+    import bot as bot_module
+
+    calls = {"n": 0}
+
+    class FlakyBot:
+        def run_once(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated database blip")
+
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            raise KeyboardInterrupt()  # end the loop after two cycles
+
+    monkeypatch.setattr(bot_module.time, "sleep", fake_sleep)
+    with pytest.raises(KeyboardInterrupt):
+        bot_module._service_loop(FlakyBot())
+    assert calls["n"] == 2  # the failure did not stop the loop
+    assert sleeps == [bot_module.CYCLE_SECONDS, bot_module.CYCLE_SECONDS]

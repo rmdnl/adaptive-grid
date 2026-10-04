@@ -128,8 +128,9 @@ class Bot:
         snap = view.snapshot
         st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
 
-        self.store.update_symbol(
-            symbol,
+        # Refresh the market/indicator view; a STOPPED symbol keeps its
+        # recorded exit reason (the state must stay authoritative).
+        market_fields = dict(
             timeframe=self.cfg.indicator_timeframe,
             last_price=snap.last_close,
             adx=snap.adx,
@@ -138,9 +139,10 @@ class Bot:
             volume_osc=snap.volume_osc,
             zscore=snap.zscore,
             atr=snap.atr,
-            exit_status=0,
-            exit_reason=None,
         )
+        if st.risk_status != "stopped":
+            market_fields.update(exit_status=0, exit_reason=None)
+        self.store.update_symbol(symbol, **market_fields)
 
         if st.risk_status == "stopped":
             self.store.set_symbol_state(symbol, "STOPPED")
@@ -173,6 +175,16 @@ class Bot:
                     symbol,
                 )
             self.executor.sync_fills(symbol, view.last_candle, allow_renewal=allow_renewal)
+            if self._has_uncovered_inventory(symbol):
+                # A previous exit or kill was interrupted (orders cancelled
+                # but liquidation never completed): finish the liquidation
+                # and stop the symbol — never resume on uncovered inventory.
+                log.error("interrupted exit detected for %s — liquidating (fail-closed)", symbol)
+                self.store.add_risk_event(
+                    symbol, "interrupted_exit_recovery", "inventory without covering sell orders"
+                )
+                self._exit_symbol(symbol, "interrupted_exit_recovery", now, cooldown=False)
+                return
             self.store.set_symbol_state(symbol, "ACTIVE")
             return
 
@@ -230,6 +242,23 @@ class Bot:
         if self.store.count_open_orders(symbol) > 0:
             return True
         return (st.inventory_qty or 0.0) > 0.0
+
+    def _has_uncovered_inventory(self, symbol: str) -> bool:
+        """True when held inventory is not covered by open sell orders.
+
+        In normal operation every bought unit has exactly one child sell
+        until it is sold, so remaining sell quantity always covers the
+        inventory. Uncovered inventory can only mean a previous exit or
+        kill was interrupted between cancellation and liquidation.
+        """
+        covered = sum(
+            float(o["qty"]) - float(o["filled_qty"] or 0.0)
+            for o in self.store.open_orders(symbol)
+            if o["side"] == "SELL"
+        )
+        st = self.store.get_symbol(symbol)
+        inventory = float(st.inventory_qty or 0.0) if st else 0.0
+        return inventory > covered + QTY_TOLERANCE
 
     def _place_grid(self, symbol: str, plan: grid_mod.GridPlan) -> None:
         for level in plan.levels:
@@ -362,6 +391,19 @@ def build_runtime(cfg: Config, store: StateStore) -> Tuple[Bot, MarketData]:
     return Bot(cfg, store, market, executor), market
 
 
+def _service_loop(bot: Bot) -> None:
+    """Runtime service loop. Per-symbol failures are contained inside
+    run_once; anything that escapes (e.g. a database blip during the
+    equity update) is logged and retried on the next cycle instead of
+    killing the process — the persisted states keep the system safe."""
+    while True:
+        try:
+            bot.run_once()
+        except Exception:  # noqa: BLE001 — the service loop must survive
+            log.exception("cycle failed; retrying next cycle")
+        time.sleep(CYCLE_SECONDS)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Adaptive grid bot — Binance Spot, dry-run by default"
@@ -393,9 +435,7 @@ def main(argv=None) -> int:
     if args.once:
         bot.run_once()
         return 0
-    while True:
-        bot.run_once()
-        time.sleep(CYCLE_SECONDS)
+    _service_loop(bot)
     return 0
 
 

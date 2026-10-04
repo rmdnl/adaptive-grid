@@ -150,3 +150,17 @@ def test_executable_economics_are_authoritative_after_quantization(cfg):
     )
     # the plan reports the worst level, never the best
     assert plan.net_pct == pytest.approx(min(l.net_pct for l in plan.levels), abs=1e-12)
+
+
+def test_buy_sell_price_ordering_for_both_modes(cfg):
+    """Every level orders strictly: 0 < buy < sell, for arithmetic and
+    geometric grids alike."""
+    cases = (
+        ("BTC/USDT", "arithmetic", 50000.0, 350.0),
+        ("SOL/USDT", "geometric", 100.0, 1.0),
+    )
+    for symbol, mode, price, atr_value in cases:
+        plan = grid.build_grid(symbol, mode, price, atr_value, filters(), cfg)
+        assert plan.executable is True
+        for level in plan.levels:
+            assert 0 < level.buy_price < level.sell_price

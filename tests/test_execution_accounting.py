@@ -11,121 +11,9 @@ import sqlite3
 
 import pytest
 
-from conftest import make_config
+from conftest import FakeSpot, make_config
 from exchange import ExchangeError, LiveExecutor, OrderUnknownState
 from state import StateStore
-
-
-class FakeSpot:
-    """Scriptable BinanceSpot stand-in (same API surface as BinanceSpot)."""
-
-    def __init__(self, adjust_balance=True):
-        self.orders = {}            # cid -> remote order dict
-        self.trades = {}            # orderId -> [trade dicts]
-        self.order_seq = 1000
-        self.trade_seq = 5000
-        self.submit_calls = []      # (type, cid, qty) for every accepted submission
-        self.fail_next_submit = None  # "lost" | "pre" | None
-        self.market_fill_fractions = []  # per-market-order executed fraction
-        self.adjust_balance = adjust_balance
-        self.balances = {}
-        self.fail_balance = False
-
-    # ----- test scripting helpers -----
-
-    def _register(self, cid, symbol, side, order_type, price, qty):
-        self.order_seq += 1
-        self.orders[cid] = {
-            "symbol": symbol, "orderId": self.order_seq, "clientOrderId": cid,
-            "side": side, "type": order_type, "origQty": float(qty),
-            "price": price, "status": "NEW", "executedQty": 0.0,
-        }
-        return self.orders[cid]
-
-    def fill(self, cid, qty, price, fee=0.0, fee_asset="USDT"):
-        """Simulate an execution (full or partial) of a remote order."""
-        order = self.orders[cid]
-        self.trade_seq += 1
-        self.trades.setdefault(order["orderId"], []).append(
-            {
-                "id": str(self.trade_seq),
-                "orderId": order["orderId"],
-                "price": price,
-                "qty": qty,
-                "commission": fee,
-                "commissionAsset": fee_asset,
-            }
-        )
-        order["executedQty"] = float(order["executedQty"]) + float(qty)
-        if order["executedQty"] >= float(order["origQty"]) - 1e-12:
-            order["status"] = "FILLED"
-        else:
-            order["status"] = "PARTIALLY_FILLED"
-        if self.adjust_balance and order["side"] == "SELL":
-            base = order["symbol"].split("/")[0]
-            if base in self.balances:
-                self.balances[base] = self.balances[base] - float(qty)
-        return order
-
-    def _submit(self, order_type, symbol, side, price, qty, cid):
-        mode = self.fail_next_submit
-        self.fail_next_submit = None
-        if mode == "lost":
-            # Request reached the exchange; the response was lost.
-            self._register(cid, symbol, side, order_type, price, qty)
-            raise ExchangeError("timeout: response lost")
-        if mode == "pre":
-            raise ExchangeError("network error before submission")
-        self.submit_calls.append((order_type, cid, float(qty)))
-        order = self._register(cid, symbol, side, order_type, price, qty)
-        if order_type == "MARKET":
-            fraction = self.market_fill_fractions.pop(0) if self.market_fill_fractions else 1.0
-            executed = float(qty) * fraction
-            if executed > 0:
-                self.fill(cid, executed, 100.0)
-            else:
-                order["status"] = "FILLED"  # nothing executable, terminal
-        return dict(self.orders[cid])
-
-    # ----- BinanceSpot API surface -----
-
-    def create_limit_maker_order(self, symbol, side, price, qty, cid):
-        return self._submit("LIMIT_MAKER", symbol, side, price, qty, cid)
-
-    def create_market_order(self, symbol, side, qty, cid):
-        return self._submit("MARKET", symbol, side, None, qty, cid)
-
-    def cancel_order(self, symbol, cid):
-        self.orders[cid]["status"] = "CANCELED"
-        return dict(self.orders[cid])
-
-    def get_order(self, symbol, cid):
-        order = self.orders.get(cid)
-        return dict(order) if order else None
-
-    def get_open_orders(self, symbol=None):
-        return [
-            dict(o)
-            for o in self.orders.values()
-            if o["status"] in ("NEW", "PARTIALLY_FILLED")
-        ]
-
-    def get_my_trades(self, symbol, order_id=None):
-        return [dict(t) for t in self.trades.get(order_id, [])]
-
-    def get_account(self):
-        if self.fail_balance:
-            raise ExchangeError("balance unavailable")
-        return {
-            "balances": [
-                {"asset": a, "free": v, "locked": 0.0} for a, v in self.balances.items()
-            ]
-        }
-
-    def get_balance(self, asset):
-        if self.fail_balance:
-            raise ExchangeError("balance unavailable")
-        return float(self.balances.get(asset, 0.0))
 
 
 def _make_env(tmp_path):
@@ -449,3 +337,70 @@ def test_accounting_continues_correctly_after_restart(tmp_path):
         if o["parent_order_id"] == local_id and o["side"] == "SELL"
     ]
     assert sum(c["qty"] for c in children) == pytest.approx(1.0)
+
+
+def test_cancel_all_accounts_partial_fills_before_cancel(tmp_path):
+    """Fills that landed before the cancellation are accounted exactly
+    once — inventory/PnL/fees must never be lost to a cancel."""
+    store, executor, spot = _make_env(tmp_path)
+    buy_id = executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0, target_sell_price=101.0)
+    cid = store.get_order(buy_id)["client_order_id"]
+    spot.fill(cid, 0.4, 100.0, fee=0.04)
+    spot.fill(cid, 0.2, 100.0, fee=0.02)  # executed 0.6, unseen locally
+
+    assert executor.cancel_all("BTC/USDT") is True
+
+    order = store.get_order(buy_id)
+    assert order["status"] == "CANCELED"
+    assert order["filled_qty"] == pytest.approx(0.6)
+    st = store.get_symbol("BTC/USDT")
+    assert st.inventory_qty == pytest.approx(0.6)   # accounted, not lost
+    assert store.sum_fees("BTC/USDT") == pytest.approx(0.06)
+    assert fills_row_count(store) == 2
+    # no child sell is spawned by the cancel path (the exit/kill flow
+    # liquidates the accounted inventory instead)
+    assert child_sells(store, buy_id) == []
+
+
+def test_cancel_racing_a_full_fill_mirrors_exchange_status(tmp_path):
+    """A cancel that loses the race against a full fill records FILLED
+    with the executed quantity — never a fake CANCELED."""
+    store, executor, spot = _make_env(tmp_path)
+    buy_id = executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0, target_sell_price=101.0)
+    cid = store.get_order(buy_id)["client_order_id"]
+    spot.fill(cid, 1.0, 100.0, fee=0.1)  # fully filled remotely, unseen locally
+
+    assert executor.cancel_all("BTC/USDT") is True  # cancel gets -2011, reconciles
+
+    order = store.get_order(buy_id)
+    assert order["status"] == "FILLED"
+    assert order["filled_qty"] == pytest.approx(1.0)
+    st = store.get_symbol("BTC/USDT")
+    assert st.inventory_qty == pytest.approx(1.0)
+    assert store.sum_fees("BTC/USDT") == pytest.approx(0.1)
+
+
+def test_sync_mirrors_remote_cancellation_with_partial_fill(tmp_path):
+    """A stale local NEW order that the exchange already cancelled (with a
+    partial fill) reconciles to the authoritative state and accounts the
+    unseen fill exactly once."""
+    store, executor, spot = _make_env(tmp_path)
+    buy_id = executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0, target_sell_price=101.0)
+    cid = store.get_order(buy_id)["client_order_id"]
+    spot.fill(cid, 0.5, 100.0, fee=0.05)
+    spot.cancel_order("BTC/USDT", cid)  # exchange cancels the remainder
+
+    executor.sync_fills("BTC/USDT", None)
+
+    order = store.get_order(buy_id)
+    assert order["status"] == "CANCELED"
+    assert order["filled_qty"] == pytest.approx(0.5)
+    st = store.get_symbol("BTC/USDT")
+    assert st.inventory_qty == pytest.approx(0.5)
+    assert store.sum_fees("BTC/USDT") == pytest.approx(0.05)
+    assert fills_row_count(store) == 1
+    # the acquired quantity is converted into a child sell (normal grid
+    # operation keeps inventory covered)
+    children = child_sells(store, buy_id)
+    assert len(children) == 1
+    assert children[0]["qty"] == pytest.approx(0.5)

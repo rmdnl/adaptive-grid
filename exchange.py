@@ -105,6 +105,13 @@ class BinanceSpot:
                 last_error = exc
                 if attempt < retries:
                     time.sleep(0.5 * (attempt + 1))
+            except (ValueError, UnicodeDecodeError) as exc:
+                # Malformed/non-JSON response body (e.g. an HTML error page):
+                # no retry, and always surfaced as an ExchangeError so the
+                # fail-closed handling upstream sees one exception type.
+                raise ExchangeError(
+                    f"{method} {path} returned a malformed response: {exc}"
+                ) from None
         raise ExchangeError(f"{method} {path} failed after retries: {last_error}")
 
     # ----- public market data -----
@@ -460,7 +467,7 @@ class LiveExecutor(BaseExecutor):
     exchange trades of each order (myTrades, keyed by trade id) —
     partial fills are accounted as they happen, exactly once. Unknown
     order state after any submission raises OrderUnknownState — the bot
-ol instead of guessing.
+    fails closed for the symbol instead of guessing.
     """
 
     mode = "live"
@@ -602,16 +609,31 @@ ol instead of guessing.
         return True
 
     def cancel_all(self, symbol: str) -> bool:
+        """Cancel every open order. Trades that landed before the cancel
+        (partial fills, or a cancel racing a fill) are accounted exactly
+        once, and each order's local status mirrors the authoritative
+        exchange status — a cancel racing a fill records FILLED, never a
+        fake CANCELED. Unresolvable orders fail closed."""
         for order in list(self.store.open_orders(symbol)):
             cid = order["client_order_id"]
             try:
-                self.spot.cancel_order(symbol, cid)
+                remote = self.spot.cancel_order(symbol, cid)
             except ExchangeError as exc:
-                existing = self.spot.get_order(symbol, cid)
-                if existing is None or existing.get("status") not in _TERMINAL_STATUSES:
-                    log.error("cancel failed for %s %s: %s", symbol, cid, exc)
+                # The cancel itself may have failed because the order is
+                # already in a terminal state — reconcile before judging.
+                remote = None
+                try:
+                    remote = self.spot.get_order(symbol, cid)
+                except ExchangeError:
+                    pass
+                if remote is None:
+                    log.error("cancel unresolvable for %s %s: %s", symbol, cid, exc)
                     return False
-            self.store.update_order_status(order["id"], "CANCELED", order["filled_qty"])
+            self._record_remote_trades(symbol, remote)
+            status = remote.get("status", "CANCELED")
+            self.store.update_order_status(
+                order["id"], status, float(remote.get("executedQty") or 0)
+            )
         try:
             return len(self.spot.get_open_orders(symbol)) == 0
         except ExchangeError as exc:

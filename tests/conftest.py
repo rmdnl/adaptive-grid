@@ -124,3 +124,122 @@ def make_candle(close, high, low, volume, open_time, close_time, open_=None):
         "volume": volume,
         "close_time": close_time,
     }
+
+
+class FakeSpot:
+    """Scriptable BinanceSpot stand-in (same API surface as BinanceSpot)
+    for offline LiveExecutor tests."""
+
+    def __init__(self, adjust_balance=True):
+        import exchange as _exchange
+        self._exchange = _exchange
+        self.orders = {}            # cid -> remote order dict
+        self.trades = {}            # orderId -> [trade dicts]
+        self.order_seq = 1000
+        self.trade_seq = 5000
+        self.submit_calls = []      # (type, cid, qty) for every accepted submission
+        self.fail_next_submit = None  # "lost" | "pre" | None
+        self.market_fill_fractions = []  # per-market-order executed fraction
+        self.adjust_balance = adjust_balance
+        self.balances = {}
+        self.fail_balance = False
+
+    # ----- test scripting helpers -----
+
+    def _register(self, cid, symbol, side, order_type, price, qty):
+        self.order_seq += 1
+        self.orders[cid] = {
+            "symbol": symbol, "orderId": self.order_seq, "clientOrderId": cid,
+            "side": side, "type": order_type, "origQty": float(qty),
+            "price": price, "status": "NEW", "executedQty": 0.0,
+        }
+        return self.orders[cid]
+
+    def fill(self, cid, qty, price, fee=0.0, fee_asset="USDT"):
+        """Simulate an execution (full or partial) of a remote order."""
+        order = self.orders[cid]
+        self.trade_seq += 1
+        self.trades.setdefault(order["orderId"], []).append(
+            {
+                "id": str(self.trade_seq),
+                "orderId": order["orderId"],
+                "price": price,
+                "qty": qty,
+                "commission": fee,
+                "commissionAsset": fee_asset,
+            }
+        )
+        order["executedQty"] = float(order["executedQty"]) + float(qty)
+        if order["executedQty"] >= float(order["origQty"]) - 1e-12:
+            order["status"] = "FILLED"
+        else:
+            order["status"] = "PARTIALLY_FILLED"
+        if self.adjust_balance and order["side"] == "SELL":
+            base = order["symbol"].split("/")[0]
+            if base in self.balances:
+                self.balances[base] = self.balances[base] - float(qty)
+        return order
+
+    def _submit(self, order_type, symbol, side, price, qty, cid):
+        mode = self.fail_next_submit
+        self.fail_next_submit = None
+        if mode == "lost":
+            # Request reached the exchange; the response was lost.
+            self._register(cid, symbol, side, order_type, price, qty)
+            raise self._exchange.ExchangeError("timeout: response lost")
+        if mode == "pre":
+            raise self._exchange.ExchangeError("network error before submission")
+        self.submit_calls.append((order_type, cid, float(qty)))
+        order = self._register(cid, symbol, side, order_type, price, qty)
+        if order_type == "MARKET":
+            fraction = self.market_fill_fractions.pop(0) if self.market_fill_fractions else 1.0
+            executed = float(qty) * fraction
+            if executed > 0:
+                self.fill(cid, executed, 100.0)
+            else:
+                order["status"] = "FILLED"  # nothing executable, terminal
+        return dict(self.orders[cid])
+
+    # ----- BinanceSpot API surface -----
+
+    def create_limit_maker_order(self, symbol, side, price, qty, cid):
+        return self._submit("LIMIT_MAKER", symbol, side, price, qty, cid)
+
+    def create_market_order(self, symbol, side, qty, cid):
+        return self._submit("MARKET", symbol, side, None, qty, cid)
+
+    def cancel_order(self, symbol, cid):
+        order = self.orders[cid]
+        if order["status"] in ("FILLED", "CANCELED", "EXPIRED", "REJECTED"):
+            # real Binance behaviour: cancelling a terminal order -> -2011
+            raise self._exchange.ExchangeError("-2011 Unknown order sent")
+        order["status"] = "CANCELED"
+        return dict(order)
+
+    def get_order(self, symbol, cid):
+        order = self.orders.get(cid)
+        return dict(order) if order else None
+
+    def get_open_orders(self, symbol=None):
+        return [
+            dict(o)
+            for o in self.orders.values()
+            if o["status"] in ("NEW", "PARTIALLY_FILLED")
+        ]
+
+    def get_my_trades(self, symbol, order_id=None):
+        return [dict(t) for t in self.trades.get(order_id, [])]
+
+    def get_account(self):
+        if self.fail_balance:
+            raise self._exchange.ExchangeError("balance unavailable")
+        return {
+            "balances": [
+                {"asset": a, "free": v, "locked": 0.0} for a, v in self.balances.items()
+            ]
+        }
+
+    def get_balance(self, asset):
+        if self.fail_balance:
+            raise self._exchange.ExchangeError("balance unavailable")
+        return float(self.balances.get(asset, 0.0))
