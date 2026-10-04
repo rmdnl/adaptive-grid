@@ -115,13 +115,28 @@ def test_default_config_never_permits_live(tmp_path):
 @pytest.mark.parametrize(
     "overrides,expected",
     [
+        # all four live gates explicit -> live endpoints/credentials active
         ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "true", "BINANCE_ENV": "live",
-          "BINANCE_LIVE_API_KEY": "k", "BINANCE_LIVE_API_SECRET": "s"}, True),   # all three gates explicit
-        ({"DRY_RUN": "true", "ALLOW_LIVE_EXECUTION": "true", "BINANCE_ENV": "live"}, False),  # dry-run still on
-        ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "false", "BINANCE_ENV": "live"}, None), # contradictory -> ConfigError
+          "EXECUTION_MODE": "live", "BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s"}, True),
+        # dry-run still engaged -> refuse
+        ({"DRY_RUN": "true", "ALLOW_LIVE_EXECUTION": "true", "BINANCE_ENV": "live",
+          "EXECUTION_MODE": "live", "BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s"}, None),
+        # live gate closed -> refuse
+        ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "false", "BINANCE_ENV": "live",
+          "EXECUTION_MODE": "live"}, None),
+        # env=live with a non-live execution mode -> refuse
+        ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "true", "BINANCE_ENV": "live",
+          "EXECUTION_MODE": "paper"}, None),
+        # EXECUTION_MODE=live on testnet env -> refuse
         ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "true", "BINANCE_ENV": "testnet",
-          "BINANCE_TESTNET_API_KEY": "tk", "BINANCE_TESTNET_API_SECRET": "ts"}, False),         # testnet env
-        ({"DRY_RUN": "true", "ALLOW_LIVE_EXECUTION": "false", "BINANCE_ENV": "testnet"}, False),# full defaults
+          "EXECUTION_MODE": "live"}, None),
+        # testnet execution: real orders, testnet URL only, never live
+        ({"DRY_RUN": "false", "ALLOW_LIVE_EXECUTION": "false", "BINANCE_ENV": "testnet",
+          "EXECUTION_MODE": "testnet", "BINANCE_TESTNET_API_KEY": "tk",
+          "BINANCE_TESTNET_API_SECRET": "ts"}, False),
+        # full defaults: paper on testnet
+        ({"DRY_RUN": "true", "ALLOW_LIVE_EXECUTION": "false", "BINANCE_ENV": "testnet",
+          "EXECUTION_MODE": "paper"}, False),
     ],
 )
 def test_live_requires_all_three_gates(tmp_path, overrides, expected):
@@ -138,14 +153,15 @@ def test_live_credentials_not_exposed_unless_gated(tmp_path):
         tmp_path / ".env",
         BINANCE_TESTNET_API_KEY="test-key",
         BINANCE_TESTNET_API_SECRET="test-secret",
-        BINANCE_LIVE_API_KEY="live-key",
-        BINANCE_LIVE_API_SECRET="live-secret",
+        BINANCE_API_KEY="live-key",
+        BINANCE_API_SECRET="live-secret",
     )
     cfg = load_config(path)
     assert cfg.api_credentials == ("test-key", "test-secret")
 
     live_cfg = make_config(
         dry_run=False, allow_live_execution=True, binance_env="live",
+        execution_mode="live",
         live_api_key="live-key", live_api_secret="live-secret",
     )
     assert live_cfg.allow_live is True
@@ -158,14 +174,40 @@ def test_live_gate_with_empty_live_credentials_fails(tmp_path):
         DRY_RUN="false",
         ALLOW_LIVE_EXECUTION="true",
         BINANCE_ENV="live",
+        EXECUTION_MODE="live",
     )
     with pytest.raises(ConfigError, match="live execution enabled"):
         load_config(path)
 
 
 def test_real_testnet_execution_requires_testnet_credentials(tmp_path):
-    path = write_env_file(tmp_path / ".env", DRY_RUN="false")
+    path = write_env_file(tmp_path / ".env", DRY_RUN="false", EXECUTION_MODE="testnet")
     with pytest.raises(ConfigError, match="testnet credentials"):
+        load_config(path)
+
+
+def test_testnet_execution_requires_dry_run_release(tmp_path):
+    path = write_env_file(
+        tmp_path / ".env",
+        DRY_RUN="true",
+        EXECUTION_MODE="testnet",
+        BINANCE_TESTNET_API_KEY="tk",
+        BINANCE_TESTNET_API_SECRET="ts",
+    )
+    with pytest.raises(ConfigError, match="DRY_RUN=false"):
+        load_config(path)
+
+
+def test_paper_mode_defaults_remain_valid(tmp_path):
+    path = write_env_file(tmp_path / ".env")
+    cfg = load_config(path)
+    assert cfg.execution_mode == "paper"
+    assert cfg.allow_live is False
+
+
+def test_invalid_execution_mode_rejected(tmp_path):
+    path = write_env_file(tmp_path / ".env", EXECUTION_MODE="yolo")
+    with pytest.raises(ConfigError, match="EXECUTION_MODE"):
         load_config(path)
 
 
@@ -209,13 +251,16 @@ def test_grid_mode_mapping():
 
 
 def test_start_equity_defaults_and_validates(tmp_path):
-    path = write_env_file(tmp_path / ".env")  # key omitted -> safe default
-    assert load_config(path).start_equity == 1000.0
+    # absent / 0 -> derive the session capital from the testnet USDT balance
+    path = write_env_file(tmp_path / ".env")
+    assert load_config(path).start_equity == 0.0
     path = write_env_file(tmp_path / ".env", START_EQUITY="250")
     assert load_config(path).start_equity == 250.0
+    path = write_env_file(tmp_path / ".env", START_EQUITY="0")
+    assert load_config(path).start_equity == 0.0
     path = write_env_file(tmp_path / ".env", START_EQUITY="zero")
     with pytest.raises(ConfigError, match="START_EQUITY"):
         load_config(path)
-    path = write_env_file(tmp_path / ".env", START_EQUITY="0")
+    path = write_env_file(tmp_path / ".env", START_EQUITY="-5")
     with pytest.raises(ConfigError, match="START_EQUITY"):
         load_config(path)

@@ -17,6 +17,7 @@ from config import Config  # noqa: E402
 
 ENV_DEFAULTS = {
     "BINANCE_ENV": "testnet",
+    "EXECUTION_MODE": "paper",
     "DRY_RUN": "true",
     "ALLOW_LIVE_EXECUTION": "false",
     "PAIR_LIST": "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT",
@@ -45,12 +46,11 @@ ENV_DEFAULTS = {
     "SLIPPAGE_ESTIMATE": "0.0005",
     "MAX_DRAWDOWN_PERCENT": "2",
     "STOP_IF_BELOW_LOWER_PERCENT": "2",
-    "START_EQUITY": "1000",
     "COOLDOWN_HOURS": "3",
     "BINANCE_TESTNET_API_KEY": "",
     "BINANCE_TESTNET_API_SECRET": "",
-    "BINANCE_LIVE_API_KEY": "",
-    "BINANCE_LIVE_API_SECRET": "",
+    "BINANCE_API_KEY": "",
+    "BINANCE_API_SECRET": "",
 }
 
 
@@ -58,6 +58,7 @@ def make_config(**overrides) -> Config:
     """Build a validated Config object directly (defaults match .env.example)."""
     fields = dict(
         binance_env="testnet",
+        execution_mode="paper",
         dry_run=True,
         allow_live_execution=False,
         pair_list=("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"),
@@ -165,6 +166,7 @@ class FakeSpot:
                 "orderId": order["orderId"],
                 "price": price,
                 "qty": qty,
+                "quoteQty": price * qty,
                 "commission": fee,
                 "commissionAsset": fee_asset,
             }

@@ -404,3 +404,26 @@ def test_sync_mirrors_remote_cancellation_with_partial_fill(tmp_path):
     children = child_sells(store, buy_id)
     assert len(children) == 1
     assert children[0]["qty"] == pytest.approx(0.5)
+
+
+def test_fills_persist_full_exchange_provenance(tmp_path):
+    """Each fill stores the exchange trade id, client order id, exchange
+    order id, quote quantity and commission asset — exactly once."""
+    store, executor, spot = _make_env(tmp_path)
+    buy_id = executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0, target_sell_price=101.0)
+    buy_cid = store.get_order(buy_id)["client_order_id"]
+    spot.fill(buy_cid, 0.4, 100.0, fee=0.04, fee_asset="USDT")
+    executor.sync_fills("BTC/USDT", None)
+
+    import sqlite3
+    conn = sqlite3.connect(store.path)
+    conn.row_factory = sqlite3.Row
+    fill = dict(conn.execute(
+        "SELECT * FROM fills WHERE trade_id IS NOT NULL"
+    ).fetchone())
+    conn.close()
+    assert fill["client_order_id"] == buy_cid
+    assert fill["exchange_order_id"] == spot.orders[buy_cid]["orderId"]
+    assert fill["quote_qty"] == pytest.approx(40.0)
+    assert fill["commission_asset"] == "USDT"
+    assert fill["trade_id"] == str(spot.trades[spot.orders[buy_cid]["orderId"]][0]["id"])

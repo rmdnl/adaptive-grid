@@ -11,7 +11,7 @@ import urllib.request
 
 import pytest
 
-from dashboard import build_history, build_payload, make_server
+from dashboard import build_history, build_payload, make_server, render_page
 from state import StateStore
 
 
@@ -21,7 +21,12 @@ def seeded(tmp_path):
     store = StateStore(path)
     store.ensure_symbols(["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"])
     store.set_meta("mode_binance_env", "testnet")
-    store.set_meta("mode_dry_run", "1")
+    store.set_meta("mode_execution", "paper")
+    store.set_meta("session_id", "paper-abc123def456")
+    store.set_meta("session_mode", "paper")
+    store.set_meta("session_env", "testnet")
+    store.set_meta_float("session_start_equity", 10000.0)
+    store.set_meta_float("session_initial_cash", 10000.0)
     buy = store.create_order("cid-b", "BTC/USDT", "BUY", "LIMIT_MAKER", 49650.0, 0.00021, "dry_run")
     store.update_order_status(buy, "FILLED", 0.00021)
     store.record_fill(buy, "BTC/USDT", "BUY", 49650.0, 0.00021, 0.0104, trade_id="t-b1")
@@ -37,18 +42,26 @@ def test_payload_carries_runtime_mode(seeded):
     payload = build_payload(seeded)
     glob = payload["global"]
     assert glob["binance_env"] == "testnet"
-    assert glob["dry_run"] is True
-    assert glob["execution"] == "DRY-RUN"
+    assert glob["execution_mode"] == "paper"
+    assert glob["session"]["mode"] == "paper"
+    assert glob["session"]["env"] == "testnet"
+    assert glob["wallet_usdt"] is None  # no wallet telemetry in this fixture
+    assert glob["session"]["start_equity"] == pytest.approx(10000.0)
+    page = render_page()
+    assert "TESTNET WALLET" in page
+    assert "PAPER EQUITY" in page
+    assert "EXCHANGE EQUITY" in page
 
 
-def test_payload_mode_live_reflects_runtime_record(seeded):
+def test_payload_mode_reflects_runtime_record(seeded):
     store = StateStore(seeded)
-    store.set_meta("mode_binance_env", "live")
-    store.set_meta("mode_dry_run", "0")
+    store.set_meta("mode_binance_env", "testnet")
+    store.set_meta("mode_execution", "testnet")
+    store.set_meta_float("wallet_usdt", 10000.0)
     glob = build_payload(seeded)["global"]
-    assert glob["binance_env"] == "live"
-    assert glob["dry_run"] is False
-    assert glob["execution"] == "LIVE"
+    assert glob["binance_env"] == "testnet"
+    assert glob["execution_mode"] == "testnet"
+    assert glob["wallet_usdt"] == pytest.approx(10000.0)
 
 
 def test_bot_stamps_mode_into_state_for_the_dashboard(tmp_path):
@@ -66,8 +79,10 @@ def test_bot_stamps_mode_into_state_for_the_dashboard(tmp_path):
     Bot(cfg, store, NoMarket(), DryRunExecutor(cfg, store))
     glob = build_payload(str(tmp_path / "state.db"))["global"]
     assert glob["binance_env"] == "testnet"
-    assert glob["dry_run"] is True
-    assert glob["execution"] == "DRY-RUN"
+    assert glob["execution_mode"] == "paper"
+    # session created from the configured capital override
+    assert glob["session"]["start_equity"] == pytest.approx(1000.0)
+    assert glob["session"]["mode"] == "paper"
 
 
 # ----- equity / PnL history from the fills ledger -----

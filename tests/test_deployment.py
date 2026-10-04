@@ -88,3 +88,20 @@ def test_dashboard_source_never_touches_configuration_or_secrets():
     for forbidden in ("dotenv", "load_dotenv", "os.environ", "API_KEY", "API_SECRET",
                       "BINANCE_TESTNET", "BINANCE_LIVE", "api_secret"):
         assert forbidden not in source, forbidden
+
+
+def test_env_example_carries_execution_mode_defaults():
+    env = (REPO / ".env.example").read_text(encoding="utf-8")
+    assert "EXECUTION_MODE=paper" in env
+    assert "BINANCE_ENV=testnet" in env
+    assert "DRY_RUN=true" in env
+    assert "ALLOW_LIVE_EXECUTION=false" in env
+    # production keys use the new names; testnet keys separate
+    assert "BINANCE_API_KEY=" in env and "BINANCE_API_SECRET=" in env
+    assert "BINANCE_TESTNET_API_KEY=" in env
+    assert "BINANCE_LIVE_API_KEY" not in env
+
+
+def test_no_hardcoded_default_capital():
+    env = (REPO / ".env.example").read_text(encoding="utf-8")
+    assert "START_EQUITY=1000" not in env

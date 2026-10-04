@@ -57,6 +57,10 @@ CREATE TABLE IF NOT EXISTS fills (
     fee REAL DEFAULT 0,
     realized_pnl REAL DEFAULT 0,
     trade_id TEXT UNIQUE,
+    quote_qty REAL,
+    commission_asset TEXT,
+    client_order_id TEXT,
+    exchange_order_id INTEGER,
     ts REAL
 );
 CREATE TABLE IF NOT EXISTS risk_events (
@@ -77,7 +81,7 @@ OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
 
 # orders.child_sell_qty tracks how much executed BUY quantity has already
 # been converted into child SELL orders (prevents duplicate child sells).
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Inventory dust below this absolute quantity is zeroed after a SELL.
 _INVENTORY_DUST = 1e-12
@@ -133,8 +137,10 @@ class StateStore:
 
     def _migrate(self) -> None:
         """Minimal deterministic schema migration. Version 1 = the clean
-        rebuild schema (no child_sell_qty); version 2 adds child_sell_qty
-        for duplicate-free child-sell conversion. Idempotent."""
+        rebuild schema; version 2 adds orders.child_sell_qty for
+        duplicate-free child-sell conversion; version 3 adds fill
+        provenance columns (quote_qty, commission_asset, client_order_id,
+        exchange_order_id). Idempotent."""
         conn = self._connect()
         try:
             row = conn.execute(
@@ -150,6 +156,20 @@ class StateStore:
                     conn.execute(
                         "ALTER TABLE orders ADD COLUMN child_sell_qty REAL NOT NULL DEFAULT 0"
                     )
+            if version < 3:
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(fills)").fetchall()
+                }
+                for column, decl in (
+                    ("quote_qty", "REAL"),
+                    ("commission_asset", "TEXT"),
+                    ("client_order_id", "TEXT"),
+                    ("exchange_order_id", "INTEGER"),
+                ):
+                    if column not in cols:
+                        conn.execute(f"ALTER TABLE fills ADD COLUMN {column} {decl}")
+            if version < SCHEMA_VERSION:
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -402,6 +422,10 @@ class StateStore:
         qty: float,
         fee: float,
         trade_id: Optional[str] = None,
+        quote_qty: Optional[float] = None,
+        commission_asset: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        exchange_order_id: Optional[int] = None,
     ) -> bool:
         """THE authoritative accounting event for one execution trade.
 
@@ -409,6 +433,9 @@ class StateStore:
         realized PnL (SELL) and the fills ledger — atomically, in a single
         transaction. `trade_id` is the idempotency key: a trade recorded
         before (including after restart) returns False and mutates nothing.
+
+        Provenance (quote_qty, commission_asset, client_order_id,
+        exchange_order_id) is persisted with the fill when provided.
 
         Accounting model: BUY grows inventory at weighted average cost; SELL
         realizes qty x (price - avg_cost) against held inventory; fees are
@@ -448,8 +475,11 @@ class StateStore:
 
             cur = conn.execute(
                 "INSERT OR IGNORE INTO fills(order_id, symbol, side, price, qty, fee, "
-                "realized_pnl, trade_id, ts) VALUES(?,?,?,?,?,?,?,?,?)",
-                (order_id, symbol, side, price, qty, fee, realized, trade_id, time.time()),
+                "realized_pnl, trade_id, quote_qty, commission_asset, client_order_id, "
+                "exchange_order_id, ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (order_id, symbol, side, price, qty, fee, realized, trade_id,
+                 quote_qty, commission_asset, client_order_id, exchange_order_id,
+                 time.time()),
             )
             if cur.rowcount == 0:
                 # Duplicate trade (e.g. replayed reconciliation): the ledger
@@ -533,6 +563,31 @@ class StateStore:
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+    # ----- session reset (explicit operator action) -----
+
+    SESSION_META_KEYS = (
+        "session_id", "session_mode", "session_env", "session_started_ts",
+        "session_start_equity", "session_initial_cash",
+        "equity", "reference_equity", "wallet_usdt",
+        "kill_active", "kill_reason", "runtime_status", "last_cycle_ts",
+    )
+
+    def reset_session(self) -> None:
+        """Wipe all session-scoped trading state (fills, orders, symbol
+        rows, equity/kill meta). Explicit operator action only — the
+        caller must verify there are no open orders. Risk events are kept
+        as permanent audit trail."""
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM fills")
+            conn.execute("DELETE FROM orders")
+            conn.execute("DELETE FROM symbols")
+            placeholders = ", ".join("?" for _ in self.SESSION_META_KEYS)
+            conn.execute(f"DELETE FROM meta WHERE key IN ({placeholders})", self.SESSION_META_KEYS)
+            conn.commit()
+        finally:
+            conn.close()
 
     # ----- health -----
 

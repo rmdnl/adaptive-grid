@@ -50,8 +50,18 @@ def _global_payload(store: StateStore) -> Dict:
     if reference is not None and reference > 0 and equity is not None:
         drawdown = (reference - equity) / reference
     binance_env = store.get_meta("mode_binance_env")
-    dry_run_raw = store.get_meta("mode_dry_run")
+    session = {
+        "id": store.get_meta("session_id"),
+        "mode": store.get_meta("session_mode"),
+        "env": store.get_meta("session_env"),
+        "started_ts": store.get_meta_float("session_started_ts"),
+        "start_equity": store.get_meta_float("session_start_equity"),
+        "initial_cash": store.get_meta_float("session_initial_cash"),
+    }
     return {
+        "execution_mode": store.get_meta("mode_execution"),
+        "wallet_usdt": store.get_meta_float("wallet_usdt"),
+        "session": session,
         "equity": equity,
         "reference_equity": reference,
         "drawdown": drawdown,
@@ -66,8 +76,6 @@ def _global_payload(store: StateStore) -> Dict:
         "database": store.database_status(),
         # operating mode, as persisted by the trading runtime itself
         "binance_env": binance_env,
-        "dry_run": None if dry_run_raw is None else dry_run_raw == "1",
-        "execution": None if dry_run_raw is None else ("DRY-RUN" if dry_run_raw == "1" else "LIVE"),
     }
 
 
@@ -128,9 +136,10 @@ def build_payload(db_path: str, max_drawdown_percent: Optional[float] = None) ->
             "runtime_status": None,
             "last_cycle_ts": None,
             "database": {"ok": False, "path": db_path, "error": str(exc)},
+            "execution_mode": None,
+            "wallet_usdt": None,
+            "session": None,
             "binance_env": None,
-            "dry_run": None,
-            "execution": None,
         }
         return {"global": glob, "symbols": symbols}
     glob["max_drawdown_percent"] = max_drawdown_percent
@@ -198,7 +207,9 @@ header.mast{
   box-shadow:0 0 6px rgba(0,0,0,0)}
 .ind.online .dot{background:var(--green); box-shadow:0 0 7px rgba(61,255,158,.7)}
 .ind.offline .dot{background:var(--red); box-shadow:0 0 7px rgba(255,77,94,.7)}
-.ind.live{border-color:var(--magenta); color:var(--magenta)}
+.ind.live{border-color:var(--red); color:var(--red)}
+.ind.paper{border-color:rgba(255,181,69,.55); color:var(--amber)}
+.ind.testnet{border-color:rgba(79,216,255,.55); color:var(--cyan)}
 .ind .lbl{color:var(--dim)}
 /* ---------- panels ---------- */
 .panel{border:1px solid var(--line); background:linear-gradient(180deg,var(--panel2),var(--panel));
@@ -282,7 +293,8 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
 </header>
 
 <div class="kpis">
-  <div class="panel kpi"><div class="cap">EQUITY</div><div class="val" id="k-equity">&#8212;</div><div class="unit">USDT &middot; PNL-BASED</div></div>
+  <div class="panel kpi"><div class="cap" id="k-equity-label">EQUITY</div><div class="val" id="k-equity">&#8212;</div><div class="unit">USDT &middot; PNL-BASED</div></div>
+  <div class="panel kpi"><div class="cap">TESTNET WALLET</div><div class="val" id="k-wallet">&#8212;</div><div class="unit">USDT &middot; LIVE WALLET READ</div></div>
   <div class="panel kpi"><div class="cap">REFERENCE EQUITY</div><div class="val" id="k-ref">&#8212;</div><div class="unit">HIGH-WATER MARK</div></div>
   <div class="panel kpi risk" id="k-dd-box"><div class="cap">DRAWDOWN</div><div class="val" id="k-dd">&#8212;</div><div class="unit">FROM REFERENCE</div></div>
   <div class="panel kpi"><div class="cap">MAX DRAWDOWN</div><div class="val" id="k-maxdd">&#8212;</div><div class="unit">HARD LIMIT</div></div>
@@ -303,6 +315,8 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
       <span class="item"><span class="k">KILL SWITCH</span><span class="v" id="s-kill">&#8212;</span></span>
       <span class="item"><span class="k">RISK STATUS</span><span class="v" id="s-risk">&#8212;</span></span>
       <span class="item"><span class="k">LAST CYCLE</span><span class="v" id="s-cycle">&#8212;</span></span>
+      <span class="item"><span class="k">SESSION</span><span class="v" id="s-session">&#8212;</span></span>
+      <span class="item"><span class="k">START EQUITY</span><span class="v" id="s-start">&#8212;</span></span>
     </div>
     <div class="killreason" id="killreason"></div>
   </div>
@@ -418,11 +432,15 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     set("system", g.runtime_status === "KILL_ACTIVE" ? "KILL ACTIVE" : (online ? "ONLINE" : "OFFLINE"));
     setCls("ind-system", "ind " + (g.runtime_status === "KILL_ACTIVE" ? "offline" : online ? "online" : "offline"));
     var env = (g.binance_env || "").toUpperCase();
+    var mode = (g.execution_mode || "").toUpperCase();   // PAPER / TESTNET / LIVE
     set("binance", env || "UNKNOWN");
-    setCls("ind-binance", "ind" + (env === "LIVE" ? " live" : ""));
-    set("execution", g.execution ? g.execution.toUpperCase() : "UNKNOWN");
-    setCls("ind-exec", "ind" + (g.execution === "LIVE" ? " live" : ""));
+    setCls("ind-binance", "ind" + (env === "LIVE" ? " live" : " testnet"));
+    set("execution", mode || "UNKNOWN");
+    setCls("ind-exec", "ind" + (mode === "LIVE" ? " live" : mode === "PAPER" ? " paper" : " testnet"));
     set("lastcycle", fmtTs(g.last_cycle_ts));
+    // mode-aware capital labels
+    set("k-equity-label", mode === "PAPER" ? "PAPER EQUITY" : mode === "TESTNET" ? "EXCHANGE EQUITY" : "EQUITY");
+    set("k-wallet", fmtNum(g.wallet_usdt, 2));
 
     // system safety telemetry — explicit text, never color alone
     set("s-runtime", g.runtime_status || "UNKNOWN");
@@ -431,8 +449,13 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     setCls("s-db", "v " + (g.database && g.database.ok ? "ok" : "danger"));
     set("s-binance", env || "UNKNOWN");
     setCls("s-binance", "v " + (env === "LIVE" ? "magenta" : "cyan"));
-    set("s-exec", g.execution ? g.execution.toUpperCase() : "UNKNOWN");
-    setCls("s-exec", "v " + (g.execution === "LIVE" ? "magenta" : "cyan"));
+    set("s-exec", mode || "UNKNOWN");
+    setCls("s-exec", "v " + (mode === "LIVE" ? "magenta" : mode === "PAPER" ? "warn" : "cyan"));
+    var sess = g.session || {};
+    set("s-session", sess.id
+      ? String(sess.id).slice(0, 14) + " · " + String(sess.mode || "?").toUpperCase()
+      : "—");
+    set("s-start", fmtNum(sess.start_equity, 2));
     set("s-kill", g.kill_active ? "ACTIVE" : "INACTIVE");
     setCls("s-kill", "v " + (g.kill_active ? "danger" : "ok"));
     set("s-cycle", fmtTs(g.last_cycle_ts));

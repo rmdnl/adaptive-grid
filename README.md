@@ -4,8 +4,12 @@ A conservative multi-symbol **Binance Spot** grid bot with strict indicator-base
 entry/exit gates, executable grid-economics validation, a global 2% drawdown
 kill switch, and a read-only dashboard.
 
-**Dry-run is the default. Live trading is disabled by every default and
-requires three explicit configuration gates.**
+Two non-live execution modes exist: **PAPER** (internal simulation; session
+capital derived from the Binance testnet USDT balance; no order ever reaches
+Binance) and **TESTNET EXECUTION** (real Binance **Spot Testnet** orders on
+virtual funds). LIVE is disabled by every default and requires all four
+gates: `EXECUTION_MODE=live`, `BINANCE_ENV=live`, `DRY_RUN=false`,
+`ALLOW_LIVE_EXECUTION=true`.
 
 ---
 
@@ -72,18 +76,48 @@ Key groups:
 
 | Group | Keys |
 |---|---|
-| Environment & safety | `BINANCE_ENV`, `DRY_RUN`, `ALLOW_LIVE_EXECUTION` |
+| Environment & safety | `BINANCE_ENV` (`testnet`/`live`), `EXECUTION_MODE` (`paper`/`testnet`/`live`), `DRY_RUN`, `ALLOW_LIVE_EXECUTION` |
 | Market scope | `PAIR_LIST` (e.g. `BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT`), `INDICATOR_TIMEFRAME` |
 | Indicators | `ADX_PERIOD`, `RSI_PERIOD`, `BB_PERIOD`, `BB_STD`, `VO_FAST`, `VO_SLOW`, `ZSCORE_PERIOD`, `ATR_PERIOD` |
 | Entry gate (ALL must hold) | `ENTRY_ADX_MAX`, `ENTRY_RSI_MAX`, `ENTRY_VOLUME_OSC_MIN`, `ENTRY_BB_PERCENT_B_MAX` |
 | Exit gate (ANY triggers) | `EXIT_RSI_MIN`, `EXIT_ADX_MIN`, `EXIT_BB_PERCENT_B_MIN`, `EXIT_ZSCORE_ABS_MAX` |
 | Grid economics | `GRID_STEP_ATR_MULTIPLIER`, `GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`, `MAKER_FEE`, `TAKER_FEE`, `SLIPPAGE_ESTIMATE` |
 | Risk | `MAX_DRAWDOWN_PERCENT` (hard cap 2), `STOP_IF_BELOW_LOWER_PERCENT` (hard cap 2), `START_EQUITY`, `COOLDOWN_HOURS` |
-| Credentials | `BINANCE_TESTNET_API_KEY/SECRET`, `BINANCE_LIVE_API_KEY/SECRET` |
+| Credentials | `BINANCE_TESTNET_API_KEY/SECRET` (testnet), `BINANCE_API_KEY/SECRET` (production; unused unless live is fully gated) |
 
 Hard floors enforced by validation: `GRID_GROSS_MIN >= 0.005` (0.50%),
 `MIN_NET_PROFIT_PER_GRID >= 0.002` (0.20%), `MAX_DRAWDOWN_PERCENT <= 2`,
 `STOP_IF_BELOW_LOWER_PERCENT <= 2`.
+
+### Execution modes
+
+| `BINANCE_ENV` | `EXECUTION_MODE` | Behaviour |
+|---|---|---|
+| `testnet` | `paper` (default) | Internal simulation; session capital derived from the testnet USDT balance at session creation; **no Binance order is ever submitted**; paper transactions never touch the exchange account. |
+| `testnet` | `testnet` | Real Binance **Spot Testnet** orders with testnet credentials only; requires `DRY_RUN=false`; the exchange is the source of truth for fills, fees and inventory. |
+| `live` | `live` | Production execution — locked unless `DRY_RUN=false` **and** `ALLOW_LIVE_EXECUTION=true` **and** live keys exist. |
+
+Consistency is enforced at startup (fail closed): `EXECUTION_MODE=live`
+requires `BINANCE_ENV=live` and vice versa; `EXECUTION_MODE=testnet`
+requires `DRY_RUN=false` and testnet credentials; `EXECUTION_MODE=testnet`
+never touches production endpoints (the base URL is selected by the gates,
+never by keys).
+
+### Session capital (paper/testnet)
+
+At first start the bot creates an execution **session**: the session
+capital comes from `START_EQUITY` (if set > 0) or from the Binance testnet
+USDT balance (requires testnet credentials; fail-closed if unavailable or
+zero). Equity is `session capital + realized PnL − fees + unrealized PnL`;
+the wallet balance is display telemetry only and is never re-imported into
+the paper ledger. Sessions persist: a restart resumes the same capital,
+session id and drawdown baseline. Switching `EXECUTION_MODE`/`BINANCE_ENV`
+against an existing session database refuses startup; the deterministic
+escape hatch is an explicit reset:
+
+```bash
+python bot.py --reset-session    # refuses while orders are open; clears session + kill state
+```
 
 ### Live-trading gates
 
@@ -197,7 +231,7 @@ oscilloscope-style net-PnL chart. Auto-refreshes from the API every 5 s
 without a page reload; on feed failure it shows `DATA STALE` and keeps the
 last good values — nothing is fabricated; `DATA LIVE` returns when the API
 recovers. The environment (`TESTNET`/`LIVE`) and execution mode
-(`DRY-RUN`/`LIVE`) shown in the header are the runtime's own persisted
+(`PAPER`/`TESTNET`/`LIVE`) shown in the header are the runtime's own persisted
 record — they cannot be set or altered from the dashboard.
 
 Routes (GET only): `GET /` (console shell — static HTML/CSS/JS, no external
@@ -236,7 +270,7 @@ Python 3.10+ recommended. Runtime dependencies are minimal: `python-dotenv`
 
 ```bash
 python bot.py --once          # one cycle
-python bot.py                 # loop (30s cycle), DRY_RUN=true by default
+python bot.py                 # loop (30s cycle); PAPER mode by default
 ```
 
 Startup logs the environment as `TESTNET` or `LIVE` (never credentials) and
@@ -244,11 +278,22 @@ refuses to start on any configuration problem.
 
 ### Testnet setup
 
-1. Create API keys at <https://testnet.binance.vision/>.
+1. Create API keys at <https://testnet.binance.vision/> — **Spot trading
+   permission only; withdrawal disabled.**
 2. Put them in `.env` under `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET`.
-3. Keep `BINANCE_ENV=testnet`. With `DRY_RUN=false` the bot submits real
-   **testnet** orders (reconciliation, filters, fees all apply); with
-   `DRY_RUN=true` (default) nothing is ever submitted.
+3. PAPER mode (default) uses these keys read-only to derive session capital;
+   nothing is ever submitted.
+4. To execute real testnet orders, set `EXECUTION_MODE=testnet` and
+   `DRY_RUN=false`. Validate the path first:
+
+```bash
+python bot.py --check-exchange                       # connectivity/auth/filters (read-only)
+python bot.py --testnet-order-selftest BTC/USDT      # place + verify + cancel one far-from-market order
+python bot.py                                        # run testnet execution
+```
+
+The order self-test is flag-gated and never runs automatically; it places a
+LIMIT_MAKER buy 50% below the market and cancels it — it can never fill.
 
 ## Deployment (VPS / systemd)
 
@@ -299,8 +344,8 @@ ss -ltnp | grep 8080
 # 11. verify the dashboard API
 curl -s http://127.0.0.1:8080/api/state | python3 -m json.tool | head -40
 
-# 12. verify DRY-RUN mode (must print true / DRY-RUN)
-curl -s http://127.0.0.1:8080/api/state | grep -E '"dry_run"|"execution"'
+# 12. verify PAPER mode (must print paper / PAPER)
+curl -s http://127.0.0.1:8080/api/state | grep -E '"execution_mode"|"session"')
 
 # 13. verify Binance TESTNET (must print testnet)
 curl -s http://127.0.0.1:8080/api/state | grep '"binance_env"'

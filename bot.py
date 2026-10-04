@@ -19,13 +19,14 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import grid as grid_mod
 import indicators
 import strategy as strategy_mod
-from config import Config, load_config
+from config import Config, ConfigError, load_config
 from exchange import (
     BinanceSpot,
     DryRunExecutor,
@@ -34,6 +35,7 @@ from exchange import (
     OrderUnknownState,
     QTY_TOLERANCE,
 )
+from grid import quantize_price_floor, quantize_qty_ceil
 from risk import BREACH, UNKNOWN, RiskEngine
 from state import StateStore, SymbolState
 
@@ -41,6 +43,13 @@ log = logging.getLogger("bot")
 
 CYCLE_SECONDS = 30
 KLINE_LIMIT = 200
+
+
+class SessionError(Exception):
+    """Raised when the persisted execution session does not match the
+    configured mode/environment, or no session capital can be established.
+    Fail-closed: the bot refuses to start."""
+
 
 
 @dataclass
@@ -87,17 +96,99 @@ class MarketData:
 
 
 class Bot:
-    def __init__(self, cfg: Config, store: StateStore, market: MarketData, executor):
+    def __init__(
+        self,
+        cfg: Config,
+        store: StateStore,
+        market: MarketData,
+        executor,
+        spot: Optional[BinanceSpot] = None,
+    ):
         self.cfg = cfg
         self.store = store
         self.market = market
         self.executor = executor
+        self.spot = spot
         self.risk = RiskEngine(cfg, store)
         store.ensure_symbols(list(cfg.pair_list))
         # Persist the operating mode so the read-only dashboard displays
         # the runtime's own record (display only — no gate reads it).
         store.set_meta("mode_binance_env", cfg.binance_env)
-        store.set_meta("mode_dry_run", "1" if cfg.dry_run else "0")
+        store.set_meta("mode_execution", cfg.execution_mode)
+        self._initialize_session()
+
+    # ----- execution session (paper/testnet capital) -----
+
+    def _initialize_session(self) -> None:
+        """Create or resume the execution session.
+
+        A fresh session derives its capital from the configured
+        START_EQUITY (explicit override) or from the Binance TESTNET USDT
+        balance. An existing session resumes exactly as persisted — the
+        wallet balance is NOT re-imported. A stored session belonging to a
+        different execution mode or environment refuses startup (state
+        isolation); use --reset-session for an explicit reset.
+        """
+        store = self.store
+        existing_mode = store.get_meta("session_mode")
+        existing_env = store.get_meta("session_env")
+        if existing_mode is not None or existing_env is not None:
+            if existing_mode != self.cfg.execution_mode or existing_env != self.cfg.binance_env:
+                raise SessionError(
+                    "state database belongs to execution session "
+                    f"mode={existing_mode!r} env={existing_env!r}; refusing to start "
+                    f"mode={self.cfg.execution_mode!r} env={self.cfg.binance_env!r}. "
+                    "Use the matching mode or reset the session explicitly "
+                    "(bot.py --reset-session)."
+                )
+            log.info(
+                "resuming session %s (mode=%s env=%s capital=%s)",
+                store.get_meta("session_id"),
+                existing_mode,
+                existing_env,
+                store.get_meta_float("session_start_equity"),
+            )
+            return
+
+        capital: Optional[float] = None
+        source = "unknown"
+        if self.cfg.start_equity > 0:
+            capital = self.cfg.start_equity
+            source = "configured START_EQUITY"
+        elif self.spot is not None:
+            try:
+                balance = self.spot.get_balance("USDT")  # signed read-only query
+            except ExchangeError as exc:
+                raise SessionError(
+                    f"cannot initialize session capital from the Binance testnet "
+                    f"USDT balance: {exc}"
+                ) from None
+            if balance <= 0:
+                raise SessionError(
+                    "Binance testnet USDT balance is 0 — cannot initialize session capital"
+                )
+            capital = balance
+            source = "Binance testnet USDT balance"
+            store.set_meta_float("wallet_usdt", balance)
+        else:
+            raise SessionError(
+                "no session capital available: set START_EQUITY in .env "
+                "or provide testnet credentials to derive it from the "
+                "Binance testnet USDT balance"
+            )
+
+        session_id = f"{self.cfg.execution_mode}-{uuid.uuid4().hex[:12]}"
+        store.set_meta("session_id", session_id)
+        store.set_meta("session_mode", self.cfg.execution_mode)
+        store.set_meta("session_env", self.cfg.binance_env)
+        store.set_meta_float("session_started_ts", time.time())
+        store.set_meta_float("session_start_equity", capital)
+        store.set_meta_float("session_initial_cash", capital)
+        store.set_meta_float("reference_equity", capital)
+        log.info(
+            "new session %s: mode=%s env=%s capital=%.2f (%s)",
+            session_id, self.cfg.execution_mode, self.cfg.binance_env, capital, source,
+        )
 
     # ----- cycle -----
 
@@ -125,6 +216,7 @@ class Bot:
                 self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
                 self.store.add_risk_event(symbol, "cycle_error", str(exc))
         self._update_equity(now)
+        self._update_wallet()
         self.store.set_runtime("RUNNING", now)
 
     def _cycle_symbol(self, symbol: str, now_ms: int, now: float) -> None:
@@ -362,6 +454,16 @@ class Bot:
                 self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
                 log.error("fail-closed (%s) during global kill: %s", symbol, exc)
 
+    def _update_wallet(self) -> None:
+        """Display-only testnet wallet telemetry (never used for paper
+        equity after session creation; failures are non-fatal)."""
+        if self.spot is None or not any(self.cfg.api_credentials):
+            return  # no credentials: wallet telemetry unavailable by design
+        try:
+            self.store.set_meta_float("wallet_usdt", self.spot.get_balance("USDT"))
+        except ExchangeError as exc:
+            log.warning("testnet wallet balance unavailable: %s", exc)
+
     # ----- equity / drawdown -----
 
     def _update_equity(self, now: float) -> None:
@@ -371,10 +473,15 @@ class Bot:
         for st in self.store.all_symbols():
             if (st.inventory_qty or 0.0) > 0.0 and st.last_price:
                 unrealized += st.inventory_qty * (st.last_price - (st.avg_cost or 0.0))
-        equity = self.cfg.start_equity + realized - fees + unrealized
+        # The session capital (paper start equity, derived from the testnet
+        # USDT balance or START_EQUITY) anchors the PnL-based equity model.
+        capital = self.store.get_meta_float("session_start_equity")
+        if capital is None:
+            capital = self.cfg.start_equity
+        equity = capital + realized - fees + unrealized
         reference = self.store.get_meta_float("reference_equity")
         if reference is None:
-            reference = self.cfg.start_equity
+            reference = capital
             self.store.set_meta_float("reference_equity", reference)
         if equity > reference:
             reference = equity
@@ -385,14 +492,18 @@ class Bot:
             self._global_kill(f"max_drawdown_breach dd={drawdown:.4%}")
 
 
-def build_runtime(cfg: Config, store: StateStore) -> Tuple[Bot, MarketData]:
-    spot = BinanceSpot(cfg)
+def build_runtime(cfg: Config, store: StateStore, spot: Optional[BinanceSpot] = None) -> Tuple[Bot, MarketData]:
+    if spot is None:
+        spot = BinanceSpot(cfg)
     market = MarketData(spot)
-    if cfg.dry_run:
+    if cfg.execution_mode == "paper":
+        # PAPER: internal simulation only — no order ever reaches Binance.
         executor = DryRunExecutor(cfg, store)
     else:
+        # TESTNET / LIVE: real execution; the exchange is the source of
+        # truth for fills, fees and inventory.
         executor = LiveExecutor(cfg, spot, store)
-    return Bot(cfg, store, market, executor), market
+    return Bot(cfg, store, market, executor, spot=spot), market
 
 
 def _service_loop(bot: Bot) -> None:
@@ -408,13 +519,110 @@ def _service_loop(bot: Bot) -> None:
         time.sleep(CYCLE_SECONDS)
 
 
+def reset_execution_session(cfg: Config, store: StateStore) -> None:
+    """Explicit operator reset of the execution session. This is the
+    deterministic escape hatch for mode switches: it wipes session-scoped
+    trading state (fills, orders, symbol rows, equity, kill state) and a
+    fresh session initializes on the next start. Refuses while open
+    orders exist; risk events are kept as audit trail."""
+    open_orders = store.count_open_orders()
+    if open_orders:
+        raise SessionError(
+            f"refusing to reset: {open_orders} open orders exist — cancel/close them first"
+        )
+    kill_active, _ = store.global_kill()
+    store.reset_session()
+    log.warning(
+        "SESSION RESET by operator (mode=%s env=%s): trading state, session capital "
+        "and kill state (was %s) cleared; a fresh session initializes on next start",
+        cfg.execution_mode, cfg.binance_env, "ACTIVE" if kill_active else "inactive",
+    )
+
+
+def _validate_exchange_access(cfg: Config, spot: BinanceSpot) -> Dict:
+    """Startup gate for trading modes: connectivity, auth, permissions,
+    clock skew, USDT balance and per-symbol filters. Raises on failure."""
+    log.info("validating exchange access (%s) ...", spot.environment)
+    access = spot.validate_trading_access(list(cfg.pair_list))
+    if access["usdt"] <= 0:
+        raise ExchangeError("USDT balance is 0 — cannot trade")
+    log.info(
+        "exchange access validated: environment=%s USDT=%.2f skew=%dms symbols=%s",
+        spot.environment, access["usdt"], access["clock_skew_ms"],
+        ",".join(access["symbols"]),
+    )
+    return access
+
+
+def _testnet_order_selftest(cfg: Config, spot: BinanceSpot, symbol: str) -> int:
+    """Explicit, flag-gated order-path self-test on Binance Spot Testnet.
+
+    Places ONE far-from-market LIMIT_MAKER BUY (50%% below the last closed
+    price, minimum-notional quantity), verifies it rests on the book,
+    cancels it and verifies the cancellation. The order can never fill.
+    Requires EXECUTION_MODE=testnet and is never run automatically.
+    """
+    if cfg.execution_mode != "testnet" or cfg.allow_live:
+        log.error("order self-test is only available in EXECUTION_MODE=testnet")
+        return 1
+    try:
+        _validate_exchange_access(cfg, spot)
+        filters = spot.get_filters(symbol)
+        klines = spot.fetch_klines(symbol, cfg.indicator_timeframe, 2)
+        closed = indicators.closed_candles(klines)
+        if not closed:
+            raise ExchangeError(f"no closed candles for {symbol}")
+        last = float(closed[-1]["close"])
+        price = quantize_price_floor(last * 0.5, filters.tick_size)
+        qty = quantize_qty_ceil(filters.min_notional / price, filters.step_size)
+        if filters.min_qty > 0 and qty < filters.min_qty:
+            qty = quantize_qty_ceil(filters.min_qty, filters.step_size)
+        cid = f"ag-selftest-{uuid.uuid4().hex[:20]}"
+        log.warning(
+            "SELFTEST: placing far-from-market LIMIT_MAKER BUY %s qty=%s price=%s (last=%s)",
+            symbol, qty, price, last,
+        )
+        resp = spot.create_limit_maker_order(symbol, "BUY", price, qty, cid)
+        log.info("SELFTEST: order accepted status=%s", resp.get("status"))
+        found = None
+        for _ in range(3):
+            found = spot.get_order(symbol, cid)
+            if found is not None:
+                break
+            time.sleep(0.5)
+        if found is None:
+            raise ExchangeError("selftest order not found after submission")
+        log.info("SELFTEST: order on book status=%s executed=%s", found.get("status"), found.get("executedQty"))
+        spot.cancel_order(symbol, cid)
+        canceled = spot.get_order(symbol, cid)
+        if canceled is None or canceled.get("status") != "CANCELED":
+            raise ExchangeError("selftest cancellation could not be verified")
+        log.warning("SELFTEST PASSED: order placed, verified and cancelled cleanly")
+        return 0
+    except ExchangeError as exc:
+        log.error("SELFTEST FAILED (fail-closed): %s", exc)
+        return 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Adaptive grid bot — Binance Spot, dry-run by default"
+        description="Adaptive grid bot — Binance Spot (paper/testnet by default; live locked)"
     )
     parser.add_argument("--env", default=".env", help="path to the .env configuration file")
     parser.add_argument("--db", default="state.db", help="path to the SQLite state database")
     parser.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    parser.add_argument(
+        "--reset-session", action="store_true",
+        help="explicitly reset the execution session (paper/testnet local state; refuses while orders are open)",
+    )
+    parser.add_argument(
+        "--check-exchange", action="store_true",
+        help="validate exchange connectivity/auth/filters (read-only) and exit",
+    )
+    parser.add_argument(
+        "--testnet-order-selftest", metavar="SYMBOL",
+        help="place and cancel one far-from-market LIMIT_MAKER order on Binance Spot Testnet, then exit",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -423,18 +631,47 @@ def main(argv=None) -> int:
     )
     cfg = load_config(args.env)
     log.info(
-        "startup: environment=%s dry_run=%s pairs=%s timeframe=%s",
+        "startup: environment=%s execution=%s dry_run=%s pairs=%s timeframe=%s",
         "LIVE" if cfg.allow_live else "TESTNET",
+        cfg.execution_mode.upper(),
         cfg.dry_run,
         ",".join(cfg.pair_list),
         cfg.indicator_timeframe,
     )
-    if cfg.dry_run:
-        log.info("DRY RUN: no real orders will be submitted")
+    if cfg.execution_mode == "paper":
+        log.info("PAPER mode: orders are simulated internally; no Binance orders will be submitted")
 
     store = StateStore(args.db)
     store.ensure_symbols(list(cfg.pair_list))
-    bot, _ = build_runtime(cfg, store)
+
+    if args.reset_session:
+        try:
+            reset_execution_session(cfg, store)
+            return 0
+        except SessionError as exc:
+            log.error("session reset refused: %s", exc)
+            return 1
+
+    spot = BinanceSpot(cfg)
+    try:
+        if args.check_exchange:
+            _validate_exchange_access(cfg, spot)
+            log.warning("exchange access check PASSED")
+            return 0
+        if args.testnet_order_selftest:
+            return _testnet_order_selftest(cfg, spot, args.testnet_order_selftest)
+        # Trading modes validate exchange access before anything can run.
+        if cfg.execution_mode in ("testnet", "live"):
+            _validate_exchange_access(cfg, spot)
+    except (ExchangeError, SessionError) as exc:
+        log.error("startup refused (fail-closed): %s", exc)
+        return 1
+
+    try:
+        bot, _ = build_runtime(cfg, store, spot=spot)
+    except (SessionError, ConfigError) as exc:
+        log.error("startup refused (fail-closed): %s", exc)
+        return 1
 
     if args.once:
         bot.run_once()

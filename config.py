@@ -26,6 +26,11 @@ ALLOWED_TIMEFRAMES = (
     "1h", "2h", "4h", "6h", "8h", "12h", "1d",
 )
 
+# Execution modes: paper = internal simulation (no orders, capital derived
+# from the testnet USDT balance); testnet = real Binance Spot TESTNET orders;
+# live = gated production execution (locked by default).
+ALLOWED_EXECUTION_MODES = ("paper", "testnet", "live")
+
 # Grid type per symbol. Configuration-level mapping only; unknown symbols
 # default to arithmetic.
 GRID_MODES = {
@@ -85,10 +90,16 @@ class Config:
 
     cooldown_hours: float
 
-    # Equity anchor for the drawdown kill switch: the PnL-tracking model
-    # measures equity as start_equity + realized - fees + unrealized, so
-    # the 2% drawdown limit is a percentage of a real capital base instead
-    # of a near-zero PnL peak (which would trip on fee-sized noise).
+    # Execution mode: paper (internal simulation, no orders), testnet (real
+    # Binance Spot TESTNET orders) or live (gated production). See
+    # ALLOWED_EXECUTION_MODES and the fail-closed consistency rules below.
+    execution_mode: str
+
+    # Optional manual session capital override. 0 (the default) means:
+    # derive the session capital from the Binance testnet USDT balance at
+    # session creation. The session capital anchors the PnL-based equity
+    # model (equity = capital + realized - fees + unrealized), so the 2%
+    # drawdown limit is a percentage of a real capital base.
     start_equity: float
 
     testnet_api_key: str
@@ -100,13 +111,14 @@ class Config:
 
     @property
     def allow_live(self) -> bool:
-        """Live endpoints/credentials are used only when ALL three gates
-        are explicitly satisfied: DRY_RUN=false AND ALLOW_LIVE_EXECUTION=true
-        AND BINANCE_ENV=live."""
+        """Live endpoints/credentials are used only when ALL gates are
+        explicitly satisfied: EXECUTION_MODE=live AND BINANCE_ENV=live AND
+        DRY_RUN=false AND ALLOW_LIVE_EXECUTION=true."""
         return (
-            (not self.dry_run)
-            and self.allow_live_execution
+            self.execution_mode == "live"
             and self.binance_env == "live"
+            and (not self.dry_run)
+            and self.allow_live_execution
         )
 
     @property
@@ -282,40 +294,66 @@ def load_config(env_file: str = ".env") -> Config:
 
     cooldown_hours = _get_float(env, "COOLDOWN_HOURS", minimum=0.0, maximum=None, errors=errors)
 
-    start_equity = _get_float(env, "START_EQUITY", default=1000.0, minimum=0.000001, maximum=None, errors=errors)
+    # 0 (or absent) = derive the session capital from the testnet USDT balance.
+    start_equity = _get_float(env, "START_EQUITY", default=0.0, minimum=0.0, maximum=None, errors=errors)
+
+    execution_mode = _get_str(env, "EXECUTION_MODE", default="paper", errors=errors)
+    if execution_mode is not None and execution_mode not in ALLOWED_EXECUTION_MODES:
+        errors.append(
+            f"EXECUTION_MODE must be one of {ALLOWED_EXECUTION_MODES}, got {execution_mode!r}"
+        )
+        execution_mode = None
 
     testnet_api_key = str(env.get("BINANCE_TESTNET_API_KEY") or "").strip()
     testnet_api_secret = str(env.get("BINANCE_TESTNET_API_SECRET") or "").strip()
-    live_api_key = str(env.get("BINANCE_LIVE_API_KEY") or "").strip()
-    live_api_secret = str(env.get("BINANCE_LIVE_API_SECRET") or "").strip()
+    live_api_key = str(env.get("BINANCE_API_KEY") or "").strip()
+    live_api_secret = str(env.get("BINANCE_API_SECRET") or "").strip()
 
     if errors:
         raise ConfigError("invalid configuration:\n- " + "\n- ".join(errors))
 
-    # Live-safety gates: refuse dangerous or contradictory combinations
-    # before anything can run.
-    if binance_env == "live" and dry_run is False and allow_live_execution is False:
+    # ----- execution-mode consistency (fail closed) -----
+    # Allowed combinations:
+    #   BINANCE_ENV=testnet + EXECUTION_MODE=paper
+    #   BINANCE_ENV=testnet + EXECUTION_MODE=testnet (requires DRY_RUN=false)
+    #   BINANCE_ENV=live   + EXECUTION_MODE=live   (requires ALL live gates)
+    # Everything else is refused before anything can run.
+    if execution_mode == "live":
+        if binance_env != "live":
+            raise ConfigError(
+                "refusing EXECUTION_MODE=live with BINANCE_ENV="
+                f"{binance_env!r} (live execution requires BINANCE_ENV=live)"
+            )
+        if dry_run is True or allow_live_execution is False:
+            raise ConfigError(
+                "refusing EXECUTION_MODE=live: live trading requires "
+                "DRY_RUN=false AND ALLOW_LIVE_EXECUTION=true (fail-safe)"
+            )
+        if not live_api_key or not live_api_secret:
+            raise ConfigError("live execution enabled but BINANCE_API_KEY/SECRET are empty")
+    elif binance_env == "live":
         raise ConfigError(
-            "refusing BINANCE_ENV=live with DRY_RUN=false and ALLOW_LIVE_EXECUTION=false "
-            "(fail-safe; live execution requires the explicit gate)"
+            f"refusing BINANCE_ENV=live with EXECUTION_MODE={execution_mode!r} "
+            "(BINANCE_ENV=live requires EXECUTION_MODE=live)"
         )
 
-    allow_live = bool(
-        dry_run is False and allow_live_execution is True and binance_env == "live"
-    )
-    if allow_live and (not live_api_key or not live_api_secret):
-        raise ConfigError("live execution enabled but BINANCE_LIVE_API_KEY/SECRET are empty")
-
-    if dry_run is False and not allow_live and (not testnet_api_key or not testnet_api_secret):
-        raise ConfigError(
-            "DRY_RUN=false requires testnet credentials (BINANCE_TESTNET_API_KEY/SECRET) "
-            "unless all live gates are satisfied"
-        )
+    if execution_mode == "testnet":
+        if dry_run is True:
+            raise ConfigError(
+                "EXECUTION_MODE=testnet requires DRY_RUN=false "
+                "(the trading lock must be released explicitly)"
+            )
+        if not testnet_api_key or not testnet_api_secret:
+            raise ConfigError(
+                "EXECUTION_MODE=testnet requires testnet credentials "
+                "(BINANCE_TESTNET_API_KEY/SECRET)"
+            )
 
     return Config(
         binance_env=binance_env,
         dry_run=bool(dry_run),
         allow_live_execution=bool(allow_live_execution),
+        execution_mode=execution_mode,
         pair_list=pair_list,
         indicator_timeframe=indicator_timeframe,
         adx_period=adx_period,

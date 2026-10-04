@@ -30,8 +30,8 @@ class _FakeResponse(io.BytesIO):
 def _spot(dry_run=False) -> BinanceSpot:
     cfg = make_config(
         dry_run=dry_run,
-        testnet_api_key="" if dry_run else "test-key",
-        testnet_api_secret="" if dry_run else "test-secret",
+        testnet_api_key="test-key",
+        testnet_api_secret="test-secret",
     )
     return BinanceSpot(cfg)
 
@@ -110,23 +110,26 @@ def test_signed_order_post_is_never_blindly_retried(monkeypatch):
     assert calls["n"] == 1  # exactly one HTTP attempt, no blind retry
 
 
-def test_dry_run_refuses_every_signed_request():
-    """DRY_RUN=true must make every private/trading endpoint impossible to
-    call — the refusal happens before any request is built."""
+def test_dry_run_refuses_every_trading_request(monkeypatch):
+    """DRY_RUN=true must make every state-changing trading endpoint
+    impossible to call — the refusal happens before any request is built.
+    Read-only signed queries (account balance) stay available: paper mode
+    needs them to derive session capital from the testnet wallet."""
     spot = _spot(dry_run=True)
-    signed_calls = (
-        spot.get_account,
-        lambda: spot.get_balance("BTC"),
+    trading_calls = (
         lambda: spot.create_limit_maker_order("BTC/USDT", "BUY", 1.0, 1.0, "c"),
         lambda: spot.create_market_order("BTC/USDT", "SELL", 1.0, "c"),
         lambda: spot.cancel_order("BTC/USDT", "c"),
-        lambda: spot.get_order("BTC/USDT", "c"),
-        lambda: spot.get_open_orders("BTC/USDT"),
-        lambda: spot.get_my_trades("BTC/USDT"),
     )
-    for fn in signed_calls:
+    for fn in trading_calls:
         with pytest.raises(ExchangeError, match="DRY_RUN"):
             fn()
+    # read-only signed access remains (paper capital initialization)
+    def fake_urlopen(req, timeout=10):
+        return _FakeResponse(json.dumps({"canTrade": True, "balances": []}).encode())
+
+    monkeypatch.setattr(exchange.urllib.request, "urlopen", fake_urlopen)
+    assert spot.get_balance("USDT") == 0.0
 
 
 def test_live_env_without_live_gates_stays_on_testnet():
@@ -150,6 +153,7 @@ def test_gated_live_uses_live_endpoints():
         dry_run=False,
         allow_live_execution=True,
         binance_env="live",
+        execution_mode="live",
         live_api_key="k",
         live_api_secret="s",
     )
@@ -168,3 +172,74 @@ def test_build_runtime_picks_dry_run_executor_by_default(tmp_path):
     store = StateStore(str(tmp_path / "state.db"))
     bot, _market = build_runtime(make_config(), store)
     assert isinstance(bot.executor, DryRunExecutor)
+
+
+def test_validate_trading_access_checks_all_gates(monkeypatch):
+    """The startup gate verifies clock skew, canTrade, USDT balance and
+    per-symbol tradability — failing closed on the first problem."""
+    spot = _spot()
+
+    class FakeTimeResponse(_FakeResponse):
+        pass
+
+    good_account = json.dumps({
+        "canTrade": True,
+        "balances": [{"asset": "USDT", "free": "10000", "locked": "0"}],
+    }).encode()
+    good_exchangeinfo = json.dumps({
+        "symbols": [{
+            "symbol": "BTCUSDT", "status": "TRADING",
+            "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE", "stepSize": "0.00001", "minQty": "0.00001"},
+                {"filterType": "NOTIONAL", "minNotional": "10"},
+            ],
+        }],
+    }).encode()
+
+    def fake_urlopen(req, timeout=10):
+        if "api/v3/time" in req.full_url:
+            server_now = int(__import__("time").time() * 1000)
+            return _FakeResponse(json.dumps({"serverTime": server_now}).encode())
+        if "api/v3/account" in req.full_url:
+            return _FakeResponse(good_account)
+        if "api/v3/exchangeInfo" in req.full_url:
+            return _FakeResponse(good_exchangeinfo)
+        raise AssertionError(f"unexpected endpoint {req.full_url}")
+
+    monkeypatch.setattr(exchange.urllib.request, "urlopen", fake_urlopen)
+    access = spot.validate_trading_access(["BTC/USDT"])
+    assert access["usdt"] == 10000.0
+    assert access["clock_skew_ms"] < 30_000
+
+    # non-trading symbol -> refused
+    halted = good_exchangeinfo.replace(b'"TRADING"', b'"BREAK"')
+    def halted_urlopen(req, timeout=10):
+        if "api/v3/time" in req.full_url:
+            return _FakeResponse(json.dumps({"serverTime": int(__import__("time").time() * 1000)}).encode())
+        if "api/v3/account" in req.full_url:
+            return _FakeResponse(good_account)
+        return _FakeResponse(halted)
+    monkeypatch.setattr(exchange.urllib.request, "urlopen", halted_urlopen)
+    with pytest.raises(ExchangeError, match="not tradable"):
+        spot.validate_trading_access(["BTC/USDT"])
+
+    # cannot-trade account -> refused
+    no_trade = good_account.replace(b"true", b"false")
+    def no_trade_urlopen(req, timeout=10):
+        if "api/v3/time" in req.full_url:
+            return _FakeResponse(json.dumps({"serverTime": int(__import__("time").time() * 1000)}).encode())
+        return _FakeResponse(no_trade)
+    monkeypatch.setattr(exchange.urllib.request, "urlopen", no_trade_urlopen)
+    with pytest.raises(ExchangeError, match="cannot trade"):
+        spot.validate_trading_access(["BTC/USDT"])
+
+    # excessive clock skew -> refused
+    def skewed_urlopen(req, timeout=10):
+        if "api/v3/time" in req.full_url:
+            old = int(__import__("time").time() * 1000) - 120_000
+            return _FakeResponse(json.dumps({"serverTime": old}).encode())
+        raise AssertionError("should not be reached")
+    monkeypatch.setattr(exchange.urllib.request, "urlopen", skewed_urlopen)
+    with pytest.raises(ExchangeError, match="clock"):
+        spot.validate_trading_access(["BTC/USDT"])

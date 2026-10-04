@@ -75,8 +75,10 @@ class BinanceSpot:
         params = dict(params or {})
         headers = {"User-Agent": "adaptive-grid/1.0"}
         if signed:
-            if self.cfg.dry_run:
-                raise ExchangeError("signed request refused: DRY_RUN is enabled")
+            # DRY_RUN refuses ORDER-STATE-CHANGING calls at the trading
+            # methods, not here: read-only signed queries (account balance)
+            # are required to initialize paper capital from the testnet
+            # wallet. Trading methods enforce the lock themselves.
             if not self._api_key or not self._api_secret:
                 raise ExchangeError("signed request refused: no credentials for this environment")
             params["timestamp"] = int(time.time() * 1000)
@@ -161,6 +163,9 @@ class BinanceSpot:
                 min_notional = float(f.get("minNotional", f.get("notional", 0)) or 0)
         if not tick or not step or min_notional is None:
             raise ExchangeError(f"incomplete exchange filters for {symbol}")
+        status = symbols[0].get("status")
+        if status is not None and status != "TRADING":
+            raise ExchangeError(f"{symbol} is not tradable (status={status!r})")
         return ExchangeFilters(tick, step, min_notional, min_qty or 0.0)
 
     # ----- trading (signed; disabled under DRY_RUN) -----
@@ -168,6 +173,8 @@ class BinanceSpot:
     def create_limit_maker_order(
         self, symbol: str, side: str, price: float, qty: float, client_order_id: str
     ) -> Dict:
+        if self.cfg.dry_run:
+            raise ExchangeError("order submission refused: DRY_RUN is enabled")
         params = {
             "symbol": exchange_symbol(symbol),
             "side": side,
@@ -179,6 +186,8 @@ class BinanceSpot:
         return self._request("POST", "/api/v3/order", params, signed=True)
 
     def create_market_order(self, symbol: str, side: str, qty: float, client_order_id: str) -> Dict:
+        if self.cfg.dry_run:
+            raise ExchangeError("order submission refused: DRY_RUN is enabled")
         params = {
             "symbol": exchange_symbol(symbol),
             "side": side,
@@ -189,6 +198,8 @@ class BinanceSpot:
         return self._request("POST", "/api/v3/order", params, signed=True)
 
     def cancel_order(self, symbol: str, client_order_id: str) -> Dict:
+        if self.cfg.dry_run:
+            raise ExchangeError("order cancellation refused: DRY_RUN is enabled")
         return self._request(
             "DELETE",
             "/api/v3/order",
@@ -234,6 +245,29 @@ class BinanceSpot:
                 return float(b.get("free") or 0) + float(b.get("locked") or 0)
         return 0.0
 
+    def validate_trading_access(self, symbols: List[str]) -> Dict:
+        """Startup gate for trading modes (testnet/live): connectivity,
+        clock skew, authentication, account access, trading permission,
+        USDT balance and per-symbol filters/status. Raises ExchangeError
+        on the first failure — the caller must fail closed."""
+        server = self._request("GET", "/api/v3/time", retries=2)
+        skew_ms = abs(int(server["serverTime"]) - int(time.time() * 1000))
+        if skew_ms > 30_000:
+            raise ExchangeError(
+                f"local clock differs from Binance server time by {skew_ms}ms "
+                "(signed requests would be rejected)"
+            )
+        account = self.get_account()
+        if not account.get("canTrade", False):
+            raise ExchangeError("account cannot trade (canTrade=false)")
+        usdt = 0.0
+        for b in account.get("balances", []):
+            if b.get("asset") == "USDT":
+                usdt = float(b.get("free") or 0) + float(b.get("locked") or 0)
+        for symbol in symbols:
+            self.get_filters(symbol)  # validates filters + TRADING status
+        return {"usdt": usdt, "clock_skew_ms": skew_ms, "symbols": list(symbols)}
+
 
 class Accounting:
     """Thin façade over the authoritative fill recording in StateStore.
@@ -258,9 +292,15 @@ class Accounting:
         qty: float,
         fee: float,
         trade_id: str,
+        quote_qty: Optional[float] = None,
+        commission_asset: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        exchange_order_id: Optional[int] = None,
     ) -> bool:
         recorded = self.store.record_fill(
-            order_id, symbol, side, price, qty, fee, trade_id=trade_id
+            order_id, symbol, side, price, qty, fee, trade_id=trade_id,
+            quote_qty=quote_qty, commission_asset=commission_asset,
+            client_order_id=client_order_id, exchange_order_id=exchange_order_id,
         )
         if recorded:
             log.info(
@@ -337,6 +377,10 @@ class BaseExecutor:
             recorded = self.accounting.record_trade(
                 order["symbol"], order["id"], order["side"],
                 t["price"], t["qty"], t["fee"], t["id"],
+                quote_qty=t.get("quote_qty"),
+                commission_asset=t.get("commission_asset"),
+                client_order_id=order.get("client_order_id"),
+                exchange_order_id=t.get("exchange_order_id"),
             )
             if recorded:
                 new_qty += t["qty"]
@@ -422,8 +466,12 @@ class DryRunExecutor(BaseExecutor):
         order_id = self.store.create_order(cid, symbol, "SELL", "MARKET", price, qty, self.mode)
         self.store.update_order_status(order_id, "FILLED", qty)
         self._account_trades(
-            {"id": order_id, "symbol": symbol, "side": "SELL"},
-            [{"id": f"dry-{cid}", "price": price, "qty": qty, "fee": fee}],
+            {"id": order_id, "symbol": symbol, "side": "SELL", "client_order_id": cid},
+            [{
+                "id": f"dry-{cid}", "price": price, "qty": qty, "fee": fee,
+                "quote_qty": price * qty,
+                "commission_asset": symbol.split("/")[1] if "/" in symbol else "",
+            }],
         )
         log.info("dry-run liquidation %s qty=%s price=%s", symbol, qty, price)
         return True
@@ -444,6 +492,8 @@ class DryRunExecutor(BaseExecutor):
                     "price": order["price"],
                     "qty": order["qty"],
                     "fee": order["price"] * order["qty"] * self.cfg.maker_fee,
+                    "quote_qty": order["price"] * order["qty"],
+                    "commission_asset": order["symbol"].split("/")[1] if "/" in order["symbol"] else "",
                 }
                 self.store.update_order_status(order["id"], "FILLED", order["qty"])
                 self._account_trades(order, [trade])
@@ -454,6 +504,8 @@ class DryRunExecutor(BaseExecutor):
                     "price": order["price"],
                     "qty": order["qty"],
                     "fee": order["price"] * order["qty"] * self.cfg.maker_fee,
+                    "quote_qty": order["price"] * order["qty"],
+                    "commission_asset": order["symbol"].split("/")[1] if "/" in order["symbol"] else "",
                 }
                 self.store.update_order_status(order["id"], "FILLED", order["qty"])
                 self._account_trades(order, [trade])
@@ -665,16 +717,7 @@ class LiveExecutor(BaseExecutor):
         status = remote.get("status", "NEW")
         executed = float(remote.get("executedQty") or 0)
         self.store.update_order_status(order["id"], status, executed)
-        trades = []
-        for t in self.spot.get_my_trades(symbol, remote.get("orderId")):
-            trades.append(
-                {
-                    "id": str(t.get("id")),
-                    "price": float(t["price"]),
-                    "qty": float(t["qty"]),
-                    "fee": self._fee_in_quote(symbol, t),
-                }
-            )
+        trades = self._trades_from_exchange(symbol, remote.get("orderId"))
         self._account_trades(order, trades)
         if order["side"] == "BUY":
             self._spawn_child_sells(order)
@@ -713,17 +756,28 @@ class LiveExecutor(BaseExecutor):
         local = self.store.get_order_by_client_id(remote_order.get("clientOrderId", ""))
         if local is None:
             return
+        trades = self._trades_from_exchange(symbol, remote_order.get("orderId"))
+        self._account_trades(local, trades)
+
+    def _trades_from_exchange(self, symbol: str, order_id: Optional[int]) -> List[Dict]:
+        """Normalize exchange trades into accounting dicts, carrying full
+        provenance (quote quantity, commission asset, exchange order id)."""
         trades = []
-        for t in self.spot.get_my_trades(symbol, remote_order.get("orderId")):
+        for t in self.spot.get_my_trades(symbol, order_id):
+            price = float(t["price"])
+            qty = float(t["qty"])
             trades.append(
                 {
                     "id": str(t.get("id")),
-                    "price": float(t["price"]),
-                    "qty": float(t["qty"]),
+                    "price": price,
+                    "qty": qty,
                     "fee": self._fee_in_quote(symbol, t),
+                    "quote_qty": float(t.get("quoteQty") or 0) or price * qty,
+                    "commission_asset": str(t.get("commissionAsset") or ""),
+                    "exchange_order_id": int(t.get("orderId") or 0) or None,
                 }
             )
-        self._account_trades(local, trades)
+        return trades
 
     def _fee_in_quote(self, symbol: str, trade: Dict) -> float:
         base, quote = symbol.split("/")
