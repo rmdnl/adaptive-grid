@@ -32,6 +32,7 @@ from exchange import (
     ExchangeError,
     LiveExecutor,
     OrderUnknownState,
+    QTY_TOLERANCE,
 )
 from risk import BREACH, UNKNOWN, RiskEngine
 from state import StateStore, SymbolState
@@ -110,8 +111,10 @@ class Bot:
             try:
                 self._cycle_symbol(symbol, now_ms, now)
             except OrderUnknownState as exc:
+                # Unknown order state can never be reconciled: fail closed
+                # permanently for this symbol (risk veto, no re-entry).
                 log.error("fail-closed (%s): %s", symbol, exc)
-                self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
                 self.store.add_risk_event(symbol, "order_unknown_state", str(exc))
             except Exception as exc:  # keep the loop alive, mark the symbol
                 log.exception("cycle failed for %s", symbol)
@@ -264,7 +267,7 @@ class Bot:
                 return
             liquidated = self.executor.place_market_sell(symbol, inventory, ref_price)
             st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
-            if not liquidated or (st.inventory_qty or 0.0) > 1e-12:
+            if not liquidated or (st.inventory_qty or 0.0) > QTY_TOLERANCE:
                 self.store.add_risk_event(symbol, "liquidation_verify_failed", reason)
                 self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
                 log.error("fail-closed: liquidation verification failed for %s", symbol)
@@ -278,14 +281,53 @@ class Bot:
             self.risk.stop_symbol(symbol, reason)
 
     def _global_kill(self, reason: str) -> None:
+        """Global kill switch.
+
+        1. Latch and persist the kill FIRST (stops new orders globally via
+           the risk veto and stays latched across restart, regardless of
+           what fails below).
+        2. Per symbol: cancel all open orders -> verify -> liquidate held
+           inventory -> verify.
+        3. Verification failures are fail-closed (symbol ERROR/STOPPED +
+           risk events) and never clear the kill.
+        """
         log.error("GLOBAL KILL SWITCH: %s", reason)
-        for symbol in self.cfg.pair_list:
-            if self.executor.cancel_all(symbol):
-                self.store.set_symbol_state(symbol, "KILL_ACTIVE")
-            else:
-                self.store.add_risk_event(symbol, "cancel_verify_failed", reason)
-                self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
         self.risk.trigger_global_kill(reason)
+        for symbol in self.cfg.pair_list:
+            try:
+                if not self.executor.cancel_all(symbol):
+                    self.store.add_risk_event(symbol, "cancel_verify_failed", reason)
+                    self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                    log.error(
+                        "fail-closed: cancellation verification failed for %s during global kill",
+                        symbol,
+                    )
+                    continue
+                st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
+                inventory = st.inventory_qty or 0.0
+                if inventory > QTY_TOLERANCE:
+                    ref_price = st.last_price or 0.0
+                    if ref_price <= 0:
+                        self.store.add_risk_event(
+                            symbol, "liquidation_verify_failed", "no price reference during global kill"
+                        )
+                        self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                        continue
+                    liquidated = self.executor.place_market_sell(symbol, inventory, ref_price)
+                    st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
+                    if not liquidated or (st.inventory_qty or 0.0) > QTY_TOLERANCE:
+                        self.store.add_risk_event(symbol, "liquidation_verify_failed", reason)
+                        self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                        log.error(
+                            "fail-closed: liquidation verification failed for %s during global kill",
+                            symbol,
+                        )
+                        continue
+                self.store.set_symbol_state(symbol, "KILL_ACTIVE")
+            except OrderUnknownState as exc:
+                self.store.add_risk_event(symbol, "order_unknown_state", str(exc))
+                self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
+                log.error("fail-closed (%s) during global kill: %s", symbol, exc)
 
     # ----- equity / drawdown -----
 

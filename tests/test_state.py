@@ -97,25 +97,29 @@ def test_get_order_by_client_id(store):
 def test_fills_pnl_and_fees_sums(store):
     b = store.create_order("cid-b2", "BTC/USDT", "BUY", "LIMIT_MAKER", 49650.0, 0.1, "dry_run")
     s = store.create_order("cid-s2", "BTC/USDT", "SELL", "LIMIT_MAKER", 50000.0, 0.1, "dry_run")
-    store.record_fill(b, "BTC/USDT", "BUY", 49650.0, 0.1, 0.0104)
-    store.record_fill(s, "BTC/USDT", "SELL", 50000.0, 0.1, 0.0105, realized_pnl=3.5)
-    store.record_fill(
-        store.create_order("cid-e2", "ETH/USDT", "SELL", "MARKET", 200.0, 0.05, "dry_run"),
-        "ETH/USDT", "SELL", 200.0, 0.05, 0.01, realized_pnl=0.5,
-    )
-    assert store.sum_realized_pnl("BTC/USDT") == pytest.approx(3.5)
-    assert store.sum_realized_pnl() == pytest.approx(4.0)
+    store.record_fill(b, "BTC/USDT", "BUY", 49650.0, 0.1, 0.0104, trade_id="t-b1")
+    store.record_fill(s, "BTC/USDT", "SELL", 50000.0, 0.1, 0.0105, trade_id="t-s1")
+    e = store.create_order("cid-e2", "ETH/USDT", "SELL", "MARKET", 200.0, 0.05, "dry_run")
+    store.record_fill(e, "ETH/USDT", "SELL", 200.0, 0.05, 0.01, trade_id="t-e1")
+    # realized PnL is computed against average cost by the store itself
+    assert store.sum_realized_pnl("BTC/USDT") == pytest.approx(0.1 * (50000.0 - 49650.0))
+    assert store.sum_realized_pnl() == pytest.approx(0.1 * (50000.0 - 49650.0))
+    # a SELL without held inventory realizes nothing
+    assert store.get_symbol("ETH/USDT").inventory_qty == pytest.approx(0.0)
     assert store.sum_fees("BTC/USDT") == pytest.approx(0.0209)
     assert store.sum_fees() == pytest.approx(0.0309)
     assert store.count_completed_grids("BTC/USDT") == 1
     assert store.count_completed_grids("ETH/USDT") == 1
 
 
-def test_duplicate_trade_id_is_ignored(store):
-    oid = store.create_order("cid-t", "BTC/USDT", "BUY", "LIMIT_MAKER", 1.0, 1.0, "live")
-    store.record_fill(oid, "BTC/USDT", "BUY", 1.0, 1.0, 0.001, trade_id="t-1")
-    store.record_fill(oid, "BTC/USDT", "BUY", 1.0, 1.0, 0.001, trade_id="t-1")
-    assert store.sum_fees("BTC/USDT") == pytest.approx(0.001)
+def test_record_fill_is_idempotent_by_trade_id(store):
+    oid = store.create_order("cid-idem", "BTC/USDT", "BUY", "LIMIT_MAKER", 100.0, 2.0, "live")
+    assert store.record_fill(oid, "BTC/USDT", "BUY", 100.0, 2.0, 0.002, trade_id="t-1") is True
+    assert store.record_fill(oid, "BTC/USDT", "BUY", 100.0, 2.0, 0.002, trade_id="t-1") is False
+    assert store.sum_fees("BTC/USDT") == pytest.approx(0.002)
+    st = store.get_symbol("BTC/USDT")
+    assert st.inventory_qty == pytest.approx(2.0)  # recorded exactly once
+    assert st.avg_cost == pytest.approx(100.0)
 
 
 def test_cooldown_persists_across_restart(store, tmp_path):
@@ -168,3 +172,61 @@ def test_database_status_ok(store):
     status = store.database_status()
     assert status["ok"] is True
     assert status["size_bytes"] > 0
+
+
+def test_schema_migration_v1_to_v2(tmp_path):
+    """A pre-existing v1 database (no child_sell_qty) migrates
+    deterministically: column added, version stamped, data preserved."""
+    import sqlite3
+
+    from state import SCHEMA_VERSION
+
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE symbols (
+            symbol TEXT PRIMARY KEY, strategy_state TEXT DEFAULT 'WAITING',
+            inventory_qty REAL DEFAULT 0, avg_cost REAL DEFAULT 0,
+            risk_status TEXT DEFAULT 'ok', updated_at REAL DEFAULT 0
+        );
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_order_id TEXT UNIQUE, symbol TEXT, side TEXT, type TEXT,
+            price REAL, qty REAL, filled_qty REAL DEFAULT 0,
+            status TEXT DEFAULT 'NEW', mode TEXT, parent_order_id INTEGER,
+            target_sell_price REAL, created_at REAL, updated_at REAL
+        );
+        CREATE TABLE fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER,
+            symbol TEXT, side TEXT, price REAL, qty REAL, fee REAL DEFAULT 0,
+            realized_pnl REAL DEFAULT 0, trade_id TEXT UNIQUE, ts REAL
+        );
+        CREATE TABLE risk_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL, scope TEXT, event TEXT, details TEXT
+        );
+        INSERT INTO symbols(symbol, updated_at) VALUES('BTC/USDT', 1.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(path)  # triggers migration
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+    version = conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone()["value"]
+    conn.close()
+    assert "child_sell_qty" in cols
+    assert int(version) == SCHEMA_VERSION
+    # pre-existing data survives the migration
+    assert store.get_symbol("BTC/USDT").strategy_state == "WAITING"
+    # migrated store accepts child-sell tracking
+    parent = store.create_order("cid-p", "BTC/USDT", "BUY", "LIMIT_MAKER", 1.0, 1.0, "dry_run")
+    child = store.create_child_sell_order("cid-c", "BTC/USDT", 2.0, 1.0, parent, "dry_run")
+    assert store.get_order(child)["parent_order_id"] == parent
+    assert store.get_order(parent)["child_sell_qty"] == pytest.approx(1.0)

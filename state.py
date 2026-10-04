@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS orders (
     mode TEXT,
     parent_order_id INTEGER,
     target_sell_price REAL,
+    child_sell_qty REAL NOT NULL DEFAULT 0,
     created_at REAL, updated_at REAL
 );
 CREATE TABLE IF NOT EXISTS fills (
@@ -73,6 +74,13 @@ _SYMBOL_COLUMNS = {
 }
 
 OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
+
+# orders.child_sell_qty tracks how much executed BUY quantity has already
+# been converted into child SELL orders (prevents duplicate child sells).
+SCHEMA_VERSION = 2
+
+# Inventory dust below this absolute quantity is zeroed after a SELL.
+_INVENTORY_DUST = 1e-12
 
 
 @dataclass
@@ -120,6 +128,35 @@ class StateStore:
             conn.commit()
             conn.execute("PRAGMA journal_mode=WAL")
             conn.commit()
+            conn.close()
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Minimal deterministic schema migration. Version 1 = the clean
+        rebuild schema (no child_sell_qty); version 2 adds child_sell_qty
+        for duplicate-free child-sell conversion. Idempotent."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            version = int(row["value"]) if row else 1
+            if version < 2:
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(orders)").fetchall()
+                }
+                if "child_sell_qty" not in cols:
+                    conn.execute(
+                        "ALTER TABLE orders ADD COLUMN child_sell_qty REAL NOT NULL DEFAULT 0"
+                    )
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(SCHEMA_VERSION),),
+                )
+                conn.commit()
+        finally:
             conn.close()
 
     def _connect(self) -> sqlite3.Connection:
@@ -262,6 +299,40 @@ class StateStore:
         conn.close()
         return order_id
 
+    def create_child_sell_order(
+        self,
+        client_order_id: str,
+        symbol: str,
+        price: float,
+        qty: float,
+        parent_order_id: int,
+        mode: str,
+    ) -> int:
+        """Create a child SELL order and mark the parent BUY's quantity as
+        converted — in ONE transaction, so a crash can never produce a
+        duplicate child sell or lose one (duplicate-prevention state)."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO orders(client_order_id, symbol, side, type, price, qty, "
+                "status, mode, parent_order_id, target_sell_price, created_at, updated_at) "
+                "VALUES(?, ?, 'SELL', 'LIMIT_MAKER', ?, ?, 'NEW', ?, ?, NULL, ?, ?)",
+                (
+                    client_order_id, symbol, price, qty, mode, parent_order_id,
+                    time.time(), time.time(),
+                ),
+            )
+            child_id = int(cur.lastrowid)
+            conn.execute(
+                "UPDATE orders SET child_sell_qty = child_sell_qty + ?, updated_at=? "
+                "WHERE id=?",
+                (qty, time.time(), parent_order_id),
+            )
+            conn.commit()
+            return child_id
+        finally:
+            conn.close()
+
     def update_order_status(
         self, order_id: int, status: str, filled_qty: Optional[float] = None
     ) -> None:
@@ -313,6 +384,15 @@ class StateStore:
 
     # ----- fills / pnl / fees -----
 
+    def fill_exists(self, trade_id: str) -> bool:
+        """True when this exchange trade has already been accounted."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT 1 FROM fills WHERE trade_id=?", (trade_id,)
+        ).fetchone()
+        conn.close()
+        return row is not None
+
     def record_fill(
         self,
         order_id: int,
@@ -321,17 +401,70 @@ class StateStore:
         price: float,
         qty: float,
         fee: float,
-        realized_pnl: float = 0.0,
         trade_id: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
+        """THE authoritative accounting event for one execution trade.
+
+        Exactly one call per exchange trade updates inventory, average cost,
+        realized PnL (SELL) and the fills ledger — atomically, in a single
+        transaction. `trade_id` is the idempotency key: a trade recorded
+        before (including after restart) returns False and mutates nothing.
+
+        Accounting model: BUY grows inventory at weighted average cost; SELL
+        realizes qty x (price - avg_cost) against held inventory; fees are
+        tracked separately; equity = start + realized - fees + unrealized.
+        """
         conn = self._connect()
-        conn.execute(
-            "INSERT OR IGNORE INTO fills(order_id, symbol, side, price, qty, fee, "
-            "realized_pnl, trade_id, ts) VALUES(?,?,?,?,?,?,?,?,?)",
-            (order_id, symbol, side, price, qty, fee, realized_pnl, trade_id, time.time()),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            row = conn.execute(
+                "SELECT inventory_qty, avg_cost FROM symbols WHERE symbol=?",
+                (symbol,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO symbols(symbol, inventory_qty, avg_cost, updated_at) "
+                    "VALUES(?, 0, 0, ?)",
+                    (symbol, time.time()),
+                )
+                inventory = 0.0
+                avg_cost = 0.0
+            else:
+                inventory = float(row["inventory_qty"] or 0.0)
+                avg_cost = float(row["avg_cost"] or 0.0)
+
+            realized = 0.0
+            if side == "BUY":
+                new_inventory = inventory + qty
+                avg_cost = ((inventory * avg_cost) + qty * price) / new_inventory
+                inventory = new_inventory
+            else:  # SELL realizes PnL only against actually held inventory
+                sell_qty = min(qty, inventory) if inventory > 0.0 else 0.0
+                if sell_qty > 0.0:
+                    realized = sell_qty * (price - avg_cost)
+                    inventory -= sell_qty
+                if inventory <= _INVENTORY_DUST:
+                    inventory = 0.0
+                    avg_cost = 0.0
+
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO fills(order_id, symbol, side, price, qty, fee, "
+                "realized_pnl, trade_id, ts) VALUES(?,?,?,?,?,?,?,?,?)",
+                (order_id, symbol, side, price, qty, fee, realized, trade_id, time.time()),
+            )
+            if cur.rowcount == 0:
+                # Duplicate trade (e.g. replayed reconciliation): the ledger
+                # keeps exactly one row; nothing else may change.
+                conn.rollback()
+                return False
+            conn.execute(
+                "UPDATE symbols SET inventory_qty=?, avg_cost=?, updated_at=? "
+                "WHERE symbol=?",
+                (inventory, avg_cost, time.time(), symbol),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
 
     def sum_realized_pnl(self, symbol: Optional[str] = None) -> float:
         conn = self._connect()

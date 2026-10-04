@@ -234,9 +234,13 @@ def test_drawdown_kill_switch_triggers_and_persists(env):
     market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
     bot.run_once()
     # first cycle anchors the reference at the starting equity (1000);
-    # a large realized loss then breaches the 2% hard limit
+    # a large realized loss on ETH (bought 100, sold 60) then breaches
+    # the 2% hard limit
     assert store.get_meta_float("reference_equity") == pytest.approx(1000.0)
-    store.record_fill(9999, "ETH/USDT", "SELL", 1.0, 1.0, 0.0, realized_pnl=-30.0)
+    loss_b = store.create_order("cid-loss-b", "ETH/USDT", "BUY", "MARKET", 100.0, 1.0, "dry_run")
+    store.record_fill(loss_b, "ETH/USDT", "BUY", 100.0, 1.0, 0.0, trade_id="t-loss-b")
+    loss_s = store.create_order("cid-loss-s", "ETH/USDT", "SELL", "MARKET", 60.0, 1.0, "dry_run")
+    store.record_fill(loss_s, "ETH/USDT", "SELL", 60.0, 1.0, 0.0, trade_id="t-loss-s")
     bot.run_once()
     active, reason = store.global_kill()
     assert active is True
@@ -269,6 +273,143 @@ def test_small_pnl_fluctuation_does_not_trip_kill_switch(env):
     assert store.count_completed_grids("BTC/USDT") == 1
     buys = [o for o in store.open_orders("BTC/USDT") if o["side"] == "BUY"]
     assert len(buys) == 5
+
+
+class FaultyExecutor(DryRunExecutor):
+    """Dry-run executor with injectable verification failures."""
+
+    def __init__(self, cfg, store):
+        super().__init__(cfg, store)
+        self.fail_cancel = False
+        self.fail_liquidate = False
+
+    def cancel_all(self, symbol):
+        if self.fail_cancel:
+            return False
+        return super().cancel_all(symbol)
+
+    def place_market_sell(self, symbol, qty, ref_price):
+        if self.fail_liquidate:
+            return False
+        return super().place_market_sell(symbol, qty, ref_price)
+
+
+def _pre_kill_state(tmp_path, executor_cls=DryRunExecutor, with_inventory=False):
+    """Build everything up to (but not including) the kill-triggering cycle:
+    grid placed, optionally one filled buy, then a realized loss large
+    enough to breach the 2% drawdown limit on the next run_once()."""
+    store = StateStore(str(tmp_path / "state.db"))
+    market = StubMarket()
+    cfg = make_config()
+    executor = executor_cls(cfg, store)
+    bot = Bot(cfg, store, market, executor)
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    assert store.get_meta_float("reference_equity") == pytest.approx(1000.0)
+    if with_inventory:
+        market.set("BTC/USDT", snap_entry(), close_15m=49000.0,
+                   candle={"high": 49990.0, "low": 49600.0, "close": 49900.0})
+        bot.run_once()
+        assert store.get_symbol("BTC/USDT").inventory_qty > 0
+    # realized loss of 40 on ETH (bought 100, sold 60) -> ~4% drawdown
+    loss_b = store.create_order("cid-loss-b", "ETH/USDT", "BUY", "MARKET", 100.0, 1.0, "dry_run")
+    store.record_fill(loss_b, "ETH/USDT", "BUY", 100.0, 1.0, 0.0, trade_id="t-loss-b")
+    loss_s = store.create_order("cid-loss-s", "ETH/USDT", "SELL", "MARKET", 60.0, 1.0, "dry_run")
+    store.record_fill(loss_s, "ETH/USDT", "SELL", 60.0, 1.0, 0.0, trade_id="t-loss-s")
+    return bot, store, market
+
+
+def test_global_kill_liquidates_inventory(tmp_path):
+    bot, store, market = _pre_kill_state(tmp_path, with_inventory=True)
+    bot.run_once()
+
+    active, reason = store.global_kill()
+    assert active is True
+    assert "max_drawdown_breach" in reason
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "KILL_ACTIVE"
+    assert st.inventory_qty == pytest.approx(0.0)          # liquidated
+    assert store.count_open_orders("BTC/USDT") == 0        # and cancelled
+    # liquidation sale recorded against the held inventory
+    assert store.sum_realized_pnl("BTC/USDT") > 0
+    assert store.count_open_orders() == 0
+
+
+def test_global_kill_with_failed_cancellation_fails_closed(tmp_path):
+    bot, store, market = _pre_kill_state(tmp_path, executor_cls=FaultyExecutor)
+    bot.executor.fail_cancel = True
+    bot.run_once()
+
+    assert store.global_kill()[0] is True                  # kill stays latched
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ERROR"
+    assert store.count_open_orders("BTC/USDT") == 5        # NOT cancelled
+    assert any(
+        e["event"] == "cancel_verify_failed" for e in store.recent_risk_events()
+    )
+
+
+def test_global_kill_with_failed_liquidation_fails_closed(tmp_path):
+    bot, store, market = _pre_kill_state(
+        tmp_path, executor_cls=FaultyExecutor, with_inventory=True
+    )
+    bot.executor.fail_liquidate = True
+    bot.run_once()
+
+    assert store.global_kill()[0] is True                  # kill stays latched
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ERROR"
+    assert st.inventory_qty > 0                            # NOT liquidated
+    assert any(
+        e["event"] == "liquidation_verify_failed" for e in store.recent_risk_events()
+    )
+
+
+def test_dry_run_liquidation_is_deterministic(tmp_path):
+    cfg = make_config()
+    store = StateStore(str(tmp_path / "state.db"))
+    executor = DryRunExecutor(cfg, store)
+    store.ensure_symbols(["BTC/USDT"])
+    buy = store.create_order("cid-b", "BTC/USDT", "BUY", "LIMIT_MAKER", 100.0, 2.0, "dry_run")
+    store.record_fill(buy, "BTC/USDT", "BUY", 100.0, 2.0, 0.0, trade_id="t-b")
+
+    assert executor.place_market_sell("BTC/USDT", 2.0, ref_price=90.0) is True
+    st = store.get_symbol("BTC/USDT")
+    assert st.inventory_qty == pytest.approx(0.0)
+    # sale at ref * (1 - slippage): realized against avg cost 100
+    sale_price = 90.0 * (1.0 - cfg.slippage_estimate)
+    assert store.sum_realized_pnl("BTC/USDT") == pytest.approx(2.0 * (sale_price - 100.0))
+    assert store.sum_fees("BTC/USDT") == pytest.approx(sale_price * 2.0 * cfg.taker_fee)
+
+    # repeating the same logical liquidation does not double-account
+    executor.place_market_sell("BTC/USDT", 2.0, ref_price=90.0)
+    assert store.sum_realized_pnl("BTC/USDT") == pytest.approx(2.0 * (sale_price - 100.0))
+
+
+def test_dry_run_accounting_is_deterministic(tmp_path):
+    outcomes = []
+    for run in range(2):
+        store = StateStore(str(tmp_path / f"state{run}.db"))
+        market = StubMarket()
+        cfg = make_config()
+        bot = Bot(cfg, store, market, DryRunExecutor(cfg, store))
+        market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+        bot.run_once()
+        market.set("BTC/USDT", snap_entry(), close_15m=49000.0,
+                   candle={"high": 49990.0, "low": 49600.0, "close": 49900.0})
+        bot.run_once()
+        market.set("BTC/USDT", snap_entry(), close_15m=49000.0,
+                   candle={"high": 50050.0, "low": 49700.0, "close": 50010.0})
+        bot.run_once()
+        outcomes.append(
+            (
+                store.get_meta_float("equity"),
+                store.sum_realized_pnl(),
+                store.sum_fees(),
+                store.count_completed_grids("BTC/USDT"),
+            )
+        )
+    assert outcomes[0] == outcomes[1]
 
 
 def test_cycle_error_marks_symbol_error_not_crash(env):

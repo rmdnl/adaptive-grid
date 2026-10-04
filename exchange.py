@@ -215,21 +215,34 @@ class BinanceSpot:
             params["orderId"] = order_id
         return self._request("GET", "/api/v3/myTrades", params, signed=True)
 
+    def get_account(self) -> Dict:
+        """Authoritative account balances (signed; refused under DRY_RUN)."""
+        return self._request("GET", "/api/v3/account", signed=True)
+
+    def get_balance(self, asset: str) -> float:
+        """Free + locked balance for one asset, from the account snapshot."""
+        account = self.get_account()
+        for b in account.get("balances", []):
+            if b.get("asset") == asset:
+                return float(b.get("free") or 0) + float(b.get("locked") or 0)
+        return 0.0
+
 
 class Accounting:
-    """Inventory / fee / realized-PnL bookkeeping shared by executors.
+    """Thin façade over the authoritative fill recording in StateStore.
 
-    Conventions (consistent with the equity formula in bot.py):
-    - realized PnL records the price difference qty x (sell - avg_cost);
-    - fees are recorded separately (every fill's fee);
-    - equity = sum(realized) - sum(fees) + unrealized.
+    StateStore.record_fill is THE single accounting event per exchange
+    trade: atomic (fill row + inventory/avg-cost/realized-PnL in one
+    transaction) and idempotent (trade_id is the idempotency key). This
+    class only adds logging; executors must route every fill through it
+    exactly once via BaseExecutor._account_trades.
     """
 
     def __init__(self, cfg, store: StateStore):
         self.cfg = cfg
         self.store = store
 
-    def record_fill(
+    def record_trade(
         self,
         symbol: str,
         order_id: int,
@@ -237,42 +250,38 @@ class Accounting:
         price: float,
         qty: float,
         fee: float,
-        trade_id: Optional[str] = None,
-    ) -> None:
-        st = self.store.get_symbol(symbol)
-        inventory = st.inventory_qty if st else 0.0
-        avg_cost = st.avg_cost if st else 0.0
-        realized = 0.0
-        if side == "BUY":
-            new_inv = inventory + qty
-            avg_cost = ((inventory * avg_cost) + (qty * price)) / new_inv
-            inventory = new_inv
-        else:  # SELL
-            sell_qty = min(qty, inventory) if inventory > 0 else 0.0
-            if sell_qty > 0:
-                realized = sell_qty * (price - avg_cost)
-                inventory -= sell_qty
-            if inventory <= 1e-12:
-                inventory = 0.0
-                avg_cost = 0.0
-        self.store.record_fill(
-            order_id, symbol, side, price, qty, fee, realized, trade_id
+        trade_id: str,
+    ) -> bool:
+        recorded = self.store.record_fill(
+            order_id, symbol, side, price, qty, fee, trade_id=trade_id
         )
-        self.store.update_symbol(
-            symbol, inventory_qty=inventory, avg_cost=avg_cost
-        )
-        log.info(
-            "fill %s %s qty=%s price=%s fee=%s realized=%s",
-            symbol, side, qty, price, fee, realized,
-        )
+        if recorded:
+            log.info(
+                "fill %s %s qty=%s price=%s fee=%s trade=%s",
+                symbol, side, qty, price, fee, trade_id,
+            )
+        return recorded
 
 
 def _new_client_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
 
+# Tolerances for quantity bookkeeping:
+QTY_TOLERANCE = 1e-9         # absolute epsilon: "effectively zero" quantity
+LIQ_REL_TOLERANCE = 1e-6     # relative tolerance for liquidation/balance checks
+
+
 class BaseExecutor:
-    """Order lifecycle shared by dry-run and live executors."""
+    """Order lifecycle shared by dry-run and live executors.
+
+    Accounting invariant: there is exactly ONE authoritative accounting
+    event per exchange trade. All fills flow through `_account_trades`
+    -> Accounting.record_trade -> StateStore.record_fill (atomic +
+    idempotent by trade_id). A BUY's executed quantity is converted into
+    child SELL orders via `child_sell_qty` on the parent order, so
+    repeated reconciliation can never spawn duplicate child sells.
+    """
 
     mode = "abstract"
 
@@ -301,49 +310,75 @@ class BaseExecutor:
     def sync_fills(self, symbol: str, candle: Optional[Dict], allow_renewal: bool = True) -> None:
         raise NotImplementedError
 
-    # ----- fill consequences (shared) -----
+    def _place_child_sell(self, parent: Dict, qty: float) -> None:
+        raise NotImplementedError
 
-    def _on_buy_filled(self, order: Dict, fill_price: float, fee: float, trade_id: Optional[str] = None) -> None:
-        self.store.update_order_status(order["id"], "FILLED", order["qty"])
-        self.accounting.record_fill(
-            order["symbol"], order["id"], "BUY", fill_price, order["qty"], fee, trade_id
-        )
-        # A filled buy immediately spawns its sell at the planned target.
-        self.place_limit(
-            order["symbol"],
-            "SELL",
-            order["target_sell_price"],
-            order["qty"],
-            parent_order_id=order["id"],
-        )
+    # ----- shared fill accounting (the single accounting path) -----
 
-    def _on_sell_filled(
-        self, order: Dict, fill_price: float, fee: float,
-        trade_id: Optional[str] = None, allow_renewal: bool = True,
-    ) -> None:
-        self.store.update_order_status(order["id"], "FILLED", order["qty"])
-        self.accounting.record_fill(
-            order["symbol"], order["id"], "SELL", fill_price, order["qty"], fee, trade_id
-        )
-        # Grid renewal: re-place the buy at the same level for the next cycle.
+    def _account_trades(self, order: Dict, trades: List[Dict]) -> float:
+        """Record every not-yet-recorded trade exactly once.
+
+        Each trade carries its exchange trade id (`t["id"]`), the
+        idempotency key. Returns the quantity newly recorded. Fee and
+        quantity always come from the actual trade — never the planned
+        order quantity.
+        """
+        new_qty = 0.0
+        for t in trades:
+            if self.store.fill_exists(t["id"]):
+                continue
+            recorded = self.accounting.record_trade(
+                order["symbol"], order["id"], order["side"],
+                t["price"], t["qty"], t["fee"], t["id"],
+            )
+            if recorded:
+                new_qty += t["qty"]
+        return new_qty
+
+    def _spawn_child_sells(self, order: Dict) -> None:
+        """Convert executed-but-unconverted BUY quantity into child SELL
+        orders. The conversion bookkeeping (`child_sell_qty`) is updated
+        atomically with child creation, so the sum of child sells always
+        equals the acquired quantity — never more, never duplicated."""
+        parent = self.store.get_order(order["id"])
+        if parent is None or parent["side"] != "BUY":
+            return
+        executed = float(parent["filled_qty"] or 0.0)
+        converted = float(parent["child_sell_qty"] or 0.0)
+        delta = executed - converted
+        if delta <= QTY_TOLERANCE:
+            return
+        self._place_child_sell(parent, delta)
+
+    def _renew_grid_level(self, sell_order: Dict, allow_renewal: bool = True) -> None:
+        """Grid renewal: when a child SELL fills, re-place the BUY at the
+        same grid level (the parent buy's plan)."""
         if not allow_renewal:
             return
-        parent = None
-        if order.get("parent_order_id"):
-            parent = self.store.get_order(order["parent_order_id"])
-        if parent is not None:
-            self.place_limit(
-                order["symbol"],
-                "BUY",
-                parent["price"],
-                parent["qty"],
-                parent_order_id=None,
-                target_sell_price=parent["target_sell_price"],
-            )
+        if not sell_order.get("parent_order_id"):
+            return
+        parent = self.store.get_order(sell_order["parent_order_id"])
+        if parent is None:
+            return
+        self.place_limit(
+            sell_order["symbol"],
+            "BUY",
+            parent["price"],
+            parent["qty"],
+            parent_order_id=None,
+            target_sell_price=parent["target_sell_price"],
+        )
 
 
 class DryRunExecutor(BaseExecutor):
-    """Simulated execution. Never talks to Binance."""
+    """Simulated execution. Never talks to Binance.
+
+    Fill simulation is deterministic: a buy fills when the last CLOSED
+    candle's low <= limit price, a sell when the high >= limit price, at
+    the limit price with a maker fee. Synthetic trade ids
+    (`dry-<client_order_id>`) make the accounting idempotent like live
+    trade ids.
+    """
 
     mode = "dry_run"
 
@@ -364,15 +399,25 @@ class DryRunExecutor(BaseExecutor):
         log.info("dry-run order %s %s %s qty=%s price=%s", symbol, side, "LIMIT_MAKER", qty, price)
         return order_id
 
+    def _place_child_sell(self, parent: Dict, qty: float) -> None:
+        cid = _new_client_id("dry")
+        self.store.create_child_sell_order(
+            cid, parent["symbol"], parent["target_sell_price"], qty,
+            parent["id"], self.mode,
+        )
+        log.info("dry-run child sell %s qty=%s price=%s",
+                 parent["symbol"], qty, parent["target_sell_price"])
+
     def place_market_sell(self, symbol: str, qty: float, ref_price: float) -> bool:
         price = ref_price * (1.0 - self.cfg.slippage_estimate)
         fee = price * qty * max(self.cfg.maker_fee, self.cfg.taker_fee)
-        cid = _new_client_id("dry")
-        order_id = self.store.create_order(
-            cid, symbol, "SELL", "MARKET", price, qty, self.mode
-        )
+        cid = _new_client_id("dry-liq")
+        order_id = self.store.create_order(cid, symbol, "SELL", "MARKET", price, qty, self.mode)
         self.store.update_order_status(order_id, "FILLED", qty)
-        self.accounting.record_fill(symbol, order_id, "SELL", price, qty, fee)
+        self._account_trades(
+            {"id": order_id, "symbol": symbol, "side": "SELL"},
+            [{"id": f"dry-{cid}", "price": price, "qty": qty, "fee": fee}],
+        )
         log.info("dry-run liquidation %s qty=%s price=%s", symbol, qty, price)
         return True
 
@@ -383,29 +428,44 @@ class DryRunExecutor(BaseExecutor):
         return len(self.store.open_orders(symbol)) == 0
 
     def sync_fills(self, symbol: str, candle: Optional[Dict], allow_renewal: bool = True) -> None:
-        """Deterministic fill simulation from the last CLOSED candle:
-        a buy fills when candle low <= limit price, a sell when candle
-        high >= limit price (fills at the limit price, maker fee)."""
         if candle is None:
             return
         for order in list(self.store.open_orders(symbol)):
             if order["side"] == "BUY" and candle["low"] <= order["price"]:
-                fee = order["price"] * order["qty"] * self.cfg.maker_fee
-                self._on_buy_filled(order, order["price"], fee)
+                trade = {
+                    "id": f"dry-{order['client_order_id']}",
+                    "price": order["price"],
+                    "qty": order["qty"],
+                    "fee": order["price"] * order["qty"] * self.cfg.maker_fee,
+                }
+                self.store.update_order_status(order["id"], "FILLED", order["qty"])
+                self._account_trades(order, [trade])
+                self._spawn_child_sells(order)
             elif order["side"] == "SELL" and candle["high"] >= order["price"]:
-                fee = order["price"] * order["qty"] * self.cfg.maker_fee
-                self._on_sell_filled(order, order["price"], fee, allow_renewal=allow_renewal)
+                trade = {
+                    "id": f"dry-{order['client_order_id']}",
+                    "price": order["price"],
+                    "qty": order["qty"],
+                    "fee": order["price"] * order["qty"] * self.cfg.maker_fee,
+                }
+                self.store.update_order_status(order["id"], "FILLED", order["qty"])
+                self._account_trades(order, [trade])
+                self._renew_grid_level(order, allow_renewal)
 
 
 class LiveExecutor(BaseExecutor):
     """Real (testnet or gated live) execution with reconciliation.
 
-    Only constructed when DRY_RUN=false. Unknown order state after any
-    submission raises OrderUnknownState — the bot fails closed for the
-    symbol instead of guessing.
+    Only constructed when DRY_RUN=false. Fill accounting follows the
+    exchange trades of each order (myTrades, keyed by trade id) —
+    partial fills are accounted as they happen, exactly once. Unknown
+    order state after any submission raises OrderUnknownState — the bot
+ol instead of guessing.
     """
 
     mode = "live"
+
+    LIQ_MAX_ATTEMPTS = 3
 
     def __init__(self, cfg, spot: BinanceSpot, store: StateStore):
         super().__init__(cfg, store)
@@ -429,7 +489,7 @@ class LiveExecutor(BaseExecutor):
             resp = self.spot.create_limit_maker_order(symbol, side, price, qty, cid)
         except ExchangeError as exc:
             # Reconcile before any retry — never submit blindly again.
-            existing = self.spot.get_order(symbol, cid)
+            existing = self._reconcile_by_cid(symbol, cid)
             if existing is None:
                 self.store.update_order_status(order_id, "UNKNOWN")
                 raise OrderUnknownState(
@@ -442,31 +502,104 @@ class LiveExecutor(BaseExecutor):
                  symbol, side, qty, price, status)
         return order_id
 
-    def place_market_sell(self, symbol: str, qty: float, ref_price: float) -> bool:
-        """Liquidation sell. Returns True only when fully filled."""
+    def _place_child_sell(self, parent: Dict, qty: float) -> None:
+        """Submit the child SELL for acquired quantity; the local row and
+        the parent's child_sell_qty are created atomically by
+        StateStore.create_child_sell_order."""
         cid = _new_client_id("ag")
-        order_id = self.store.create_order(cid, symbol, "SELL", "MARKET", ref_price, qty, self.mode)
+        local_id = self.store.create_child_sell_order(
+            cid, parent["symbol"], parent["target_sell_price"], qty,
+            parent["id"], self.mode,
+        )
+        try:
+            resp = self.spot.create_limit_maker_order(
+                parent["symbol"], "SELL", parent["target_sell_price"], qty, cid
+            )
+        except ExchangeError as exc:
+            existing = self._reconcile_by_cid(parent["symbol"], cid)
+            if existing is None:
+                self.store.update_order_status(local_id, "UNKNOWN")
+                raise OrderUnknownState(
+                    f"child sell {cid} state unknown after submit failure: {exc}"
+                ) from None
+            resp = existing
+        self.store.update_order_status(local_id, resp.get("status", "NEW"), float(resp.get("executedQty") or 0))
+        log.info("live child sell %s qty=%s price=%s status=%s",
+                 parent["symbol"], qty, parent["target_sell_price"], resp.get("status", "NEW"))
+
+    def place_market_sell(self, symbol: str, qty: float, ref_price: float) -> bool:
+        """Liquidation sell with per-attempt client order ids, trade
+        reconciliation, and an authoritative balance verification.
+
+        Returns True only when the full quantity executed and the base
+        balance actually reflects the sale. Any unknown state raises
+        OrderUnknownState (fail-closed); any verification failure returns
+        False (the caller must treat the symbol as NOT liquidated).
+        """
+        base = symbol.split("/")[0]
+        tol = max(QTY_TOLERANCE, qty * LIQ_REL_TOLERANCE)
+        try:
+            balance_before = self.spot.get_balance(base)
+        except ExchangeError as exc:
+            log.error("balance unavailable before liquidation for %s: %s", symbol, exc)
+            self.store.add_risk_event(symbol, "liquidation_verify_failed", "balance unavailable")
+            return False
+
         remaining = qty
-        for round_no in range(2):
+        total_executed = 0.0
+        for _attempt in range(self.LIQ_MAX_ATTEMPTS):
+            if remaining <= tol:
+                break
+            # Exactly one client order id per attempt, tracked end-to-end.
+            cid = _new_client_id("ag-liq")
+            local_id = self.store.create_order(cid, symbol, "SELL", "MARKET", ref_price, remaining, self.mode)
             try:
-                self.spot.create_market_order(symbol, "SELL", remaining, cid if round_no == 0 else _new_client_id("ag"))
+                self.spot.create_market_order(symbol, "SELL", remaining, cid)
             except ExchangeError as exc:
-                found = self._find_order_any_state(symbol, cid if round_no == 0 else None)
-                if found is None:
-                    self.store.update_order_status(order_id, "UNKNOWN")
-                    raise OrderUnknownState(f"liquidation order state unknown: {exc}") from None
-            order = self._wait_terminal(symbol, cid if round_no == 0 else None)
-            if order is None:
-                self.store.update_order_status(order_id, "UNKNOWN")
-                return False
-            self._record_trades(symbol, order)
-            executed = float(order.get("executedQty") or 0)
+                # The request may or may not have reached the exchange:
+                # reconcile this exact client id before doing anything else.
+                if self._reconcile_by_cid(symbol, cid) is None:
+                    self.store.update_order_status(local_id, "UNKNOWN")
+                    raise OrderUnknownState(
+                        f"liquidation order {cid} state unknown after submit failure: {exc}"
+                    ) from None
+            remote = self._wait_terminal(symbol, cid)
+            if remote is None:
+                self.store.update_order_status(local_id, "UNKNOWN")
+                raise OrderUnknownState(f"liquidation order {cid} never reached a terminal state")
+            self._record_remote_trades(symbol, remote)
+            executed = float(remote.get("executedQty") or 0)
+            self.store.update_order_status(local_id, remote.get("status", "FILLED"), executed)
+            total_executed += executed
             remaining -= executed
-            if remaining <= 1e-12:
-                self.store.update_order_status(order_id, "FILLED", qty)
-                return True
-        self.store.update_order_status(order_id, "UNKNOWN")
-        return False
+
+        if remaining > tol:
+            self.store.add_risk_event(
+                symbol, "liquidation_incomplete", f"remaining={remaining} of {qty}"
+            )
+            log.error("liquidation incomplete for %s: remaining=%s", symbol, remaining)
+            return False
+
+        # Authoritative verification: the exchange base balance must
+        # reflect the sale (never increase, and drop by ~ the sold amount;
+        # base-asset commissions may drop it slightly further).
+        try:
+            balance_after = self.spot.get_balance(base)
+        except ExchangeError as exc:
+            log.error("balance unavailable after liquidation for %s: %s", symbol, exc)
+            self.store.add_risk_event(symbol, "liquidation_verify_failed", "balance unavailable")
+            return False
+        dropped = balance_before - balance_after
+        if balance_after > balance_before + tol or dropped < total_executed - tol:
+            self.store.add_risk_event(
+                symbol,
+                "liquidation_balance_mismatch",
+                f"before={balance_before} after={balance_after} executed={total_executed}",
+            )
+            log.error("liquidation balance mismatch for %s: before=%s after=%s executed=%s",
+                      symbol, balance_before, balance_after, total_executed)
+            return False
+        return True
 
     def cancel_all(self, symbol: str) -> bool:
         for order in list(self.store.open_orders(symbol)):
@@ -486,23 +619,16 @@ class LiveExecutor(BaseExecutor):
             return False
 
     def sync_fills(self, symbol: str, candle: Optional[Dict], allow_renewal: bool = True) -> None:
-        """Reconcile local open orders against the exchange before anything
-        else is assumed; unknown orders fail closed."""
+        """Reconcile local open orders against the exchange. Trades are
+        accounted exactly once (idempotent by trade id) as they happen,
+        including partial fills. Unknown orders fail closed."""
         for order in list(self.store.open_orders(symbol)):
             cid = order["client_order_id"]
             remote = self.spot.get_order(symbol, cid)
             if remote is None:
                 self.store.update_order_status(order["id"], "UNKNOWN")
                 raise OrderUnknownState(f"local open order {cid} not found on exchange")
-            status = remote.get("status", "NEW")
-            self.store.update_order_status(order["id"], status, float(remote.get("executedQty") or 0))
-            if status in _TERMINAL_STATUSES:
-                self._record_trades(symbol, remote)
-                if status == "FILLED":
-                    if order["side"] == "BUY":
-                        self._on_buy_filled(order, order["price"], 0.0)
-                    else:
-                        self._on_sell_filled(order, order["price"], 0.0, allow_renewal=allow_renewal)
+            self._sync_order_from_remote(symbol, order, remote, allow_renewal)
         remote_open = self.spot.get_open_orders(symbol)
         local_cids = {o["client_order_id"] for o in self.store.open_orders(symbol)}
         for remote_order in remote_open:
@@ -511,16 +637,39 @@ class LiveExecutor(BaseExecutor):
                     f"unknown exchange order {remote_order.get('clientOrderId')} for {symbol}"
                 )
 
+    def _sync_order_from_remote(
+        self, symbol: str, order: Dict, remote: Dict, allow_renewal: bool
+    ) -> None:
+        status = remote.get("status", "NEW")
+        executed = float(remote.get("executedQty") or 0)
+        self.store.update_order_status(order["id"], status, executed)
+        trades = []
+        for t in self.spot.get_my_trades(symbol, remote.get("orderId")):
+            trades.append(
+                {
+                    "id": str(t.get("id")),
+                    "price": float(t["price"]),
+                    "qty": float(t["qty"]),
+                    "fee": self._fee_in_quote(symbol, t),
+                }
+            )
+        self._account_trades(order, trades)
+        if order["side"] == "BUY":
+            self._spawn_child_sells(order)
+        elif status == "FILLED":
+            self._renew_grid_level(order, allow_renewal)
+
     # ----- helpers -----
 
-    def _find_order_any_state(self, symbol: str, cid: Optional[str]) -> Optional[Dict]:
+    def _reconcile_by_cid(self, symbol: str, cid: Optional[str]) -> Optional[Dict]:
+        """Look up an order by its exact client id (bounded polling)."""
         if cid is None:
             return None
         for _ in range(3):
             found = self.spot.get_order(symbol, cid)
             if found is not None:
                 return found
-            time.sleep(0.5)
+            time.sleep(0.2)
         return None
 
     def _wait_terminal(self, symbol: str, cid: Optional[str]) -> Optional[Dict]:
@@ -535,23 +684,24 @@ class LiveExecutor(BaseExecutor):
             time.sleep(0.5)
         return self.spot.get_order(symbol, cid)
 
-    def _record_trades(self, symbol: str, remote_order: Dict) -> None:
-        """Persist exchange fills (deduplicated by trade id)."""
+    def _record_remote_trades(self, symbol: str, remote_order: Dict) -> None:
+        """Account the exchange fills of one remote order (idempotent by
+        trade id). Used by the liquidation path, where orders are not
+        part of the normal grid reconciliation loop."""
         local = self.store.get_order_by_client_id(remote_order.get("clientOrderId", ""))
         if local is None:
             return
-        trades = self.spot.get_my_trades(symbol, remote_order.get("orderId"))
-        for t in trades:
-            fee = self._fee_in_quote(symbol, t)
-            self.accounting.record_fill(
-                symbol,
-                local["id"],
-                remote_order.get("side", "BUY"),
-                float(t["price"]),
-                float(t["qty"]),
-                fee,
-                trade_id=str(t.get("id")),
+        trades = []
+        for t in self.spot.get_my_trades(symbol, remote_order.get("orderId")):
+            trades.append(
+                {
+                    "id": str(t.get("id")),
+                    "price": float(t["price"]),
+                    "qty": float(t["qty"]),
+                    "fee": self._fee_in_quote(symbol, t),
+                }
             )
+        self._account_trades(local, trades)
 
     def _fee_in_quote(self, symbol: str, trade: Dict) -> float:
         base, quote = symbol.split("/")

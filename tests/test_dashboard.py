@@ -31,9 +31,12 @@ def seeded(tmp_path):
     )
     oid = store.create_order("cid-open", "BTC/USDT", "BUY", "LIMIT_MAKER", 49300.0, 0.00021, "dry_run")
     assert oid > 0
+    bid = store.create_order("cid-buy", "BTC/USDT", "BUY", "LIMIT_MAKER", 49650.0, 0.00021, "dry_run")
+    store.update_order_status(bid, "FILLED", 0.00021)
+    store.record_fill(bid, "BTC/USDT", "BUY", 49650.0, 0.00021, 0.0104, trade_id="t-b1")
     sid = store.create_order("cid-done", "BTC/USDT", "SELL", "LIMIT_MAKER", 50000.0, 0.00021, "dry_run")
     store.update_order_status(sid, "FILLED", 0.00021)
-    store.record_fill(sid, "BTC/USDT", "SELL", 50000.0, 0.00021, 0.0105, realized_pnl=0.0735)
+    store.record_fill(sid, "BTC/USDT", "SELL", 50000.0, 0.00021, 0.0105, trade_id="t-s1")
     store.set_meta_float("equity", 100.0)
     store.set_meta_float("reference_equity", 102.0)
     store.set_runtime("RUNNING", 1234.0)
@@ -95,7 +98,7 @@ def test_payload_symbol_fields(seeded):
     assert btc["inventory_qty"] == pytest.approx(0.00021)
     assert btc["open_orders"] == 1
     assert btc["realized_pnl"] == pytest.approx(0.0735)
-    assert btc["fees"] == pytest.approx(0.0105)
+    assert btc["fees"] == pytest.approx(0.0104 + 0.0105)
     assert btc["risk_status"] == "ok"
 
 

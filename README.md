@@ -141,9 +141,12 @@ expires. Cooldown survives process restart.
 
 - **Global drawdown kill switch: 2%** (`MAX_DRAWDOWN_PERCENT`, hard cap).
   Drawdown is measured against the high-water mark of
-  `equity = START_EQUITY + realized - fees + unrealized`. At breach: all open
-  orders across all symbols are cancelled and verified, new orders stop
-  globally, the kill state is persisted, and **it never auto-clears**.
+  `equity = START_EQUITY + realized - fees + unrealized`. At breach: the kill
+  is **latched and persisted first** (no new orders globally), then per
+  symbol all open orders are cancelled and verified, and all held inventory
+  is liquidated and verified. Cancellation or liquidation verification
+  failures are fail-closed (symbol `ERROR` + risk events) but **never clear
+  the kill** — it stays latched across restart until the operator intervenes.
 - **15m lower-boundary protection** (`STOP_IF_BELOW_LOWER_PERCENT`, hard cap
   2%): if the latest **CLOSED 15m candle close** (never an intrabar wick) is
   at most `lower × (1 - 2%)`, the symbol is stopped (orders cancelled,
@@ -155,13 +158,29 @@ expires. Cooldown survives process restart.
   order ids, are persisted before submission, and are **never retried
   blindly**: after a network failure the order is reconciled by client id;
   an unknown final state raises a fail-closed condition and stops the symbol.
+- **Fill accounting is idempotent per exchange trade**: the trade id is the
+  idempotency key; one atomic transaction records the fill and updates
+  inventory, average cost and realized PnL. Partial fills are accounted as
+  they happen, using actual executed quantities — never planned quantities.
+  Repeated reconciliation or a restart can never double-count.
+- A filled BUY converts its **actual acquired quantity** into child SELL
+  orders (tracked per order in `child_sell_qty`, updated atomically with
+  child creation) — duplicate child sells are structurally impossible.
+- Liquidation uses one client order id per attempt (tracked end-to-end),
+  reconciles that exact id after any network error, computes the remainder
+  from actual executed quantities, and then verifies the result against the
+  **authoritative account balance** of the base asset (testnet/live).
+  Verification failure or residual inventory means: NOT liquidated, symbol
+  fails closed.
 
 ## State
 
 A single SQLite database (`state.db` by default, path via `--db`) holds
 global bot state, per-symbol state, cooldown, grid plan values, orders,
-fills, fees, realized PnL, risk events and kill state. There are no
-compatibility tables for any earlier architecture.
+fills, fees, realized PnL, risk events and kill state. The schema carries a
+version stamp (`schema_version` in `meta`), applied by a minimal
+deterministic migration at startup. There are no compatibility tables for
+any earlier architecture.
 
 ## Dashboard
 
