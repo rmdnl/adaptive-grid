@@ -170,6 +170,17 @@ expires. Cooldown survives process restart.
 - A grid is **blocked** unless executable gross >= 0.50% and executable net
   >= 0.20% (`GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`). Bad grids are never
   widened or forced.
+- **PERCENT_PRICE_BY_SIDE is parsed and enforced locally.** For every symbol
+  the exchange's weighted-average price (`GET /api/v3/avgPrice`, over the
+  filter's `avgPriceMins` — never assumed to equal the last price) is the
+  reference: BUY levels must stay inside `reference × [bidMultiplierDown,
+  bidMultiplierUp]` and SELL prices inside `reference ×
+  [askMultiplierDown, askMultiplierUp]`. Grid levels that would violate the
+  band are dropped from the plan (or the grid is blocked when none remain);
+  child sells that fall outside the band are deferred to a later cycle
+  against the then-current reference instead of submitting an order Binance
+  would reject. A definitive rejection (HTTP 400 filter failure, codes
+  -1013/-2010) stops the symbol in `ERROR` — it is never retried blindly.
 
 ## Risk rules
 

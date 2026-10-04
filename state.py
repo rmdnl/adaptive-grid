@@ -384,6 +384,16 @@ class StateStore:
         conn.close()
         return dict(row) if row else None
 
+    def symbol_orders(self, symbol: str) -> List[Dict]:
+        """All orders for a symbol (any status) — used for accounting
+        invariants like pending child-sell conversion."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE symbol=? ORDER BY id", (symbol,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
     def open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
         conn = self._connect()
         if symbol is None:

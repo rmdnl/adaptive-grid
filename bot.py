@@ -32,10 +32,10 @@ from exchange import (
     DryRunExecutor,
     ExchangeError,
     LiveExecutor,
+    OrderRejected,
     OrderUnknownState,
     QTY_TOLERANCE,
 )
-from grid import quantize_price_floor, quantize_qty_ceil
 from risk import BREACH, UNKNOWN, RiskEngine
 from state import StateStore, SymbolState
 
@@ -93,6 +93,17 @@ class MarketData:
 
     def filters(self, symbol: str):
         return self.spot.get_filters(symbol)
+
+    def avg_price(self, symbol: str) -> Optional[float]:
+        """The exchange's weighted-average price (PERCENT_PRICE_BY_SIDE
+        reference). None when unavailable — callers fail closed."""
+        try:
+            data = self.spot.get_avg_price(symbol)
+            price = float(data.get("price") or 0)
+            return price if price > 0 else None
+        except ExchangeError as exc:
+            log.warning("reference price unavailable for %s: %s", symbol, exc)
+            return None
 
 
 class Bot:
@@ -211,6 +222,13 @@ class Bot:
                 log.error("fail-closed (%s): %s", symbol, exc)
                 self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
                 self.store.add_risk_event(symbol, "order_unknown_state", str(exc))
+            except OrderRejected as exc:
+                # The exchange definitively refused an order (e.g. a filter
+                # failure): not unknown, but never retried blindly — the
+                # symbol stops for operator attention.
+                log.error("order rejected (%s): %s", symbol, exc)
+                self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                self.store.add_risk_event(symbol, "order_rejected", str(exc))
             except Exception as exc:  # keep the loop alive, mark the symbol
                 log.exception("cycle failed for %s", symbol)
                 self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
@@ -291,6 +309,7 @@ class Bot:
                 self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker=veto.reason)
                 return
             filters = self.market.filters(symbol)
+            reference = self.market.avg_price(symbol)
             plan = grid_mod.build_grid(
                 symbol,
                 self.cfg.grid_mode(symbol),
@@ -298,6 +317,7 @@ class Bot:
                 snap.atr,
                 filters,
                 self.cfg,
+                reference_price=reference,
             )
             if not plan.executable:
                 self.store.set_symbol_state(
@@ -340,21 +360,30 @@ class Bot:
         return (st.inventory_qty or 0.0) > 0.0
 
     def _has_uncovered_inventory(self, symbol: str) -> bool:
-        """True when held inventory is not covered by open sell orders.
+        """True when held inventory is neither covered by open sell orders
+        nor accounted as pending child-sell conversion.
 
         In normal operation every bought unit has exactly one child sell
-        until it is sold, so remaining sell quantity always covers the
-        inventory. Uncovered inventory can only mean a previous exit or
-        kill was interrupted between cancellation and liquidation.
+        until it is sold. Uncovered inventory beyond what can still be
+        converted means a previous exit or kill was interrupted between
+        cancellation and liquidation. (A child sell deferred because its
+        price is outside the PERCENT_PRICE_BY_SIDE band leaves the
+        quantity pending-conversion — not an interrupted exit.)
         """
+        orders = self.store.symbol_orders(symbol)
         covered = sum(
             float(o["qty"]) - float(o["filled_qty"] or 0.0)
-            for o in self.store.open_orders(symbol)
-            if o["side"] == "SELL"
+            for o in orders
+            if o["side"] == "SELL" and o["status"] in ("NEW", "PARTIALLY_FILLED")
+        )
+        pending_conversion = sum(
+            max(0.0, float(o["filled_qty"] or 0.0) - float(o["child_sell_qty"] or 0.0))
+            for o in orders
+            if o["side"] == "BUY"
         )
         st = self.store.get_symbol(symbol)
         inventory = float(st.inventory_qty or 0.0) if st else 0.0
-        return inventory > covered + QTY_TOLERANCE
+        return inventory > covered + pending_conversion + QTY_TOLERANCE
 
     def _place_grid(self, symbol: str, plan: grid_mod.GridPlan) -> None:
         for level in plan.levels:
@@ -453,6 +482,10 @@ class Bot:
                 self.store.add_risk_event(symbol, "order_unknown_state", str(exc))
                 self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
                 log.error("fail-closed (%s) during global kill: %s", symbol, exc)
+            except OrderRejected as exc:
+                self.store.add_risk_event(symbol, "order_rejected", str(exc))
+                self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                log.error("order rejected (%s) during global kill: %s", symbol, exc)
 
     def _update_wallet(self) -> None:
         """Display-only testnet wallet telemetry (never used for paper
@@ -554,12 +587,85 @@ def _validate_exchange_access(cfg: Config, spot: BinanceSpot) -> Dict:
     return access
 
 
+def _selftest_order_params(filters, reference_price: float, last_close: float) -> Dict:
+    """Derive a filter-valid, non-marketable LIMIT_MAKER BUY probe price
+    from the ACTUAL exchange filters (never a hardcoded distance).
+
+    The price is the PERCENT_PRICE_BY_SIDE bid-band floor (weighted-average
+    reference x bidMultiplierDown), quantized UP to tickSize so it always
+    satisfies the band; the quantity is the minimum-notional quantity.
+    Every condition is checked locally BEFORE any submission; on any
+    violation a ValueError with the exact rejected condition is raised and
+    nothing is sent to the exchange.
+    """
+    from grid import quantize_price_ceil, quantize_qty_ceil, validate_price
+
+    if filters.bid_multiplier_down is None or filters.bid_multiplier_up is None:
+        raise ValueError(
+            "PERCENT_PRICE_BY_SIDE filter absent — cannot derive a filter-valid probe price"
+        )
+    if reference_price is None or reference_price <= 0:
+        raise ValueError("exchange reference (weighted-average) price unavailable")
+    if last_close is None or last_close <= 0:
+        raise ValueError("last closed price unavailable (non-marketable check impossible)")
+
+    price = quantize_price_ceil(
+        reference_price * filters.bid_multiplier_down, filters.tick_size
+    )
+    checks: list = [
+        (
+            "PERCENT_PRICE_BY_SIDE bid band",
+            validate_price(filters, "BUY", price, reference_price),
+        ),
+        (
+            "tickSize",
+            None if quantize_price_ceil(price, filters.tick_size) == price
+            else f"price {price} not tick-aligned",
+        ),
+    ]
+
+    qty = quantize_qty_ceil(filters.min_notional / price, filters.step_size)
+    if filters.min_qty > 0 and qty < filters.min_qty:
+        qty = quantize_qty_ceil(filters.min_qty, filters.step_size)
+    checks.extend([
+        (
+            "stepSize",
+            None if quantize_qty_ceil(qty, filters.step_size) == qty
+            else f"quantity {qty} not step-aligned",
+        ),
+        (
+            "minQty",
+            None if filters.min_qty <= 0 or qty >= filters.min_qty
+            else f"quantity {qty} below minQty {filters.min_qty}",
+        ),
+        (
+            "minNotional",
+            None if qty * price >= filters.min_notional
+            else f"notional {qty * price:.8g} below minNotional {filters.min_notional}",
+        ),
+        # LIMIT_MAKER must be non-marketable: the buy must rest strictly
+        # below the observable market (last traded price as the proxy).
+        (
+            "LIMIT_MAKER non-marketable",
+            None if price < last_close
+            else f"price {price} would immediately match (last close {last_close})",
+        ),
+    ])
+
+    violations = [f"{name}: {detail}" for name, detail in checks if detail]
+    if violations:
+        raise ValueError("; ".join(violations))
+    return {"price": price, "qty": qty, "reference_price": reference_price}
+
+
 def _testnet_order_selftest(cfg: Config, spot: BinanceSpot, symbol: str) -> int:
     """Explicit, flag-gated order-path self-test on Binance Spot Testnet.
 
-    Places ONE far-from-market LIMIT_MAKER BUY (50%% below the last closed
-    price, minimum-notional quantity), verifies it rests on the book,
-    cancels it and verifies the cancellation. The order can never fill.
+    Places ONE far-from-market LIMIT_MAKER BUY whose price is DERIVED from
+    the actual exchange filters (the PERCENT_PRICE_BY_SIDE bid-band floor
+    against the exchange's weighted-average price), locally validated in
+    full before submission, then verified on the book and cancelled. The
+    order can never fill and never violates exchange filters.
     Requires EXECUTION_MODE=testnet and is never run automatically.
     """
     if cfg.execution_mode != "testnet" or cfg.allow_live:
@@ -573,14 +679,24 @@ def _testnet_order_selftest(cfg: Config, spot: BinanceSpot, symbol: str) -> int:
         if not closed:
             raise ExchangeError(f"no closed candles for {symbol}")
         last = float(closed[-1]["close"])
-        price = quantize_price_floor(last * 0.5, filters.tick_size)
-        qty = quantize_qty_ceil(filters.min_notional / price, filters.step_size)
-        if filters.min_qty > 0 and qty < filters.min_qty:
-            qty = quantize_qty_ceil(filters.min_qty, filters.step_size)
+        avg = spot.get_avg_price(symbol)
+        reference = float(avg.get("price") or 0)
+        log.info(
+            "SELFTEST reference: weighted-average price=%s (avgPriceMins filter=%s), last close=%s",
+            reference, filters.avg_price_mins, last,
+        )
+        try:
+            params = _selftest_order_params(filters, reference, last)
+        except ValueError as exc:
+            # Local validation failure -> print the exact rejected
+            # condition and DO NOT submit anything.
+            log.error("SELFTEST local validation rejected the order: %s", exc)
+            return 1
+        price, qty = params["price"], params["qty"]
         cid = f"ag-selftest-{uuid.uuid4().hex[:20]}"
         log.warning(
-            "SELFTEST: placing far-from-market LIMIT_MAKER BUY %s qty=%s price=%s (last=%s)",
-            symbol, qty, price, last,
+            "SELFTEST: placing filter-valid LIMIT_MAKER BUY %s qty=%s price=%s (reference=%s last=%s)",
+            symbol, qty, price, reference, last,
         )
         resp = spot.create_limit_maker_order(symbol, "BUY", price, qty, cid)
         log.info("SELFTEST: order accepted status=%s", resp.get("status"))

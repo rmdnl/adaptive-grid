@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -28,7 +29,7 @@ import urllib.request
 import uuid
 from typing import Dict, List, Optional
 
-from grid import ExchangeFilters
+from grid import ExchangeFilters, validate_price
 from state import StateStore
 
 log = logging.getLogger("exchange")
@@ -38,6 +39,21 @@ LIVE_BASE = "https://api.binance.com"
 
 _TERMINAL_STATUSES = {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
 
+# Binance error codes that DEFINITIVELY reject an order at submit time:
+# the order was never created and retrying the same order cannot succeed
+# (e.g. -1013 filter failures, -2010 NEW_ORDER_REJECTED).
+_DEFINITIVE_REJECTION_CODES = {-1013, -2010}
+
+
+def is_definitive_rejection(exc: ExchangeError) -> bool:
+    """True when an HTTP 400 from order submission carries a Binance error
+    code that definitively rejects the order (it does not exist)."""
+    message = str(exc)
+    match = re.search(r'"code"\s*:\s*(-\d+)', message)
+    if match and int(match.group(1)) in _DEFINITIVE_REJECTION_CODES:
+        return True
+    return "Filter failure" in message
+
 
 class ExchangeError(Exception):
     """Request-level failure (HTTP error or exhausted retries)."""
@@ -45,6 +61,12 @@ class ExchangeError(Exception):
 
 class OrderUnknownState(ExchangeError):
     """The final state of an order submission is unknown (fail-closed)."""
+
+
+class OrderRejected(ExchangeError):
+    """The exchange definitively rejected the order (HTTP 400 with a Binance
+    error code, e.g. a filter failure) — the order was never created and a
+    retry of the same order cannot succeed."""
 
 
 def exchange_symbol(symbol: str) -> str:
@@ -152,6 +174,8 @@ class BinanceSpot:
             raise ExchangeError(f"unknown symbol on exchange: {symbol}")
         tick = step = min_qty = None
         min_notional: Optional[float] = None
+        bid_up = bid_down = ask_up = ask_down = None
+        avg_price_mins: Optional[int] = None
         for f in symbols[0].get("filters", []):
             ftype = f.get("filterType")
             if ftype == "PRICE_FILTER":
@@ -161,12 +185,33 @@ class BinanceSpot:
                 min_qty = float(f["minQty"])
             elif ftype in ("NOTIONAL", "MIN_NOTIONAL"):
                 min_notional = float(f.get("minNotional", f.get("notional", 0)) or 0)
+            elif ftype == "PERCENT_PRICE_BY_SIDE":
+                bid_up = float(f["bidMultiplierUp"])
+                bid_down = float(f["bidMultiplierDown"])
+                ask_up = float(f["askMultiplierUp"])
+                ask_down = float(f["askMultiplierDown"])
+                avg_price_mins = int(f.get("avgPriceMins") or 0) or None
         if not tick or not step or min_notional is None:
             raise ExchangeError(f"incomplete exchange filters for {symbol}")
         status = symbols[0].get("status")
         if status is not None and status != "TRADING":
             raise ExchangeError(f"{symbol} is not tradable (status={status!r})")
-        return ExchangeFilters(tick, step, min_notional, min_qty or 0.0)
+        return ExchangeFilters(
+            tick, step, min_notional, min_qty or 0.0,
+            bid_multiplier_up=bid_up, bid_multiplier_down=bid_down,
+            ask_multiplier_up=ask_up, ask_multiplier_down=ask_down,
+            avg_price_mins=avg_price_mins,
+        )
+
+    def get_avg_price(self, symbol: str) -> Dict:
+        """The exchange's own weighted-average price — the reference for
+        PERCENT_PRICE_BY_SIDE. Never assume the last traded price instead."""
+        return self._request(
+            "GET",
+            "/api/v3/avgPrice",
+            {"symbol": exchange_symbol(symbol)},
+            retries=2,
+        )
 
     # ----- trading (signed; disabled under DRY_RUN) -----
 
@@ -332,10 +377,40 @@ class BaseExecutor:
 
     mode = "abstract"
 
-    def __init__(self, cfg, store: StateStore):
+    def __init__(self, cfg, store: StateStore, spot: Optional[BinanceSpot] = None):
         self.cfg = cfg
         self.store = store
+        self.spot = spot
+        self._filters_cache: Dict[str, ExchangeFilters] = {}
         self.accounting = Accounting(cfg, store)
+
+    def _filters_for(self, symbol: str) -> Optional[ExchangeFilters]:
+        """Cached exchange filters for band validation (None when no spot
+        access is configured or the spot provides no filter support)."""
+        if self.spot is None:
+            return None
+        if symbol not in self._filters_cache:
+            try:
+                self._filters_cache[symbol] = self.spot.get_filters(symbol)
+            except AttributeError:
+                return None
+        return self._filters_cache[symbol]
+
+    def _child_sell_band_violation(self, symbol: str, price: float) -> Optional[str]:
+        """PERCENT_PRICE_BY_SIDE pre-validation for a child SELL against the
+        live exchange reference price. Returns the violated condition (the
+        placement must be deferred) or None. When the symbol carries no
+        percent-price filter there is nothing to enforce."""
+        filters = self._filters_for(symbol)
+        if filters is None or filters.ask_multiplier_down is None:
+            return None
+        try:
+            reference = float(self.spot.get_avg_price(symbol).get("price") or 0)
+        except ExchangeError as exc:
+            return f"reference price unavailable: {exc}"
+        except AttributeError:
+            return None  # spot without reference-price support: cannot validate
+        return validate_price(filters, "SELL", price, reference)
 
     def place_limit(
         self,
@@ -451,6 +526,17 @@ class DryRunExecutor(BaseExecutor):
         return order_id
 
     def _place_child_sell(self, parent: Dict, qty: float) -> None:
+        violation = self._child_sell_band_violation(
+            parent["symbol"], parent["target_sell_price"]
+        )
+        if violation is not None:
+            # Outside the PERCENT_PRICE_BY_SIDE band: defer — the quantity
+            # stays unconverted and the spawn is retried on a later cycle
+            # against the then-current reference price.
+            log.warning(
+                "child sell for %s deferred: %s", parent["symbol"], violation
+            )
+            return
         cid = _new_client_id("dry")
         self.store.create_child_sell_order(
             cid, parent["symbol"], parent["target_sell_price"], qty,
@@ -527,8 +613,7 @@ class LiveExecutor(BaseExecutor):
     LIQ_MAX_ATTEMPTS = 3
 
     def __init__(self, cfg, spot: BinanceSpot, store: StateStore):
-        super().__init__(cfg, store)
-        self.spot = spot
+        super().__init__(cfg, store, spot=spot)
 
     def place_limit(
         self,
@@ -547,6 +632,11 @@ class LiveExecutor(BaseExecutor):
         try:
             resp = self.spot.create_limit_maker_order(symbol, side, price, qty, cid)
         except ExchangeError as exc:
+            if is_definitive_rejection(exc):
+                # The exchange refused the order (e.g. a filter failure):
+                # it does not exist, and resubmitting cannot succeed.
+                self.store.update_order_status(order_id, "REJECTED")
+                raise OrderRejected(f"order {cid} rejected: {exc}") from None
             # Reconcile before any retry — never submit blindly again.
             existing = self._reconcile_by_cid(symbol, cid)
             if existing is None:
@@ -565,6 +655,17 @@ class LiveExecutor(BaseExecutor):
         """Submit the child SELL for acquired quantity; the local row and
         the parent's child_sell_qty are created atomically by
         StateStore.create_child_sell_order."""
+        violation = self._child_sell_band_violation(
+            parent["symbol"], parent["target_sell_price"]
+        )
+        if violation is not None:
+            # Outside the PERCENT_PRICE_BY_SIDE band: defer instead of
+            # submitting an order the exchange would refuse — the quantity
+            # stays unconverted and the spawn retries on a later cycle.
+            log.warning(
+                "child sell for %s deferred: %s", parent["symbol"], violation
+            )
+            return
         cid = _new_client_id("ag")
         local_id = self.store.create_child_sell_order(
             cid, parent["symbol"], parent["target_sell_price"], qty,
@@ -575,6 +676,11 @@ class LiveExecutor(BaseExecutor):
                 parent["symbol"], "SELL", parent["target_sell_price"], qty, cid
             )
         except ExchangeError as exc:
+            if is_definitive_rejection(exc):
+                self.store.update_order_status(local_id, "REJECTED")
+                raise OrderRejected(
+                    f"child sell {cid} rejected: {exc}"
+                ) from None
             existing = self._reconcile_by_cid(parent["symbol"], cid)
             if existing is None:
                 self.store.update_order_status(local_id, "UNKNOWN")
@@ -615,6 +721,11 @@ class LiveExecutor(BaseExecutor):
             try:
                 self.spot.create_market_order(symbol, "SELL", remaining, cid)
             except ExchangeError as exc:
+                if is_definitive_rejection(exc):
+                    self.store.update_order_status(local_id, "REJECTED")
+                    raise OrderRejected(
+                        f"liquidation order {cid} rejected: {exc}"
+                    ) from None
                 # The request may or may not have reached the exchange:
                 # reconcile this exact client id before doing anything else.
                 if self._reconcile_by_cid(symbol, cid) is None:

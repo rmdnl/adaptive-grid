@@ -48,6 +48,9 @@ class StubMarket:
             return self.views[symbol]
         return CycleView(IndicatorSnapshot(symbol=symbol), None, None)
 
+    def avg_price(self, symbol):
+        return None  # no percent-price reference: grids are unvalidated
+
     def filters(self, symbol):
         return self.filters_obj
 
