@@ -1,9 +1,21 @@
-"""Read-only dashboard over the state database.
+"""Read-only retrofuturistic operator dashboard over the state database.
+
+"Serious crypto trading control system from an alternate 1987."
 
 The dashboard implements NO strategy logic, makes NO trading decisions,
 places/cancels NO orders, exposes NO credentials and modifies NO
-configuration. It only serves GET routes: `/` (HTML) and `/api/state`
-(JSON). Any other method is refused with 405.
+configuration. It never reads .env or any environment variable: the
+operating mode it displays (TESTNET/LIVE, DRY-RUN/LIVE) is the runtime's
+own persisted record (meta keys written by bot.py).
+
+Routes (GET only):
+    /            static operator-console shell (HTML/CSS/JS, no assets)
+    /api/state   full state snapshot (JSON)
+    /api/history cumulative net PnL telemetry from the fills ledger
+
+Every other path is 404; every write method (POST/PUT/PATCH/DELETE) is
+405 Method Not Allowed. Dynamic values reach the page exclusively via
+DOM APIs (textContent) — never via HTML string interpolation.
 
 Symbol states are displayed verbatim from the database — one state is
 never inferred from another:
@@ -37,11 +49,13 @@ def _global_payload(store: StateStore) -> Dict:
     drawdown = 0.0
     if reference is not None and reference > 0 and equity is not None:
         drawdown = (reference - equity) / reference
+    binance_env = store.get_meta("mode_binance_env")
+    dry_run_raw = store.get_meta("mode_dry_run")
     return {
         "equity": equity,
         "reference_equity": reference,
         "drawdown": drawdown,
-        "max_drawdown_percent": None,  # filled by caller when config known
+        "max_drawdown_percent": None,  # filled by caller when known
         "kill_active": kill_active,
         "kill_reason": kill_reason,
         "open_orders": store.count_open_orders(),
@@ -50,11 +64,14 @@ def _global_payload(store: StateStore) -> Dict:
         "runtime_status": runtime_status,
         "last_cycle_ts": last_cycle_ts,
         "database": store.database_status(),
+        # operating mode, as persisted by the trading runtime itself
+        "binance_env": binance_env,
+        "dry_run": None if dry_run_raw is None else dry_run_raw == "1",
+        "execution": None if dry_run_raw is None else ("DRY-RUN" if dry_run_raw == "1" else "LIVE"),
     }
 
 
 def _symbol_payload(store: StateStore, st) -> Dict:
-    cooldown_active = st.cooldown_until is not None
     return {
         "symbol": st.symbol,
         "timeframe": st.timeframe,
@@ -71,7 +88,7 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "block_reason": st.block_reason,
         "exit_status": "triggered" if st.exit_status else "none",
         "exit_reason": st.exit_reason,
-        "cooldown": cooldown_active,
+        "cooldown": st.cooldown_until is not None,
         "cooldown_until": st.cooldown_until,
         "grid_mode": st.grid_mode,
         "grid_step": st.grid_step,
@@ -90,7 +107,7 @@ def _symbol_payload(store: StateStore, st) -> Dict:
 
 def build_payload(db_path: str, max_drawdown_percent: Optional[float] = None) -> Dict:
     """Read-only snapshot of global and per-symbol state. Missing data is
-    reported as None — never inferred."""
+    reported as None — never inferred, never fabricated."""
     symbols: List[Dict] = []
     store: Optional[StateStore] = None
     try:
@@ -111,74 +128,503 @@ def build_payload(db_path: str, max_drawdown_percent: Optional[float] = None) ->
             "runtime_status": None,
             "last_cycle_ts": None,
             "database": {"ok": False, "path": db_path, "error": str(exc)},
+            "binance_env": None,
+            "dry_run": None,
+            "execution": None,
         }
         return {"global": glob, "symbols": symbols}
     glob["max_drawdown_percent"] = max_drawdown_percent
     return {"global": glob, "symbols": symbols}
 
 
-_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>adaptive-grid</title>
+def build_history(db_path: str) -> List[Dict]:
+    """Cumulative net PnL telemetry from the fills ledger. If the database
+    is unavailable the telemetry is empty — nothing is invented."""
+    try:
+        store = StateStore(db_path, read_only=True)
+        return store.net_pnl_history()
+    except Exception as exc:  # dashboard must never crash on DB issues
+        log.debug("history unavailable: %s", exc)
+        return []
+
+
+_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>ADAPTIVE-GRID // SPOT TRADING CONTROL SYSTEM</title>
 <style>
- body {{ font-family: system-ui, sans-serif; margin: 24px; background: #111; color: #ddd; }}
- h1 {{ font-size: 20px; }} h2 {{ font-size: 16px; margin-top: 24px; }}
- table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
- th, td {{ border: 1px solid #333; padding: 4px 8px; text-align: left; white-space: nowrap; }}
- th {{ background: #1c1c1c; }}
- .ACTIVE {{ color: #6f6; }} .COOLDOWN {{ color: #fa0; }} .ERROR, .KILL_ACTIVE, .STOPPED {{ color: #f55; }}
- .EXITING {{ color: #f80; }} .WAITING, .ENTRY_BLOCKED, .GRID_BLOCKED {{ color: #aaa; }}
- .kill {{ color: #f55; font-weight: bold; }}
-</style></head><body>
-<h1>adaptive-grid — read-only dashboard</h1>
-<div>runtime: {runtime_status} | kill: <span class="{kill_class}">{kill}</span> | equity: {equity} | drawdown: {drawdown}</div>
-<h2>symbols</h2>
-<table>
-<tr><th>symbol</th><th>state</th><th>last</th><th>ADX</th><th>RSI</th><th>%B</th><th>VO</th><th>Z</th><th>ATR</th>
-<th>entry</th><th>blocker</th><th>exit</th><th>cooldown</th><th>mode</th><th>step</th><th>grids</th>
-<th>gross</th><th>net</th><th>inv</th><th>open</th><th>pnl</th><th>fees</th><th>risk</th></tr>
-{rows}
-</table>
-</body></html>"""
+:root{
+  --bg:#05080f; --panel:#0a101c; --panel2:#0d1524; --line:#182c47; --line2:#0f2036;
+  --text:#c9d8e8; --dim:#5f7688; --faint:#3b4f61;
+  --cyan:#4fd8ff; --green:#3dff9e; --amber:#ffb545; --orange:#ff8a3d;
+  --red:#ff4d5e; --magenta:#ff5fd2;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--text); min-height:100vh;
+  font-family:"IBM Plex Mono","JetBrains Mono","Roboto Mono",ui-monospace,Menlo,Consolas,monospace;
+  font-size:13px; line-height:1.45;
+}
+/* subtle technical grid */
+body::before{content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:
+    repeating-linear-gradient(0deg, rgba(79,216,255,.030) 0 1px, transparent 1px 48px),
+    repeating-linear-gradient(90deg, rgba(79,216,255,.030) 0 1px, transparent 1px 48px);
+}
+/* subtle CRT scanlines */
+body::after{content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px);
+}
+.wrap{position:relative; z-index:1; max-width:1340px; margin:0 auto; padding:18px 22px 40px}
+a{color:var(--cyan)}
+/* ---------- header ---------- */
+header.mast{
+  display:flex; flex-wrap:wrap; gap:14px 26px; align-items:flex-end;
+  border:1px solid var(--line); background:linear-gradient(180deg,var(--panel2),var(--panel));
+  padding:14px 18px; margin-bottom:14px; position:relative;
+}
+.mast::before,.mast::after{content:""; position:absolute; width:10px; height:10px; pointer-events:none}
+.mast::before{top:-1px; left:-1px; border-top:2px solid var(--cyan); border-left:2px solid var(--cyan)}
+.mast::after{bottom:-1px; right:-1px; border-bottom:2px solid var(--cyan); border-right:2px solid var(--cyan)}
+.brand h1{margin:0; font-size:19px; letter-spacing:.42em; color:var(--cyan);
+  text-shadow:0 0 10px rgba(79,216,255,.35); font-weight:600}
+.brand .sub{margin-top:3px; font-size:10px; letter-spacing:.34em; color:var(--dim)}
+.idrow{display:flex; flex-wrap:wrap; gap:8px; margin-left:auto; align-items:center}
+.ind{display:flex; align-items:center; gap:7px; border:1px solid var(--line2);
+  background:rgba(5,10,20,.75); padding:4px 10px; font-size:11px; letter-spacing:.14em; white-space:nowrap}
+.dot{width:8px; height:8px; border-radius:50%; background:var(--faint); flex:0 0 auto;
+  box-shadow:0 0 6px rgba(0,0,0,0)}
+.ind.online .dot{background:var(--green); box-shadow:0 0 7px rgba(61,255,158,.7)}
+.ind.offline .dot{background:var(--red); box-shadow:0 0 7px rgba(255,77,94,.7)}
+.ind.live{border-color:var(--magenta); color:var(--magenta)}
+.ind .lbl{color:var(--dim)}
+/* ---------- panels ---------- */
+.panel{border:1px solid var(--line); background:linear-gradient(180deg,var(--panel2),var(--panel));
+  padding:12px 14px; position:relative}
+.panel>.cap{font-size:10px; letter-spacing:.30em; color:var(--dim); margin-bottom:9px;
+  border-bottom:1px solid var(--line2); padding-bottom:5px}
+.kpis{display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:14px}
+.kpi .val{font-size:19px; margin-top:2px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.kpi .unit{font-size:10px; color:var(--dim); letter-spacing:.18em; margin-top:4px}
+.kpi.risk .val{color:var(--amber)}
+.kpi.risk.hot{border-color:var(--red)}
+.kpi.risk.hot .val{color:var(--red); text-shadow:0 0 9px rgba(255,77,94,.45)}
+.kpi.kill.hot .val{color:var(--red)}
+.kpi.kill .val{color:var(--green)}
+.mid{display:grid; grid-template-columns:minmax(280px,340px) 1fr; gap:10px; margin-bottom:14px}
+/* ---------- system telemetry ---------- */
+.sysrow{display:flex; gap:9px 18px; flex-wrap:wrap; font-size:12px}
+.sysrow .item{display:flex; gap:8px; min-width:190px}
+.sysrow .k{color:var(--dim); letter-spacing:.12em}
+.sysrow .v{letter-spacing:.08em}
+.sysrow .v.ok{color:var(--green)} .sysrow .v.warn{color:var(--amber)}
+.sysrow .v.danger{color:var(--red)} .sysrow .v.cyan{color:var(--cyan)}
+.sysrow .v.magenta{color:var(--magenta)}
+.killreason{margin-top:9px; border-top:1px dashed var(--line2); padding-top:7px;
+  color:var(--red); font-size:11.5px; letter-spacing:.06em; display:none}
+.killreason.show{display:block}
+/* ---------- chart ---------- */
+#chart{width:100%; height:190px; display:block}
+.chartmeta{display:flex; justify-content:space-between; color:var(--faint); font-size:10px;
+  letter-spacing:.16em; margin-top:6px}
+/* ---------- symbols ---------- */
+.symbols{display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:10px}
+.sym .symhead{display:flex; justify-content:space-between; align-items:center;
+  border-bottom:1px solid var(--line2); padding-bottom:7px; margin-bottom:8px}
+.symname{font-size:15px; letter-spacing:.22em; color:var(--cyan)}
+.badge{border:1px solid var(--faint); padding:2px 8px; font-size:10.5px; letter-spacing:.14em; white-space:nowrap}
+.badge.ok{color:var(--green); border-color:rgba(61,255,158,.55); text-shadow:0 0 6px rgba(61,255,158,.35)}
+.badge.neutral{color:#9fb4c6; border-color:#33475c}
+.badge.warn{color:var(--amber); border-color:rgba(255,181,69,.55)}
+.badge.warn2{color:var(--orange); border-color:rgba(255,138,61,.55)}
+.badge.danger{color:var(--red); border-color:rgba(255,77,94,.6); text-shadow:0 0 6px rgba(255,77,94,.35)}
+.badge.magenta{color:var(--magenta); border-color:rgba(255,95,210,.6)}
+.sec{font-size:9.5px; letter-spacing:.30em; color:var(--faint); margin:8px 0 4px}
+.kv{display:flex; justify-content:space-between; gap:12px; padding:1.5px 0; font-size:12px}
+.kv .k{color:var(--dim); letter-spacing:.12em}
+.kv .v{font-variant-numeric:tabular-nums; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.kv .v.ok{color:var(--green)} .kv .v.warn{color:var(--amber)}
+.kv .v.danger{color:var(--red)} .kv .v.cyan{color:var(--cyan)}
+.hr{border-top:1px dashed var(--line2); margin:9px 0}
+/* ---------- footer ---------- */
+footer{margin-top:16px; border:1px solid var(--line2); background:rgba(5,10,20,.6);
+  padding:10px 14px; display:flex; flex-wrap:wrap; gap:8px 22px; font-size:10.5px; color:var(--dim);
+  letter-spacing:.14em; align-items:center}
+.legend .sw{display:inline-block; width:8px; height:8px; margin:0 5px 0 14px; vertical-align:middle}
+.sw.g{background:var(--green)} .sw.c{background:#9fb4c6} .sw.a{background:var(--amber)}
+.sw.o{background:var(--orange)} .sw.r{background:var(--red)}
+footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
+@media (max-width:760px){
+  .mid{grid-template-columns:1fr}
+  .idrow{margin-left:0}
+  .brand h1{font-size:15px; letter-spacing:.3em}
+}
+</style></head>
+<body>
+<div class="wrap">
+
+<header class="mast">
+  <div class="brand">
+    <h1>ADAPTIVE-GRID</h1>
+    <div class="sub">SPOT TRADING CONTROL SYSTEM // MK-IV CONSOLE</div>
+  </div>
+  <div class="idrow">
+    <span class="ind" id="ind-system"><span class="dot"></span><span class="lbl">SYSTEM</span><span id="system">BOOT</span></span>
+    <span class="ind" id="ind-binance"><span class="lbl">BINANCE</span><span id="binance">&#8212;</span></span>
+    <span class="ind" id="ind-exec"><span class="lbl">EXECUTION</span><span id="execution">&#8212;</span></span>
+    <span class="ind" id="ind-data"><span class="lbl">FEED</span><span id="dataflag">CONNECTING</span></span>
+    <span class="ind"><span class="lbl">LAST CYCLE</span><span id="lastcycle">&#8212;</span></span>
+    <span class="ind"><span class="lbl">UPDATED</span><span id="updated">&#8212;</span></span>
+    <span class="ind"><span class="lbl">TIME</span><span id="clock">&#8212;</span></span>
+  </div>
+</header>
+
+<div class="kpis">
+  <div class="panel kpi"><div class="cap">EQUITY</div><div class="val" id="k-equity">&#8212;</div><div class="unit">USDT &middot; PNL-BASED</div></div>
+  <div class="panel kpi"><div class="cap">REFERENCE EQUITY</div><div class="val" id="k-ref">&#8212;</div><div class="unit">HIGH-WATER MARK</div></div>
+  <div class="panel kpi risk" id="k-dd-box"><div class="cap">DRAWDOWN</div><div class="val" id="k-dd">&#8212;</div><div class="unit">FROM REFERENCE</div></div>
+  <div class="panel kpi"><div class="cap">MAX DRAWDOWN</div><div class="val" id="k-maxdd">&#8212;</div><div class="unit">HARD LIMIT</div></div>
+  <div class="panel kpi"><div class="cap">OPEN ORDERS</div><div class="val" id="k-open">&#8212;</div><div class="unit">ACROSS ALL SYMBOLS</div></div>
+  <div class="panel kpi"><div class="cap">REALIZED PNL</div><div class="val" id="k-pnl">&#8212;</div><div class="unit">USDT &middot; NET LEDGER</div></div>
+  <div class="panel kpi"><div class="cap">FEES</div><div class="val" id="k-fees">&#8212;</div><div class="unit">USDT &middot; CUMULATIVE</div></div>
+  <div class="panel kpi kill" id="k-kill-box"><div class="cap">KILL SWITCH</div><div class="val" id="k-kill">&#8212;</div><div class="unit" id="k-killsub">GLOBAL DRAWDOWN GUARD</div></div>
+</div>
+
+<div class="mid">
+  <div class="panel">
+    <div class="cap">SYSTEM SAFETY TELEMETRY</div>
+    <div class="sysrow">
+      <span class="item"><span class="k">RUNTIME</span><span class="v" id="s-runtime">&#8212;</span></span>
+      <span class="item"><span class="k">DATABASE</span><span class="v" id="s-db">&#8212;</span></span>
+      <span class="item"><span class="k">BINANCE</span><span class="v" id="s-binance">&#8212;</span></span>
+      <span class="item"><span class="k">EXECUTION</span><span class="v" id="s-exec">&#8212;</span></span>
+      <span class="item"><span class="k">KILL SWITCH</span><span class="v" id="s-kill">&#8212;</span></span>
+      <span class="item"><span class="k">RISK STATUS</span><span class="v" id="s-risk">&#8212;</span></span>
+      <span class="item"><span class="k">LAST CYCLE</span><span class="v" id="s-cycle">&#8212;</span></span>
+    </div>
+    <div class="killreason" id="killreason"></div>
+  </div>
+  <div class="panel">
+    <div class="cap">NET PNL TELEMETRY &middot; OSCILLOSCOPE</div>
+    <canvas id="chart"></canvas>
+    <div class="chartmeta"><span id="chart-lo">MIN &#8212;</span><span>CUMULATIVE REALIZED &#8722; FEES &middot; FROM FILLS LEDGER</span><span id="chart-hi">MAX &#8212;</span></div>
+  </div>
+</div>
+
+<div class="symbols" id="symbols"></div>
+
+<footer>
+  <span class="legend">STATES:
+    <span class="sw g"></span>ACTIVE / OK
+    <span class="sw c"></span>WAITING / ENTRY BLOCKED
+    <span class="sw a"></span>GRID BLOCKED / COOLDOWN
+    <span class="sw o"></span>EXITING
+    <span class="sw r"></span>ERROR / STOPPED / KILL
+  </span>
+  <span class="ro">&#9679; READ-ONLY OBSERVER &middot; NO TRADING CONTROLS</span>
+</footer>
+
+</div>
+<script>
+(function () {
+  "use strict";
+  var REFRESH_MS = 5000;
+  var lastGood = null, lastGoodAt = null, dataLive = false, lastHistory = null;
+
+  function $(id) { return document.getElementById(id); }
+  var DASH = "\\u2014";
+
+  function fmtNum(v, digits) {
+    if (v === null || v === undefined || isNaN(Number(v))) return DASH;
+    return Number(v).toLocaleString("en-US", {
+      minimumFractionDigits: digits, maximumFractionDigits: digits
+    });
+  }
+  function fmtPrice(v) {
+    if (v === null || v === undefined || isNaN(Number(v))) return DASH;
+    var n = Number(v);
+    if (Math.abs(n) >= 1000) return fmtNum(n, 2);
+    if (Math.abs(n) >= 1) return fmtNum(n, 4);
+    return fmtNum(n, 8);
+  }
+  function fmtSigned(v) {
+    if (v === null || v === undefined || isNaN(Number(v))) return DASH;
+    var n = Number(v);
+    var s = Math.abs(n).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    return (n >= 0 ? "+" : "\\u2212") + s;
+  }
+  function fmtPctFrac(v) { // fraction -> signed percent
+    if (v === null || v === undefined || isNaN(Number(v))) return DASH;
+    var n = Number(v) * 100;
+    var s = Math.abs(n).toFixed(2) + "%";
+    return (n > 0 ? "+" : n < 0 ? "\\u2212" : "") + s;
+  }
+  function fmtTs(ts) {
+    if (ts === null || ts === undefined || isNaN(Number(ts))) return DASH;
+    var d = new Date(Number(ts) * 1000);
+    return isNaN(d.getTime()) ? DASH : d.toLocaleTimeString("en-GB");
+  }
+  function set(id, text) { var n = $(id); if (n) n.textContent = text; }
+  function setCls(id, cls) { var n = $(id); if (n) n.className = cls; }
+
+  function stateClass(state) {
+    switch (state) {
+      case "ACTIVE": case "OK": case "ok": case "RUNNING": return "ok";
+      case "GRID_BLOCKED": case "COOLDOWN": case "GRID BLOCKED": return "warn";
+      case "EXITING": return "warn2";
+      case "ERROR": case "STOPPED": case "KILL_ACTIVE": case "error": case "stopped": return "danger";
+      default: return "neutral";
+    }
+  }
+
+  function kv(label, value, cls) {
+    var row = document.createElement("div"); row.className = "kv";
+    var k = document.createElement("span"); k.className = "k"; k.textContent = label;
+    var v = document.createElement("span"); v.className = "v" + (cls ? " " + cls : "");
+    v.textContent = value;
+    row.appendChild(k); row.appendChild(v);
+    return row;
+  }
+  function sec(title) {
+    var s = document.createElement("div"); s.className = "sec"; s.textContent = title;
+    return s;
+  }
+  function hr() { var h = document.createElement("div"); h.className = "hr"; return h; }
+
+  function renderGlobal(g) {
+    set("k-equity", fmtNum(g.equity, 2));
+    set("k-ref", fmtNum(g.reference_equity, 2));
+    set("k-dd", g.drawdown === null || g.drawdown === undefined ? DASH : fmtPctFrac(g.drawdown).replace("+", ""));
+    var maxdd = DASH;
+    if (g.max_drawdown_percent !== null && g.max_drawdown_percent !== undefined) {
+      maxdd = Number(g.max_drawdown_percent).toFixed(2) + "%";
+    }
+    set("k-maxdd", maxdd);
+    set("k-open", g.open_orders === null || g.open_orders === undefined
+      ? DASH : String(g.open_orders).padStart(3, "0"));
+    set("k-pnl", fmtSigned(g.realized_pnl));
+    set("k-fees", fmtNum(g.fees, 4));
+    set("k-kill", g.kill_active ? "ACTIVE" : "INACTIVE");
+    setCls("k-kill", "val " + (g.kill_active ? "danger" : "ok"));
+    setCls("k-kill-box", "panel kpi kill" + (g.kill_active ? " hot" : ""));
+    var drifting = typeof g.drawdown === "number" && g.drawdown > 0;
+    setCls("k-dd-box", "panel kpi risk" + (g.kill_active ? " hot" : ""));
+    setCls("k-dd", "val " + (g.kill_active ? "danger" : drifting ? "warn" : ""));
+
+    // header identifiers — impossible to miss
+    var online = g.runtime_status === "RUNNING";
+    set("system", g.runtime_status === "KILL_ACTIVE" ? "KILL ACTIVE" : (online ? "ONLINE" : "OFFLINE"));
+    setCls("ind-system", "ind " + (g.runtime_status === "KILL_ACTIVE" ? "offline" : online ? "online" : "offline"));
+    var env = (g.binance_env || "").toUpperCase();
+    set("binance", env || "UNKNOWN");
+    setCls("ind-binance", "ind" + (env === "LIVE" ? " live" : ""));
+    set("execution", g.execution ? g.execution.toUpperCase() : "UNKNOWN");
+    setCls("ind-exec", "ind" + (g.execution === "LIVE" ? " live" : ""));
+    set("lastcycle", fmtTs(g.last_cycle_ts));
+
+    // system safety telemetry — explicit text, never color alone
+    set("s-runtime", g.runtime_status || "UNKNOWN");
+    setCls("s-runtime", "v " + (online ? "ok" : g.runtime_status === "KILL_ACTIVE" ? "danger" : "warn"));
+    set("s-db", g.database && g.database.ok ? "OK" : "UNAVAILABLE");
+    setCls("s-db", "v " + (g.database && g.database.ok ? "ok" : "danger"));
+    set("s-binance", env || "UNKNOWN");
+    setCls("s-binance", "v " + (env === "LIVE" ? "magenta" : "cyan"));
+    set("s-exec", g.execution ? g.execution.toUpperCase() : "UNKNOWN");
+    setCls("s-exec", "v " + (g.execution === "LIVE" ? "magenta" : "cyan"));
+    set("s-kill", g.kill_active ? "ACTIVE" : "INACTIVE");
+    setCls("s-kill", "v " + (g.kill_active ? "danger" : "ok"));
+    set("s-cycle", fmtTs(g.last_cycle_ts));
+    var kr = $("killreason");
+    if (g.kill_active && g.kill_reason) {
+      kr.textContent = "KILL REASON: " + g.kill_reason;
+      kr.className = "killreason show";
+    } else { kr.className = "killreason"; }
+  }
+
+  function renderSymbols(symbols) {
+    var grid = $("symbols");
+    grid.textContent = "";
+    if (!symbols || !symbols.length) {
+      var empty = document.createElement("div");
+      empty.className = "panel"; empty.style.gridColumn = "1 / -1";
+      empty.textContent = "NO SYMBOLS CONFIGURED";
+      grid.appendChild(empty);
+      return;
+    }
+    symbols.forEach(function (s) {
+      var m = document.createElement("section"); m.className = "panel sym";
+      var head = document.createElement("header"); head.className = "symhead";
+      var name = document.createElement("span"); name.className = "symname"; name.textContent = s.symbol;
+      var badge = document.createElement("span");
+      badge.className = "badge " + stateClass(s.strategy_state);
+      badge.textContent = s.strategy_state || DASH;
+      head.appendChild(name); head.appendChild(badge);
+      m.appendChild(head);
+
+      var riskOk = s.risk_status === "ok";
+      m.appendChild(kv("STATE", s.strategy_state || DASH));
+      m.appendChild(kv("RISK", riskOk ? "OK" : String(s.risk_status || DASH).toUpperCase(),
+                      riskOk ? "ok" : "danger"));
+      m.appendChild(kv("PRICE", fmtPrice(s.last_price), "cyan"));
+      m.appendChild(kv("TIMEFRAME", s.timeframe ? String(s.timeframe).toUpperCase() : DASH));
+      m.appendChild(kv("ENTRY", s.entry_status ? String(s.entry_status).toUpperCase() : DASH));
+      m.appendChild(kv("BLOCKER", s.entry_blocker || s.block_reason || DASH,
+                       (s.entry_blocker || s.block_reason) ? "warn" : ""));
+      m.appendChild(kv("EXIT", s.exit_status === "triggered"
+                       ? "TRIGGERED" + (s.exit_reason ? " \\u00b7 " + s.exit_reason : "")
+                       : "NONE", s.exit_status === "triggered" ? "warn" : ""));
+      m.appendChild(kv("COOLDOWN", s.cooldown ? "UNTIL " + fmtTs(s.cooldown_until) : "INACTIVE",
+                       s.cooldown ? "warn" : ""));
+      m.appendChild(hr());
+      m.appendChild(sec("INDICATORS"));
+      m.appendChild(kv("ADX", fmtNum(s.adx, 2)));
+      m.appendChild(kv("RSI", fmtNum(s.rsi, 2)));
+      m.appendChild(kv("%B", fmtNum(s.percent_b, 3)));
+      m.appendChild(kv("VO", s.volume_osc === null || s.volume_osc === undefined
+                       ? DASH : fmtSigned(Number(s.volume_osc) * 100) + "%"));
+      m.appendChild(kv("Z-SCORE", fmtSigned(s.zscore)));
+      m.appendChild(kv("ATR", fmtNum(s.atr, 4)));
+      m.appendChild(hr());
+      m.appendChild(sec("GRID / POSITION"));
+      m.appendChild(kv("MODE", s.grid_mode ? String(s.grid_mode).toUpperCase() : DASH));
+      m.appendChild(kv("STEP", fmtNum(s.grid_step, 4)));
+      m.appendChild(kv("COUNT", s.grid_count === null || s.grid_count === undefined
+                       ? DASH : String(s.grid_count)));
+      m.appendChild(kv("GROSS", fmtPctFrac(s.gross_pct)));
+      m.appendChild(kv("NET", fmtPctFrac(s.net_pct)));
+      m.appendChild(kv("INVENTORY", fmtNum(s.inventory_qty, 8)));
+      m.appendChild(kv("AVG COST", fmtPrice(s.avg_cost)));
+      m.appendChild(kv("OPEN", s.open_orders === null || s.open_orders === undefined
+                       ? DASH : String(s.open_orders)));
+      m.appendChild(kv("PNL", fmtSigned(s.realized_pnl),
+                       typeof s.realized_pnl === "number"
+                       ? (s.realized_pnl >= 0 ? "ok" : "danger") : ""));
+      m.appendChild(kv("FEES", fmtNum(s.fees, 4)));
+      grid.appendChild(m);
+    });
+  }
+
+  function drawChart(points) {
+    var c = $("chart");
+    if (!c) return;
+    var dpr = window.devicePixelRatio || 1;
+    var w = c.clientWidth || 600, h = 190;
+    c.width = w * dpr; c.height = h * dpr;
+    var ctx = c.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = "rgba(79,216,255,0.10)";
+    ctx.lineWidth = 1;
+    var gx;
+    for (gx = 0; gx <= 8; gx++) {
+      ctx.beginPath();
+      ctx.moveTo(gx * w / 8, 0); ctx.lineTo(gx * w / 8, h); ctx.stroke();
+    }
+    var gy;
+    for (gy = 0; gy <= 4; gy++) {
+      ctx.beginPath();
+      ctx.moveTo(0, gy * h / 4); ctx.lineTo(w, gy * h / 4); ctx.stroke();
+    }
+    if (!points || !points.length) {
+      ctx.fillStyle = "rgba(95,118,136,0.9)";
+      ctx.font = "11px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("NO TELEMETRY DATA", w / 2, h / 2);
+      set("chart-lo", "MIN " + DASH); set("chart-hi", "MAX " + DASH);
+      return;
+    }
+    var vals = points.map(function (p) { return p.net; });
+    var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    if (hi - lo < 1e-9) { hi = lo + 1; }
+    var pad = (hi - lo) * 0.1;
+    lo -= pad; hi += pad;
+    var zeroY = h - (0 - lo) / (hi - lo) * h;
+    if (zeroY >= 0 && zeroY <= h) {
+      ctx.strokeStyle = "rgba(255,181,69,0.35)";
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(w, zeroY); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.strokeStyle = "#3dff9e";
+    ctx.shadowColor = "rgba(61,255,158,0.55)";
+    ctx.shadowBlur = 5;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    points.forEach(function (p, i) {
+      var x = points.length === 1 ? w : i / (points.length - 1) * w;
+      var y = h - (p.net - lo) / (hi - lo) * h;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    set("chart-lo", "MIN " + fmtNum(Math.min.apply(null, vals), 2));
+    set("chart-hi", "MAX " + fmtNum(Math.max.apply(null, vals), 2));
+  }
+
+  function renderAll(p) {
+    if (!p) return;
+    renderGlobal(p.global || {});
+    renderSymbols(p.symbols || []);
+  }
+
+  function setDataFlag(live) {
+    var flag = live ? "DATA LIVE" : (lastGood ? "DATA STALE" : "NO DATA");
+    set("dataflag", flag);
+    setCls("dataflag", "badge " + (live ? "ok" : lastGood ? "warn" : "danger"));
+    if (live && lastGoodAt) {
+      set("updated", "UPDATED " + Math.max(0, Math.round((Date.now() - lastGoodAt) / 1000)) + "S AGO");
+    }
+    if (!live) {
+      set("updated", "LAST GOOD " + (lastGoodAt ? new Date(lastGoodAt).toLocaleTimeString("en-GB") : DASH));
+    }
+  }
+
+  function tick() {
+    fetch("/api/state").then(function (r) {
+      if (!r.ok) throw new Error("http " + r.status);
+      return r.json();
+    }).then(function (p) {
+      lastGood = p; lastGoodAt = Date.now(); dataLive = true;
+      renderAll(p);
+      setDataFlag(true);
+    }).catch(function () {
+      dataLive = false;
+      setDataFlag(false);   // keep the last good values on screen
+    });
+    fetch("/api/history").then(function (r) {
+      if (!r.ok) throw new Error("http " + r.status);
+      return r.json();
+    }).then(function (h) {
+      lastHistory = h;
+      drawChart(lastHistory);
+    }).catch(function () { /* keep last good chart */ });
+  }
+
+  function clockTick() {
+    set("clock", new Date().toLocaleTimeString("en-GB"));
+    if (lastGoodAt) {
+      set("updated", (dataLive ? "UPDATED " : "STALE SINCE ")
+        + Math.max(0, Math.round((Date.now() - lastGoodAt) / 1000)) + "S AGO");
+    }
+  }
+
+  window.addEventListener("resize", function () { drawChart(lastHistory); });
+  clockTick();
+  tick();
+  setInterval(clockTick, 1000);
+  setInterval(tick, REFRESH_MS);
+})();
+</script>
+</body></html>
+"""
 
 
-def _fmt(value) -> str:
-    if value is None:
-        return "-"
-    if isinstance(value, float):
-        return f"{value:.6g}"
-    return str(value)
-
-
-def render_html(payload: Dict) -> str:
-    glob = payload["global"]
-    rows = []
-    for s in payload["symbols"]:
-        rows.append(
-            "<tr><td>{sym}</td><td class='{state}'>{state}</td><td>{last}</td><td>{adx}</td>"
-            "<td>{rsi}</td><td>{pb}</td><td>{vo}</td><td>{z}</td><td>{atr}</td>"
-            "<td>{estatus}</td><td>{blocker}</td><td>{xstatus}</td><td>{cooldown}</td>"
-            "<td>{mode}</td><td>{step}</td><td>{grids}</td><td>{gross}</td><td>{net}</td>"
-            "<td>{inv}</td><td>{open}</td><td>{pnl}</td><td>{fees}</td><td>{risk}</td></tr>".format(
-                sym=_fmt(s["symbol"]), state=_fmt(s["strategy_state"]), last=_fmt(s["last_price"]),
-                adx=_fmt(s["adx"]), rsi=_fmt(s["rsi"]), pb=_fmt(s["percent_b"]),
-                vo=_fmt(s["volume_osc"]), z=_fmt(s["zscore"]), atr=_fmt(s["atr"]),
-                estatus=_fmt(s["entry_status"]), blocker=_fmt(s["entry_blocker"]),
-                xstatus=_fmt(s["exit_status"]), cooldown=_fmt(s["cooldown"]),
-                mode=_fmt(s["grid_mode"]), step=_fmt(s["grid_step"]),
-                grids=_fmt(s["grid_count"]), gross=_fmt(s["gross_pct"]), net=_fmt(s["net_pct"]),
-                inv=_fmt(s["inventory_qty"]), open=_fmt(s["open_orders"]),
-                pnl=_fmt(s["realized_pnl"]), fees=_fmt(s["fees"]), risk=_fmt(s["risk_status"]),
-            )
-        )
-    kill = "ACTIVE" if glob["kill_active"] else "inactive"
-    return _HTML.format(
-        runtime_status=_fmt(glob["runtime_status"]),
-        kill=kill,
-        kill_class="kill" if glob["kill_active"] else "",
-        equity=_fmt(glob["equity"]),
-        drawdown=_fmt(glob["drawdown"]),
-        rows="\n".join(rows),
-    )
+def render_page() -> str:
+    """The static console shell. Deliberately contains no server-side
+    interpolation: dynamic values reach the DOM only via textContent."""
+    return _PAGE
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -189,6 +635,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -198,9 +645,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             body = json.dumps(payload, indent=2).encode()
             self._send(200, body, "application/json")
             return
+        if self.path == "/api/history":
+            history = build_history(self.db_path)
+            self._send(200, json.dumps(history).encode(), "application/json")
+            return
         if self.path in ("/", "/index.html"):
-            payload = build_payload(self.db_path, self.max_drawdown_percent)
-            self._send(200, render_html(payload).encode(), "text/html; charset=utf-8")
+            self._send(200, render_page().encode(), "text/html; charset=utf-8")
             return
         self._send(404, b"not found\n", "text/plain")
 
@@ -213,6 +663,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:  # noqa: N802
         self._refuse()
 
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._refuse()
+
     def do_DELETE(self) -> None:  # noqa: N802
         self._refuse()
 
@@ -220,12 +673,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         log.debug(fmt, *args)
 
 
-def serve(db_path: str, host: str = "127.0.0.1", port: int = 8080) -> None:
+def make_server(
+    db_path: str,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    max_drawdown_percent: Optional[float] = None,
+) -> ThreadingHTTPServer:
     handler = type("BoundDashboardHandler", (DashboardHandler,), {
         "db_path": db_path,
-        "max_drawdown_percent": None,
+        "max_drawdown_percent": max_drawdown_percent,
     })
-    server = ThreadingHTTPServer((host, port), handler)
+    return ThreadingHTTPServer((host, port), handler)
+
+
+def serve(db_path: str, host: str = "127.0.0.1", port: int = 8080) -> None:
+    server = make_server(db_path, host, port)
     log.info("dashboard listening on http://%s:%d (read-only)", host, port)
     try:
         server.serve_forever()
@@ -234,9 +696,9 @@ def serve(db_path: str, host: str = "127.0.0.1", port: int = 8080) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="adaptive-grid read-only dashboard")
+    parser = argparse.ArgumentParser(description="adaptive-grid read-only operator dashboard")
     parser.add_argument("--db", default="state.db", help="path to the SQLite state database")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="127.0.0.1", help="bind address (e.g. 127.0.0.1 or 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

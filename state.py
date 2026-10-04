@@ -500,6 +500,21 @@ class StateStore:
         conn.close()
         return int(row["n"])
 
+    def net_pnl_history(self) -> List[Dict]:
+        """Reconstructable telemetry: cumulative net PnL (realized - fees)
+        over time from the fills ledger. Read-only; no invented data."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT ts, realized_pnl, fee FROM fills ORDER BY id"
+        ).fetchall()
+        conn.close()
+        points: List[Dict] = []
+        net = 0.0
+        for r in rows:
+            net += float(r["realized_pnl"] or 0.0) - float(r["fee"] or 0.0)
+            points.append({"ts": float(r["ts"]), "net": net})
+        return points
+
     # ----- risk events -----
 
     def add_risk_event(self, scope: str, event: str, details: str = "") -> None:

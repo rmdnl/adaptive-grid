@@ -1,0 +1,34 @@
+# adaptive-grid read-only operator dashboard (retrofuturistic console).
+# Install:  sudo cp deploy/adaptive-grid-dashboard.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now adaptive-grid-dashboard
+#
+# The dashboard receives EVERYTHING via explicit CLI flags — it never reads
+# .env, environment variables, or credentials, and opens the authoritative
+# state database READ-ONLY (query_only). The trading runtime owns writes.
+#
+# NOTE: this unit intentionally passes no environment file. Older deployments
+# passed DASHBOARD_HOST/DASHBOARD_PORT environment variables that the
+# application never read — configuration is CLI-only and deterministic.
+
+[Unit]
+Description=adaptive-grid read-only operator dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adaptive-grid
+Group=adaptive-grid
+WorkingDirectory=/opt/adaptive-grid
+ExecStart=/opt/adaptive-grid/.venv/bin/python dashboard.py --host 0.0.0.0 --port 8080 --db /opt/adaptive-grid/state.db
+Restart=on-failure
+RestartSec=10s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

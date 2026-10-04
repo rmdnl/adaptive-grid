@@ -1,0 +1,29 @@
+# adaptive-grid trading runtime (Binance Spot, DRY_RUN/testnet by default).
+# Install:  sudo cp deploy/adaptive-grid.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now adaptive-grid
+# The runtime reads its configuration from /opt/adaptive-grid/.env (single
+# source of truth) and owns writes to /opt/adaptive-grid/state.db.
+
+[Unit]
+Description=adaptive-grid continuous runtime (testnet/paper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adaptive-grid
+Group=adaptive-grid
+WorkingDirectory=/opt/adaptive-grid
+ExecStart=/opt/adaptive-grid/.venv/bin/python bot.py --env /opt/adaptive-grid/.env --db /opt/adaptive-grid/state.db
+Restart=on-failure
+RestartSec=30s
+KillSignal=SIGTERM
+TimeoutStopSec=90s
+EnvironmentFile=-/opt/adaptive-grid/.env
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

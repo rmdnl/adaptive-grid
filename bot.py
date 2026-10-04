@@ -94,6 +94,10 @@ class Bot:
         self.executor = executor
         self.risk = RiskEngine(cfg, store)
         store.ensure_symbols(list(cfg.pair_list))
+        # Persist the operating mode so the read-only dashboard displays
+        # the runtime's own record (display only — no gate reads it).
+        store.set_meta("mode_binance_env", cfg.binance_env)
+        store.set_meta("mode_dry_run", "1" if cfg.dry_run else "0")
 
     # ----- cycle -----
 

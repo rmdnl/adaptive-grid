@@ -188,18 +188,37 @@ any earlier architecture.
 python dashboard.py --db state.db --host 127.0.0.1 --port 8080
 ```
 
-Read-only: it serves `GET /` (HTML) and `GET /api/state` (JSON), implements
-no strategy logic, places/cancels nothing, exposes no credentials, and
-refuses every write method with `405`. Global section: equity, reference
-equity, drawdown, kill state/reason, open orders, realized PnL, fees, runtime
-and database status. Per symbol: timeframe, last price, ADX, RSI, %B, VO,
-Z-score, ATR, strategy state, entry status/blocker, exit status/reason,
-cooldown, grid mode/step/count, gross & net per grid, inventory, open orders,
-realized PnL, fees, risk status.
+A read-only retrofuturistic operator console ("serious crypto trading
+control system from an alternate 1987"): near-black CRT display with a
+subtle technical grid and scanlines, phosphor accent colors, monospace
+telemetry typography, instrument-style KPI panels, a system safety panel,
+a per-symbol telemetry module for every configured pair, and an
+oscilloscope-style net-PnL chart. Auto-refreshes from the API every 5 s
+without a page reload; on feed failure it shows `DATA STALE` and keeps the
+last good values — nothing is fabricated; `DATA LIVE` returns when the API
+recovers. The environment (`TESTNET`/`LIVE`) and execution mode
+(`DRY-RUN`/`LIVE`) shown in the header are the runtime's own persisted
+record — they cannot be set or altered from the dashboard.
+
+Routes (GET only): `GET /` (console shell — static HTML/CSS/JS, no external
+assets), `GET /api/state` (JSON snapshot), `GET /api/history` (cumulative
+net PnL telemetry reconstructed from the fills ledger; empty when no fills
+exist — history is never invented). Every write method returns `405`.
+The console implements no strategy logic, places/cancels nothing, exposes
+no credentials, never reads `.env` or environment variables, and renders
+every dynamic value through safe DOM APIs (`textContent`).
+
+Displayed data: global equity, reference equity, drawdown, max drawdown,
+open orders, realized PnL, fees, kill switch state/reason, runtime and
+database status; per symbol: state, risk status, price, timeframe, entry
+status/blocker, exit status/reason, cooldown, grid mode/step/count,
+gross & net per grid, inventory, average cost, open orders, realized PnL,
+fees.
 
 Symbol states are displayed verbatim from the database — never inferred:
 `WAITING`, `ENTRY_BLOCKED`, `GRID_BLOCKED`, `ACTIVE`, `COOLDOWN`, `EXITING`,
-`STOPPED`, `KILL_ACTIVE`, `ERROR`.
+`STOPPED`, `KILL_ACTIVE`, `ERROR`. If the database is unavailable the
+console stays up and reports `DATABASE UNAVAILABLE` instead of crashing.
 
 ## Installation
 
@@ -231,13 +250,77 @@ refuses to start on any configuration problem.
    **testnet** orders (reconciliation, filters, fees all apply); with
    `DRY_RUN=true` (default) nothing is ever submitted.
 
+## Deployment (VPS / systemd)
+
+Deploy templates live in `deploy/`. Both services run as the
+`adaptive-grid` user against `/opt/adaptive-grid` and share **one
+authoritative database**: `/opt/adaptive-grid/state.db`. The trading
+runtime owns all writes; the dashboard opens it read-only. There is no
+second state database — older units pointing at a legacy database under
+`data/` are obsolete and must be replaced.
+
+Fresh deployment (an existing VPS keeps its `state.db` and `.env`):
+
+```bash
+# 1. clone or update the repository
+sudo -u adaptive-grid git -C /opt/adaptive-grid pull --ff-only origin main
+# (fresh machine: sudo git clone https://github.com/rmdnl/adaptive-grid.git /opt/adaptive-grid)
+
+# 2. create/refresh the virtualenv
+cd /opt/adaptive-grid && sudo -u adaptive-grid python3 -m venv .venv
+
+# 3. install requirements
+sudo -u adaptive-grid /opt/adaptive-grid/.venv/bin/pip install -r requirements.txt
+
+# 4. configure .env (NEVER overwrite an existing one; start from the template)
+#    sudo -u adaptive-grid cp .env.example .env   # only if .env does not exist
+sudo -u adaptive-grid nano /opt/adaptive-grid/.env
+
+# 5. install the trading service
+sudo cp /opt/adaptive-grid/deploy/adaptive-grid.service /etc/systemd/system/
+
+# 6. install the dashboard service
+sudo cp /opt/adaptive-grid/deploy/adaptive-grid-dashboard.service /etc/systemd/system/
+
+# 7. reload systemd
+sudo systemctl daemon-reload
+
+# 8. enable and start both services
+sudo systemctl enable --now adaptive-grid
+sudo systemctl enable --now adaptive-grid-dashboard
+
+# 9. verify services
+systemctl status adaptive-grid --no-pager
+systemctl status adaptive-grid-dashboard --no-pager
+
+# 10. verify port 8080 is listening
+ss -ltnp | grep 8080
+
+# 11. verify the dashboard API
+curl -s http://127.0.0.1:8080/api/state | python3 -m json.tool | head -40
+
+# 12. verify DRY-RUN mode (must print true / DRY-RUN)
+curl -s http://127.0.0.1:8080/api/state | grep -E '"dry_run"|"execution"'
+
+# 13. verify Binance TESTNET (must print testnet)
+curl -s http://127.0.0.1:8080/api/state | grep '"binance_env"'
+
+# 14. verify live gates remain disabled (must print false / testnet / true)
+grep -E '^DRY_RUN=|^ALLOW_LIVE_EXECUTION=|^BINANCE_ENV=' /opt/adaptive-grid/.env
+```
+
+The dashboard binds `0.0.0.0:8080` via explicit CLI flags — the unit passes
+no environment variables and no environment file to the dashboard process.
+Expose it publicly through your own reverse proxy/tunnel if desired; that
+configuration lives outside this repository.
+
 ## Testing
 
 ```bash
 pytest -q
 ```
 
-The suite (~140 tests) is deterministic and offline: configuration validation
+The suite (200+ tests) is deterministic and offline: configuration validation
 and live gates, indicator math against hand-computed references, strict
 entry/exit thresholds and exit priority, grid quantization and executable
 economics, risk vetoes and kill persistence, state restart recovery,

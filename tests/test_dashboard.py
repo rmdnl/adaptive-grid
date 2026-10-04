@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from dashboard import KNOWN_STATES, build_payload, render_html
+from dashboard import KNOWN_STATES, build_payload, build_history, make_server, render_page
 from state import StateStore
 
 
@@ -127,8 +127,10 @@ def test_payload_kill_state(seeded):
     payload = build_payload(seeded)
     assert payload["global"]["kill_active"] is True
     assert "max_drawdown" in payload["global"]["kill_reason"]
-    html = render_html(payload)
-    assert "ACTIVE" in html
+    # the console shell carries the kill-switch instrumentation
+    html = render_page()
+    assert "KILL SWITCH" in html
+    assert "killreason" in html
 
 
 def test_payload_contains_no_credentials(seeded):
@@ -160,7 +162,10 @@ def test_dashboard_server_read_only(seeded):
         assert payload["global"]["equity"] == pytest.approx(100.0)
         with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
             assert resp.status == 200
-            assert b"adaptive-grid" in resp.read()
+            page = resp.read()
+            assert b"ADAPTIVE-GRID" in page          # console brand
+            assert b"textContent" in page            # safe DOM rendering
+            assert b"innerHTML" not in page          # no unsafe injection path
 
         try:
             urllib.request.urlopen(f"{base}/api/state", data=b"{}", timeout=5)
