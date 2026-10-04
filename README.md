@@ -268,8 +268,8 @@ Artinya jarak gross antar-grid:
 Target net:
 
 ```text
-MINIMUM     0.30%
-PREFERRED   0.30% - 0.40%
+MINIMUM     > 0.20%   (STRICT — 0.200% is rejected)
+PREFERRED   0.20% - 0.40%
 ```
 
 Bot menghitung:
@@ -289,7 +289,7 @@ NET PROFIT
 Kalau:
 
 ```text
-NET < 0.30%
+NET <= 0.20%   (gate is STRICT: NET must be > 0.20%)
 ```
 
 maka:
@@ -546,7 +546,7 @@ grid:
     SOLUSDT: geometric
     BNBUSDT: arithmetic
   min_gross_profit_pct: 0.005    # 0.50% minimum gross
-  hard_min_net_pct: 0.003        # 0.30% minimum net (after fees)
+  hard_min_net_pct: 0.002        # 0.20% minimum net (STRICT >: 0.200% rejected)
   min_cells: 6
   max_levels: 50
 ```
@@ -568,7 +568,7 @@ step_pct = MAX(ATR(14)%, min_gross_profit_pct)
 
 Jadi step otomatis menyesuaikan volatility market, tapi nggak pernah di bawah 0.50% gross. Conservative banget. 🗿
 
-Semua cell dicek. Kalau satu cell saja net profit < 0.30% (after 0.1% maker + 0.1% taker + slippage):
+Semua cell dicek. Kalau satu cell saja net profit executable tidak > 0.20% (after 0.1% maker + 0.1% taker + slippage; STRICT — 0.200% = REJECT, 0.201% = PASS):
 
 ```text
 GRID = BLOCKED
@@ -1008,7 +1008,7 @@ orders), and the production `main()` cycle remains paper-only.
     `risk_engine` gates: range-break kill (±1%), 15m candle-close
     lower-boundary kill, 2% equity-drawdown kill against a persisted
     high-water reference, market filter (ADX/ATR/BB/volume), open-order
-    capacity, per-cell minimum net profit (0.30%), and the strict
+    capacity, per-cell minimum net profit (STRICT > 0.20%), and the strict
     price-inside-range gate.  The Risk Engine remains the authoritative
     veto — nothing is re-implemented or bypassed.
   - Separate SQLite ledger (`data/testnet_cycle.sqlite3`, user_version 800;
@@ -1088,7 +1088,8 @@ Every candidate grid reports BOTH nets, and the executable one is the gate:
   0.10%/leg conservative fees + 0.05% round-trip slippage ⇒ ≈0.349%).
 - **Executable net** — the worst grid cell AFTER tick/step quantization
   (`validate_quantized_order_plan`), re-checked against
-  `hard_min_net_pct = 0.003`.  A marginal cell is rejected
+  `hard_min_net_pct = 0.002` (strict `>` gate).  A cell whose executable
+  net is AT or BELOW 0.20% (0.200% = REJECT, 0.201% = PASS) is rejected
   (`NET_PROFIT_BELOW_HARD_MIN_AFTER_QUANTIZATION`) — never rounded upward
   to pass.  Fee changes, slippage changes, coarse tick sizes, quantity
   rounding, and minNotional violations each fail the plan fail-closed.

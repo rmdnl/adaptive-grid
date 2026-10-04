@@ -1862,8 +1862,9 @@ class PaperOrchestrator:
         # round-trip net profit from the exact tick-quantized execution
         # prices — the same quantize_price + net_pct_from_prices helpers that
         # main.py's validate_quantized_order_plan uses — and reject any cell
-        # whose post-quantization profit is below the configured hard
-        # minimum.  Each rejected cell records a deterministic reason; the
+        # whose post-quantization profit is AT OR BELOW the configured hard
+        # minimum (STRICT `>` gate: 0.200% net against a 0.20% floor is
+        # REJECTED).  Each rejected cell records a deterministic reason; the
         # pre-quantization profit is never used as the final authority and
         # nothing is silently skipped.
         fee_cfg = cycle_input.cfg.get("fees", {})
@@ -1875,7 +1876,7 @@ class PaperOrchestrator:
         )
         slippage = Decimal(str(fee_cfg.get("slippage_roundtrip_pct", "0.0005")))
         hard_min = Decimal(
-            str(cycle_input.cfg.get("grid", {}).get("hard_min_net_pct", "0.003"))
+            str(cycle_input.cfg.get("grid", {}).get("hard_min_net_pct", "0.002"))
         )
         level_prices = [lv.price for lv in plan.levels]
 
@@ -1905,8 +1906,10 @@ class PaperOrchestrator:
         def _gate_blocked(side: str, index: int) -> bool:
             net = _cell_profit(index, side)
             # net is None (quantization/profit computation failed, missing
-            # level pair) OR below the hard minimum → cell is not executable.
-            return net is None or net < hard_min
+            # level pair) OR at/below the hard minimum → cell is not
+            # executable.  The gate is STRICT: net == hard_min (0.200%
+            # against a 0.20% floor) blocks; only net > hard_min passes.
+            return net is None or net <= hard_min
 
         # Step 6: Generate intents from allowed cells.
         # Quantity is taken directly from the allocation result (cell.quantity),

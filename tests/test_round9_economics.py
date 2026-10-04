@@ -61,7 +61,7 @@ def _plan(lower="100", upper="104", tick="0.01", step="0.001",
           hard_min=None):
     maker = maker if maker is not None else FEE
     slip = slip if slip is not None else SLIP
-    hard_min = hard_min if hard_min is not None else D("0.003")
+    hard_min = hard_min if hard_min is not None else D("0.002")
     rules = _rules(tick=tick, step=step, min_notional=min_notional)
     levels, _upper = build_geometric_grid(
         D(lower), D(upper), D("0.006"), min_cells=1, max_levels=40)
@@ -72,12 +72,12 @@ def _plan(lower="100", upper="104", tick="0.01", step="0.001",
 
 def test_normal_grid_theoretical_and_executable_net():
     """Report BOTH nets: theoretical from the raw step, executable after
-    tick/step quantization.  The executable net is the gate."""
+    tick/step quantization.  The executable net is the gate (STRICT > 0.002)."""
     theoretical = net_pct_from_step("0.006", FEE, FEE, SLIP)
     plan, _rules = _plan()
     del _rules
     assert plan.allowed
-    assert plan.min_net_pct >= D("0.003")
+    assert plan.min_net_pct > D("0.002")
     assert theoretical == D("0.0034867420") or theoretical > D("0.0034")
     # quantization may erode, never inflate: executable ≤ theoretical + eps
     assert plan.min_net_pct <= theoretical + D("0.0001")
@@ -97,13 +97,14 @@ def test_slippage_increase_rejects_grid():
 
 def test_tick_rounding_erodes_net_and_rejects():
     """A coarse tickSize shrinks the quantized spread: the executable net
-    drops below 0.30% even though the theoretical step net does not.  The
-    grid must be rejected — never rounded upward to pass."""
+    drops to/below the 0.20% hard floor even though the theoretical step
+    net does not.  The grid must be rejected — never rounded upward to
+    pass."""
     theoretical = net_pct_from_step("0.006", FEE, FEE, SLIP)
-    assert theoretical >= D("0.003")
-    plan, _ = _plan(tick="0.5")
+    assert theoretical > D("0.002")
+    plan, _ = _plan(tick="0.4")
     assert not plan.allowed
-    assert plan.min_net_pct < D("0.003")
+    assert plan.min_net_pct <= D("0.002")
 
 
 def test_quantity_rounding_and_min_notional():
@@ -122,24 +123,69 @@ def test_min_notional_rejection():
     assert "SYMBOL_RULE_BLOCK" in plan.reason
 
 
-def test_exactly_30bps_is_acceptable():
-    net = net_pct_from_prices("1", "1.003", "0", "0", "0")
-    assert net == D("0.003")
-    assert passes(net, D("0.003")) is True
+def test_at_hard_min_is_rejected_strict():
+    """The net floor is STRICT `>`: a cell whose executable net EQUALS the
+    floor (0.200% against a 0.20% floor) is REJECTED, not accepted."""
+    net = net_pct_from_prices("1", "1.002", "0", "0", "0")
+    assert net == D("0.002")
+    assert passes(net, D("0.002")) is False
 
 
-def test_below_30bps_rejected():
-    assert passes(D("0.00299"), D("0.003")) is False
+def test_just_above_hard_min_passes():
+    net = net_pct_from_prices("1", "1.00201", "0", "0", "0")
+    assert net > D("0.002")
+    assert passes(net, D("0.002")) is True
+
+
+def test_below_hard_min_rejected():
+    assert passes(D("0.00199"), D("0.002")) is False
+
+
+def test_strict_boundary_exhaustive():
+    """0.200% -> FAIL, 0.199% -> FAIL, 0.201% -> PASS (strict `>`)."""
+    assert passes(D("0.002"),   D("0.002")) is False   # 0.200% = floor -> REJECT
+    assert passes(D("0.00199"), D("0.002")) is False   # 0.199% -> REJECT
+    assert passes(D("0.00201"), D("0.002")) is True    # 0.201% -> PASS
+
+
+def test_post_quant_executable_net_strict_boundary():
+    """The EXECUTABLE/quantized net (after tick/quantity rounding and
+    exchange filters) is the authoritative gate value.
+
+    With tick 0.01 and fees/slippage:
+      - 100.00 -> 100.45 quantizes to (100.00, 100.45): net 0.00199
+        (0.199%) -> REJECT.
+      - 100.00 -> 100.46 quantizes to (100.00, 100.46): net 0.00209
+        (just above 0.20%) -> PASS.
+      - A net of EXACTLY 0.200% -> REJECT (the gate is strict `>`).
+    """
+    from grid_engine import GridLevel
+    rules = _rules(tick="0.01", step="0.000001", min_notional="5")
+    # 0.199% executable net -> REJECT
+    plan_below = validate_quantized_order_plan(
+        [GridLevel(0, D("100.00")), GridLevel(1, D("100.45"))],
+        rules, D("1000"), D("100.2"), FEE, FEE, SLIP, D("0.002"), 40)
+    assert not plan_below.allowed
+    assert "NET_PROFIT_BELOW_HARD_MIN_AFTER_QUANTIZATION" in plan_below.reason
+    assert plan_below.min_net_pct <= D("0.002")
+    # 0.209% executable net -> PASS
+    plan_above = validate_quantized_order_plan(
+        [GridLevel(0, D("100.00")), GridLevel(1, D("100.46"))],
+        rules, D("1000"), D("100.2"), FEE, FEE, SLIP, D("0.002"), 40)
+    assert plan_above.allowed
+    assert plan_above.min_net_pct > D("0.002")
+    # exactly 0.200% -> REJECT (strict gate)
+    assert passes(D("0.002"), D("0.002")) is False
 
 
 def test_no_silent_upward_rounding_of_marginal_cell():
     """A coarse tick quantizes both prices down asymmetrically: the cell's
-    executable spread lands at ~0.54% gross → net below 0.30% — recorded
-    as below-min (plan rejected), never rounded up to pass."""
-    plan, _ = _plan(lower="100", upper="100.604", tick="0.09")
+    executable spread lands just under the 0.20% floor — recorded as
+    below-min (plan rejected), never rounded up to pass."""
+    plan, _ = _plan(tick="0.23")
     assert not plan.allowed
-    assert plan.min_net_pct < D("0.003")
-    assert plan.min_net_pct > D("0.0026")  # genuinely marginal, not zeroed
+    assert plan.min_net_pct <= D("0.002")
+    assert plan.min_net_pct > D("0.0015")  # genuinely marginal, not zeroed
     assert "NET_PROFIT_BELOW_HARD_MIN_AFTER_QUANTIZATION" in plan.reason
 
 

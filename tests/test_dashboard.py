@@ -31,7 +31,7 @@ def bot_config():
         "mode": "testnet", "dry_run": True, "allow_live_execution": False,
         "symbols": "BNBUSDT", "timeframe": "15m",
         "max_drawdown_pct": "0.02", "grid_step_pct": "0.006",
-        "hard_min_net_pct": "0.003", "config_error": None,
+        "hard_min_net_pct": "0.002", "config_error": None,
     }
 
 
@@ -180,8 +180,8 @@ def test_root_html(server):
     # per-cycle grid/market state renders even when every cycle is BLOCKED
     # machine codes are now human-readable: "Blocked" instead of "GRID_BLOCKED"
     assert "Blocked" in html
-    # machine codes translated to human: "Net profit per grid below the 0.30% minimum"
-    assert "Net profit per grid below the 0.30% minimum" in html
+    # machine codes translated to human: "Net profit per grid not above the 0.20% minimum"
+    assert "Net profit per grid not above the 0.20% minimum" in html
     assert "765.88" in html            # current price from last_price
     assert "765.23" in html            # lower from last_range
     assert "MARKET FILTERED" in html   # human-friendly market badge
@@ -671,7 +671,7 @@ def multi_bot_config():
         "mode": "testnet", "dry_run": True, "allow_live_execution": False,
         "symbols": "BNBUSDT,ETHUSDT,SOLUSDT", "timeframe": "4h",
         "max_drawdown_pct": "0.02", "grid_step_pct": "0.006",
-        "hard_min_net_pct": "0.003", "config_error": None,
+        "hard_min_net_pct": "0.002", "config_error": None,
     }
 
 

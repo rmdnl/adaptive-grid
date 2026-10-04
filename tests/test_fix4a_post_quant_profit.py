@@ -3,7 +3,7 @@
 The planner's profit gate runs on the PRE-quantization grid step.  The
 orchestrator must NOT emit an executable intent for any grid cell whose
 ACTUAL (tick-quantized) round-trip net profit is below the configured hard
-minimum (``grid.hard_min_net_pct``, default 0.003).
+minimum (``grid.hard_min_net_pct``, default 0.002, STRICT `>`: 0.200% net is rejected).
 
 These tests drive ``PaperOrchestrator._generate_order_intents`` directly
 (precise raw levels + coarse tick size) and the full ``run_cycle`` path,
@@ -12,9 +12,9 @@ reusing the same ``quantize_price`` + ``net_pct_from_prices`` helpers that
 
 Required invariant:
 
-    pre_quant_profit >= hard_min  AND  post_quant_profit >= hard_min
+    pre_quant_profit > hard_min  AND  post_quant_profit > hard_min
         => executable intent
-    post_quant_profit < hard_min
+    post_quant_profit <= hard_min
         => NO executable intent (deterministic block reason)
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ from symbol_rules import SymbolRules
 from symbol_rules import quantize_price  # noqa: F401  (reuse proof, shared w/ main.py)
 
 D = Decimal
-HARD_MIN = D("0.003")
+HARD_MIN = D("0.002")
 _NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
@@ -57,7 +57,7 @@ def _rules(tick=D("0.01")):
 def _cfg():
     return {
         "pair": "BTCUSDT",
-        "grid": {"hard_min_net_pct": "0.003"},
+        "grid": {"hard_min_net_pct": "0.002"},
         "execution": {"order_quote_size": "25", "prefer_limit_maker": True},
         "fees": {
             "maker_fee_fallback": "0.001",
@@ -185,7 +185,7 @@ def _block_reasons(result, side, index):
 
 def test_4a_1_quantization_preserves_net_intent_generated(tmp_path):
     levels = [GridLevel(0, D("100")), GridLevel(1, D("100.60"))]
-    assert _gate_net(D("100"), D("100.60"), D("0.01")) >= HARD_MIN
+    assert _gate_net(D("100"), D("100.60"), D("0.01")) > HARD_MIN
     result, _ = _intents_for(tmp_path, levels, D("0.01"), D("100.2"))
     assert result.allocation_blocked is None
     assert _idx("BUY", result.intents) == [0]
@@ -197,14 +197,14 @@ def test_4a_1_quantization_preserves_net_intent_generated(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_4a_2_quantization_erodes_net_cell_blocked(tmp_path):
-    # BUY i=0 pairs (100.60→101.00): quantized net 0.001468 < 0.003 → blocked.
-    # BUY i=1 pairs (101.00→101.61): net 0.003527 >= 0.003 → passes.
+    # BUY i=0 pairs (100.60→101.00): quantized net 0.001468 <= 0.002 → blocked.
+    # BUY i=1 pairs (101.00→101.61): net 0.003527 > 0.002 → passes.
     levels = [
         GridLevel(0, D("100.60")),
         GridLevel(1, D("101.00")),
         GridLevel(2, D("101.61")),
     ]
-    assert _gate_net(D("100.60"), D("101.00"), D("0.01")) < HARD_MIN
+    assert _gate_net(D("100.60"), D("101.00"), D("0.01")) <= HARD_MIN
     result, _ = _intents_for(tmp_path, levels, D("0.01"), D("101.5"))
     assert _block_reasons(result, "BUY", 0) in result.profit_blocked_cells
     assert _idx("BUY", result.intents) == [1], "only the valid BUY cell survives"
@@ -216,9 +216,9 @@ def test_4a_2_quantization_erodes_net_cell_blocked(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_4a_3_boundary_accepted(tmp_path):
-    # (100 → 100.65) quantized net 0.003986 >= 0.003 → accepted.
+    # (100 → 100.65) quantized net 0.003986 > 0.002 → accepted.
     levels = [GridLevel(0, D("100")), GridLevel(1, D("100.65"))]
-    assert _gate_net(D("100"), D("100.65"), D("0.01")) >= HARD_MIN
+    assert _gate_net(D("100"), D("100.65"), D("0.01")) > HARD_MIN
     result, _ = _intents_for(tmp_path, levels, D("0.01"), D("100.2"))
     assert _idx("BUY", result.intents) == [0]
     assert result.profit_blocked_cells == ()
@@ -242,15 +242,15 @@ def test_4a_3b_boundary_equivalence():
 # ---------------------------------------------------------------------------
 
 def test_4a_4_slightly_below_rejected(tmp_path):
-    # (101 → 101.5): quantized net 0.00244 < 0.003 → rejected, whole block.
+    # (101 → 101.4): quantized net 0.001453 <= 0.002 → rejected, whole block.
     levels = [
         GridLevel(0, D("101")),
-        GridLevel(1, D("101.5")),
-        GridLevel(2, D("102.0")),
+        GridLevel(1, D("101.4")),
+        GridLevel(2, D("101.8")),
     ]
-    assert _gate_net(D("101"), D("101.5"), D("0.01")) < HARD_MIN
-    assert _gate_net(D("101.5"), D("102.0"), D("0.01")) < HARD_MIN
-    result, _ = _intents_for(tmp_path, levels, D("0.01"), D("101.7"))
+    assert _gate_net(D("101"), D("101.4"), D("0.01")) <= HARD_MIN
+    assert _gate_net(D("101.4"), D("101.8"), D("0.01")) <= HARD_MIN
+    result, _ = _intents_for(tmp_path, levels, D("0.01"), D("101.3"))
     assert result.allocation_blocked is not None
     assert result.allocation_blocked["status"] == "PROFIT_GATE_BLOCKED"
     assert _block_reasons(result, "BUY", 0) in result.allocation_blocked["reasons"]
@@ -282,10 +282,12 @@ def test_4a_5_mixed_cells_only_valid_executable(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_4a_6_all_cells_invalid_zero_submissions(tmp_path):
+    # Every BUY round-trip cell nets ~0.0014, at/below the 0.20% floor:
+    # no cell is executable → zero submissions.
     levels = [
         GridLevel(0, D("101")),
-        GridLevel(1, D("101.5")),
-        GridLevel(2, D("102.0")),
+        GridLevel(1, D("101.4")),
+        GridLevel(2, D("101.8")),
     ]
     result, _ = _intents_for(tmp_path, levels, D("0.01"), D("101.7"))
     assert result.allocation_blocked is not None
@@ -301,16 +303,16 @@ def test_4a_6_all_cells_invalid_zero_submissions(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_4a_7_quantized_prices_used_not_raw(tmp_path):
-    # Raw pair (100.00 → 100.559): pre-quant net 0.003078 ≥ 0.003 (would
+    # Raw pair (100.00 → 100.459): pre-quant net 0.002080 > 0.002 (would
     # earn on the paper economics).
     assert net_pct_from_prices(
-        D("100.00"), D("100.559"), D("0.001"), D("0.001"), D("0.0005"),
-    ) >= HARD_MIN, "pre-quant economics pass"
-    # Tick-0.01 quantization floors 100.559 → 100.55: post-quant net
-    # 0.002988 < 0.003 → the gate MUST use the quantized price and block.
-    assert _gate_net(D("100.00"), D("100.559"), D("0.01")) < HARD_MIN, \
-        "post-quant economics fail (quantized 100.55, not raw 100.559)"
-    levels = [GridLevel(0, D("100.00")), GridLevel(1, D("100.559"))]
+        D("100.00"), D("100.459"), D("0.001"), D("0.001"), D("0.0005"),
+    ) > HARD_MIN, "pre-quant economics pass"
+    # Tick-0.01 quantization floors 100.459 → 100.45: post-quant net
+    # 0.001991 <= 0.002 → the gate MUST use the quantized price and block.
+    assert _gate_net(D("100.00"), D("100.459"), D("0.01")) <= HARD_MIN, \
+        "post-quant economics fail (quantized 100.45, not raw 100.459)"
+    levels = [GridLevel(0, D("100.00")), GridLevel(1, D("100.459"))]
     result, _ = _intents_for(tmp_path, levels, D("0.01"), D("100.2"))
     assert result.intents == []
     assert _block_reasons(result, "BUY", 0) in result.profit_blocked_cells
@@ -321,15 +323,16 @@ def test_4a_7_quantized_prices_used_not_raw(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_4a_8_fees_and_slippage_included(tmp_path):
-    # Same spread, but taker sell fee (0.005) erodes the net below the min.
+    # Same spread, but taker sell fee (0.003) erodes the net to the 0.20%
+    # floor (0.001975 <= 0.002): STRICT gate rejects.
     levels = [GridLevel(0, D("100")), GridLevel(1, D("100.65"))]
     # Baseline maker/maker passes:
     result_pass, _ = _intents_for(tmp_path, levels, D("0.01"), D("100.2"))
     assert _idx("BUY", result_pass.intents) == [0]
-    # High taker sell fee fails (prefer_maker=False → sell uses taker_fee):
+    # Taker sell fee fails (prefer_maker=False → sell uses taker_fee):
     result_fail, _ = _intents_for(
         tmp_path, levels, D("0.01"), D("100.2"),
-        taker_fee=D("0.005"), prefer_maker=False,
+        taker_fee=D("0.003"), prefer_maker=False,
     )
     assert result_fail.intents == []
     assert _block_reasons(result_fail, "BUY", 0) in result_fail.profit_blocked_cells
@@ -354,25 +357,25 @@ def test_4a_9_adversarial_full_cycle_no_submission(tmp_path, monkeypatch):
 
     # Pre-quantization economics the planner gates on (config step 0.006):
     pre = net_pct_from_step(D("0.006"), D("0.001"), D("0.001"), D("0.0005"))
-    assert pre >= HARD_MIN, "planner's pre-quant economics must PASS"
+    assert pre > HARD_MIN, "planner's pre-quant economics must PASS"
 
-    # These levels have a ~0.5% raw step; after tick-0.01 quantization every
-    # BUY round-trip cell earns < 0.003 (post-quant net 0.0025 / 0.0024).
+    # These levels have a ~0.4% raw step; after tick-0.01 quantization every
+    # BUY round-trip cell earns ~0.145% net, at/below the 0.20% hard floor.
     levels = [
         GridLevel(0, D("101")),
-        GridLevel(1, D("101.5")),
-        GridLevel(2, D("102.0")),
+        GridLevel(1, D("101.4")),
+        GridLevel(2, D("101.8")),
     ]
     tick = D("0.01")
-    plan = _plan_from_levels(levels, D("101.7"), plan_id="fix4a_adv")
+    plan = _plan_from_levels(levels, D("101.3"), plan_id="fix4a_adv")
 
     # Post-quantization economics of the actual cells FAIL the hard min:
-    for lo, hi in ((D("101"), D("101.5")), (D("101.5"), D("102.0"))):
+    for lo, hi in ((D("101"), D("101.4")), (D("101.4"), D("101.8"))):
         assert po._post_quant_net_profit(
             lo, hi, _rules(tick), D("0.001"), D("0.001"), D("0.0005"),
-        ) < HARD_MIN
+        ) <= HARD_MIN
 
-    ci = _cycle_input(plan, tick, D("101.7"))
+    ci = _cycle_input(plan, tick, D("101.3"))
 
     # Seed a funded paper account so allocation is not a funding block; the
     # post-quant profit gate is what must decide.

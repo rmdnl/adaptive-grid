@@ -116,7 +116,7 @@ def test_valid_paper_configuration():
         "grid": {
             "mode_by_symbol": {"BNBUSDT": "arithmetic"},
             "step_pct": 0.006,
-            "hard_min_net_pct": 0.003,
+            "hard_min_net_pct": 0.002,
             "preferred_net_max_pct": 0.004,
             "min_cells": 6,
             "max_levels": 40,
@@ -145,7 +145,7 @@ def test_missing_paper_configuration_fails_closed():
         "grid": {
             "mode_by_symbol": {"BNBUSDT": "arithmetic"},
             "step_pct": 0.006,
-            "hard_min_net_pct": 0.003,
+            "hard_min_net_pct": 0.002,
             "preferred_net_max_pct": 0.004,
             "min_cells": 6,
             "max_levels": 40,
@@ -175,7 +175,7 @@ def test_invalid_paper_balance_fails_closed(field):
         "grid": {
             "mode_by_symbol": {"BNBUSDT": "arithmetic"},
             "step_pct": 0.006,
-            "hard_min_net_pct": 0.003,
+            "hard_min_net_pct": 0.002,
             "preferred_net_max_pct": 0.004,
             "min_cells": 6,
             "max_levels": 40,

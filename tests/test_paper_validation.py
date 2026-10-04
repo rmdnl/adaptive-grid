@@ -1189,7 +1189,7 @@ def test_scenario_ak_net_grid_profit_threshold():
     config = ValidationConfig()
     validator = PaperValidator(config)
     
-    # Config has hard_min_net_pct: 0.003
+    # Config has hard_min_net_pct: 0.002 (strict > 0.20% gate)
     candles = generate_oscillating_sequence(
         start_candle=36000,
         num_candles=15,

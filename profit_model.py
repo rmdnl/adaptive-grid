@@ -35,11 +35,16 @@ def net_pct_from_step(step_pct, buy_fee, sell_fee, roundtrip_slippage) -> Decima
     )
 
 def passes(net_value, hard_min) -> bool:
-    return D(net_value) >= D(hard_min)
+    """The executable net must be STRICTLY greater than the hard minimum.
+
+    net == hard_min (e.g. 0.200% vs a 0.20% floor) does NOT pass: the
+    gate is `>`, never `>=`.
+    """
+    return D(net_value) > D(hard_min)
 
 def profit_class(net_value, hard_min, preferred_max) -> str:
     n, lo, hi = D(net_value), D(hard_min), D(preferred_max)
-    if n < lo:
+    if n <= lo:
         return "BLOCK"
     if n <= hi:
         return "PREFERRED"

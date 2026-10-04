@@ -244,12 +244,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ConfigError(f"grid.mode_by_symbol[{sym}] must be 'arithmetic' or 'geometric'")
 
     min_gross = _d(grid.get("min_gross_profit_pct", "0.005"))
-    hard_min = _d(grid.get("hard_min_net_pct", "0.003"))
+    hard_min = _d(grid.get("hard_min_net_pct", "0.002"))
     preferred_max = _d(grid.get("preferred_net_max_pct", "0.004"))
     if min_gross <= 0:
         raise ConfigError("grid.min_gross_profit_pct must be > 0")
-    if hard_min < _d("0.003"):
-        raise ConfigError("grid.hard_min_net_pct cannot be below 0.003")
+    if hard_min < _d("0.002"):
+        raise ConfigError("grid.hard_min_net_pct cannot be below 0.002")
     if preferred_max < hard_min:
         raise ConfigError("grid.preferred_net_max_pct must be >= hard_min_net_pct")
     min_cells = int(grid.get("min_cells", 0))

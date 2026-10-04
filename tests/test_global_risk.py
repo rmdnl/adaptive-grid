@@ -110,7 +110,7 @@ def _install_pass_stubs(monkeypatch, tmp_path):
         "grid": {"mode_by_symbol": {"BTCUSDT": "arithmetic",
                                     "ETHUSDT": "arithmetic"},
                  "min_gross_profit_pct": "0.005",
-                 "hard_min_net_pct": "0.003", "min_cells": 6,
+                 "hard_min_net_pct": "0.002", "min_cells": 6,
                  "max_levels": 40, "atr_multiplier": "1.0"},
         "strategy": {"entry": {"adx_max": "25", "rsi_max": "40",
                                "bb_percent_b_max": "0"},

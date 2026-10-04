@@ -130,7 +130,10 @@ def validate_quantized_order_plan(
             net = net_pct_from_prices(
                 buy_price, sell_price, buy_fee, sell_fee, roundtrip_slippage
             )
-            if net < hard_min:
+            # STRICT gate: an executable net AT the hard minimum (e.g.
+            # 0.200% against a 0.20% floor) is rejected; only net >
+            # hard_min passes.
+            if net <= hard_min:
                 reasons.append("NET_PROFIT_BELOW_HARD_MIN_AFTER_QUANTIZATION")
         except (ArithmeticError, SymbolRuleError, ValueError) as exc:
             reasons.append(f"SYMBOL_RULE_BLOCK:{exc}")

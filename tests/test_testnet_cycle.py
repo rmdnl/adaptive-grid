@@ -98,7 +98,7 @@ _SYMBOL_INFO = {
 def cycle_config(tmp_path, **overrides) -> tc.TestnetCycleConfig:
     base_cfg = {
         "symbol": "BNBUSDT",
-        "grid": {"step_pct": 0.006, "hard_min_net_pct": 0.003,
+        "grid": {"step_pct": 0.006, "hard_min_net_pct": 0.002,
                  "min_cells": 6, "max_levels": 40},
         "range": {"auto": {"support_quantile": 0.10,
                            "resistance_quantile": 0.90,
@@ -897,7 +897,7 @@ def test_persistent_state_survives_restart(tmp_path):
 def _base_cfg_dict():
     return {
         "symbol": "BNBUSDT",
-        "grid": {"step_pct": 0.006, "hard_min_net_pct": 0.003,
+        "grid": {"step_pct": 0.006, "hard_min_net_pct": 0.002,
                  "min_cells": 6, "max_levels": 40},
         "range": {"auto": {"support_quantile": 0.10,
                            "resistance_quantile": 0.90,
@@ -916,7 +916,7 @@ def _base_cfg_dict():
 
 
 @pytest.mark.parametrize("field,value", [
-    ("hard_min_net_pct", 0.002),            # below the 0.30% invariant
+    ("hard_min_net_pct", 0.001),            # below the 0.20% invariant
     ("max_equity_drawdown_pct", 0.03),      # drawdown kill must stay 2%
     ("range_break_buffer_pct", 0.02),       # buffer must stay 1%
 ])

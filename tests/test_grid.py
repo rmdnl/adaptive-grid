@@ -14,7 +14,7 @@ def test_grid_rejects_too_short_range():
 
 def test_grid_profit_validation():
     levels,_=build_geometric_grid(100,110,0.006,min_cells=6,max_levels=40)
-    result=validate_grid_profit(levels,0.001,0.001,0.0005,0.003)
+    result=validate_grid_profit(levels,0.001,0.001,0.0005,0.002)
     assert result.allowed
     assert result.cells == len(levels)-1
 

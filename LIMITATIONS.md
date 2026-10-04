@@ -11,7 +11,7 @@
 | Live-trading enablement in production code | none |
 | `dry_run` default | `true` (config + `main()` raises if `false`) |
 | `allow_live_execution` default | `false` |
-| Grid invariants (0.30% min net / 0.60% step / 2% drawdown kill) | enforced in `config_loader.py` + `grid_engine.py` + `risk_engine.py` |
+| Grid invariants (STRICT > 0.20% min net / 0.50% gross gate / 0.60% step / 2% drawdown kill) | enforced in `config_loader.py` + `grid_engine.py` + `risk_engine.py` |
 | Range-break kill (fail-closed) | present (`risk_engine.range_break_kill`, `main.py`) |
 | 15m candle-close lower-boundary kill | present (`risk_engine.lower_boundary_15m_kill`, wired into `main()` risk decision + kill latch; config `risk.stop_if_below_lower_pct = 0.02` required & validated) |
 | Kill-state prevents new orders + survives restart | present (`cancel_controller` + `main()` restart gate) |
@@ -25,7 +25,7 @@
 - DRY_RUN is the default and is required by `main()` (raises otherwise).
 - Live execution is disabled (`allow_live_execution=false`) and there is no
   order-placement path outside the risk-gated paper cycle.
-- Minimum net profit per completed grid: 0.30% (`0.003`), enforced.
+- Minimum executable net profit per completed grid: STRICTLY greater than 0.20% (`0.002`).  0.200% = REJECT, 0.201% = PASS; the quantized value after fees/slippage/rounding/filters is authoritative.
 - Gross grid step: 0.60% (`0.006`).
 - Conservative fee/slippage calculation (fees summed, discount omitted).
 - Orders never placed outside LOWER_PRICE / UPPER_PRICE.

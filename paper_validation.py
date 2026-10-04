@@ -69,7 +69,7 @@ class ValidationConfig:
             object.__setattr__(self, "cfg", {
                 "grid": {
                     "step_pct": float(self.step_pct),
-                    "hard_min_net_pct": 0.003,
+                    "hard_min_net_pct": 0.002,
                     "preferred_net_max_pct": 0.004,
                     "min_cells": 6,
                     "max_levels": 40,
@@ -393,7 +393,7 @@ class PaperValidator:
             if plan is not None and hasattr(plan, "estimated_net_profit_per_grid"):
                 estimated_net = str(plan.estimated_net_profit_per_grid)
             
-            hard_min = self.config.cfg.get("grid", {}).get("hard_min_net_pct", 0.003)
+            hard_min = self.config.cfg.get("grid", {}).get("hard_min_net_pct", 0.002)
             
             profit_violations.append(
                 f"candle_index={candle.candle_index} cycle_id={result.cycle_id} "

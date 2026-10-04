@@ -15,7 +15,9 @@ class RiskDecision:
 def D(value): return Decimal(str(value))
 
 def profit_gate(net_pct, hard_min):
-    ok = D(net_pct) >= D(hard_min)
+    """Executable net must be STRICTLY greater than the hard minimum:
+    0.200% vs a 0.20% floor is REJECTED (gate is `>`, never `>=`)."""
+    ok = D(net_pct) > D(hard_min)
     return RiskDecision(ok, () if ok else ("NET_PROFIT_BELOW_HARD_MIN",))
 
 def market_gate(last_row: Any, cfg: dict):

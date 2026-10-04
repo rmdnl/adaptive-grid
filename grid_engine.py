@@ -140,7 +140,7 @@ def atr_grid_step_pct(atr_pct: Decimal, multiplier: Decimal = Decimal("1.0")) ->
     The multiplier defaults to 1.0 (locked specification).  The locked
     specification forbids substituting a fixed percentage step and forbids
     silently capping ATR: when the ATR step produces an economically invalid
-    grid (gross < 0.5% or executable net < 0.3%), the callers must BLOCK the
+    grid (gross < 0.5% or executable net <= 0.2%), the callers must BLOCK the
     grid and record the reason — never widen it artificially.
 
     Fail-closed: a non-finite or non-positive ATR raises ValueError so the

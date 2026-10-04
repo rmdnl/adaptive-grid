@@ -12,7 +12,8 @@ grid plan.  This module is a PURE DECISION LAYER:
 
 Hard safety invariants:
   LOWER_PRICE <= candidate_lower < candidate_upper <= UPPER_PRICE
-  net_profit_per_grid >= MIN_NET_PROFIT_PER_GRID (config hard_min_net_pct)
+  net_profit_per_grid > MIN_NET_PROFIT_PER_GRID (config hard_min_net_pct)
+  (STRICTLY greater: 0.200% net against a 0.20% floor is REJECTED)
   sum(buy_quote_allocations) <= TOTAL_QUOTE_BUDGET
   no synthetic base inventory
   no leverage, no margin, no futures, no shorts
@@ -324,7 +325,11 @@ def _validate_spacing_profit(
     slippage: Decimal,
     hard_min: Decimal,
 ) -> tuple[Decimal, list[PlanBlockReason]]:
-    """Return (net_pct, reasons).  net_pct < hard_min → GRID_BLOCKED."""
+    """Return (net_pct, reasons).  net_pct <= hard_min → GRID_BLOCKED.
+
+    The gate is STRICT: the estimated net must be strictly greater than
+    hard_min.  net == hard_min (e.g. 0.200% vs a 0.20% floor) BLOCKS.
+    """
     reasons: list[PlanBlockReason] = []
     try:
         net = net_pct_from_step(grid_step, buy_fee, sell_fee, slippage)
@@ -332,7 +337,7 @@ def _validate_spacing_profit(
         reasons.append(PlanBlockReason.NET_PROFIT_BELOW_MINIMUM)
         return _D("0"), reasons
 
-    if net < hard_min:
+    if net <= hard_min:
         reasons.append(PlanBlockReason.NET_PROFIT_BELOW_MINIMUM)
     return net, reasons
 
@@ -536,7 +541,7 @@ def evaluate_adaptive_grid_plan(
     plan_c   = _planner_cfg(cfg)
 
     # Configuration values
-    hard_min       = _D(grid_c.get("hard_min_net_pct",     "0.003"))
+    hard_min       = _D(grid_c.get("hard_min_net_pct",     "0.002"))
     cfg_step_pct   = _D(grid_c.get("step_pct",             "0.006"))
     min_grids      = int(grid_c.get("min_grids",            int(grid_c.get("min_cells", 6))))
     max_grids      = int(grid_c.get("max_grids",            int(grid_c.get("max_levels", 40))))

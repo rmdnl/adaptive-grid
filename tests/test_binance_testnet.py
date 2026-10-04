@@ -840,7 +840,7 @@ def test_binance_symbol_filters_feed_existing_order_plan_validation():
     assert rules.min_notional == Decimal("10")
     levels = [GridLevel(0, Decimal("350.00")), GridLevel(1, Decimal("352.10"))]
     plan = validate_quantized_order_plan(
-        levels, rules, "50", "350", "0.001", "0.001", "0.0005", "0.003", 40
+        levels, rules, "50", "350", "0.001", "0.001", "0.0005", "0.002", 40
     )
     assert plan is not None
 

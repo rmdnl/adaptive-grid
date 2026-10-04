@@ -53,7 +53,7 @@ def base_cfg() -> dict[str, Any]:
     return {
         "grid": {
             "step_pct": 0.006,
-            "hard_min_net_pct": 0.003,
+            "hard_min_net_pct": 0.002,
             "min_cells": 6,
             "max_levels": 40,
         },

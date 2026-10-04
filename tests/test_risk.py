@@ -4,8 +4,9 @@ from risk_engine import (
 )
 
 def test_profit_gate_blocks():
-    assert not profit_gate(0.0029,0.003).allowed
-    assert profit_gate(0.003,0.003).allowed
+    assert not profit_gate(0.0019,0.002).allowed
+    assert not profit_gate(0.002,0.002).allowed          # 0.200% == floor -> REJECT
+    assert profit_gate(0.00201,0.002).allowed            # 0.201% -> PASS
 
 def test_dd_kill_exact_threshold_blocks():
     # Exactly at 2% threshold (>= is the comparator) → BLOCKED.
@@ -40,6 +41,6 @@ def test_market_gate_blocks_adx():
     assert not market_gate(row,{"adx_max":28,"atr_pct_max":0.025,"bb_width_max":0.06,"volume_spike_max":2.5}).allowed
 
 def test_combine_is_veto():
-    result=combine(profit_gate(0.004,0.003),equity_dd_kill(0.02,0.02))
+    result=combine(profit_gate(0.004,0.002),equity_dd_kill(0.02,0.02))
     assert not result.allowed
     assert "EQUITY_DRAWDOWN_KILL" in result.reasons

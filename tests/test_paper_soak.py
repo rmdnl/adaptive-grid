@@ -65,7 +65,7 @@ from symbol_rules import SymbolRules
 # ---------------------------------------------------------------------------
 
 GRID_STEP_PCT = Decimal("0.006")   # 0.60%
-HARD_MIN_NET  = Decimal("0.003")   # 0.30%
+HARD_MIN_NET  = Decimal("0.002")   # 0.20% (strict > gate)
 DD_KILL_PCT   = Decimal("0.02")    # 2%
 LOWER_KILL_PCT = Decimal("0.02")   # 2%
 RANGE_BREAK_BUF = Decimal("0.01")  # 1%

@@ -26,9 +26,10 @@ Strategy (locked specification)
 - Risk kills (equity drawdown >= 2%, range-break beyond the ±1% buffer, the
   dedicated 15m lower-boundary candle-close stop) latch the persisted kill
   state and require an explicit operator release — unchanged.
-- Grid: step = 1x ATR(14) percentage with a 0.5% gross floor; every grid
-  must pass the hard minimum net profit of 0.3% after maker+taker fees and
-  conservative slippage, or it is rejected.
+- Grid: step = 1x ATR(14) percentage with a 0.5% gross floor (>= 0.50%);
+  every grid must pass the hard minimum net profit of STRICTLY MORE than
+  0.20% after maker+taker fees, slippage, tick/quantity rounding and
+  exchange filters, or it is rejected (0.200% = REJECT, 0.201% = PASS).
 """
 
 from __future__ import annotations

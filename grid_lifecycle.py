@@ -1614,7 +1614,7 @@ if __name__ == "__main__":
         )
 
         config = {
-            "grid": {"step_pct": Decimal("0.006"), "hard_min_net_pct": Decimal("0.003")},
+            "grid": {"step_pct": Decimal("0.006"), "hard_min_net_pct": Decimal("0.002")},
             "execution": {"total_quote_budget": Decimal("0")},
         }
 

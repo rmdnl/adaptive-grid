@@ -73,7 +73,7 @@ def _config(tmp_path):
         "timeframe": "15m",
         "grid": {
             "step_pct": Decimal("0.006"),
-            "hard_min_net_pct": Decimal("0.003"),
+            "hard_min_net_pct": Decimal("0.002"),
             "preferred_net_max_pct": Decimal("0.004"),
             "min_cells": 6,
             "max_levels": 40,

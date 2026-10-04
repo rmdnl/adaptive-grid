@@ -806,7 +806,7 @@ def _yn(value: Any) -> str:
 #: human-readable label for each machine reason code (the raw code is still
 #: shown in a muted line below the human text, for power users).
 _REASONS = {
-    "NET_PROFIT_BELOW_HARD_MIN": "Net profit per grid below the 0.30% minimum",
+    "NET_PROFIT_BELOW_HARD_MIN": "Net profit per grid not above the 0.20% minimum",
     "GRID_COUNT_INVALID": "Grid has fewer than 6 cells",
     "VOLATILITY_TOO_LOW": "Volatility too low to grid",
     "RANGE_QUALITY_TOO_LOW": "Range quality too low",

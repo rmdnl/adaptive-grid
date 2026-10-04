@@ -70,7 +70,7 @@ def _cfg():
     return {
         "pair": "BTCUSDT",
         "execution": {"order_quote_size": "25", "prefer_limit_maker": True},
-        "grid": {"hard_min_net_pct": "0.003"},
+        "grid": {"hard_min_net_pct": "0.002"},
         "fees": {"maker_fee_fallback": "0.001", "slippage_roundtrip_pct": "0.0005"},
     }
 

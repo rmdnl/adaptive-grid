@@ -198,8 +198,9 @@ class TestnetCycleConfig:
         _need(isinstance(self.db_path, str) and self.db_path.strip(),
               "db_path must be a non-empty string")
         _need(self.grid_step_pct > 0, "grid_step_pct must be > 0")
-        _need(self.hard_min_net_pct >= Decimal("0.003"),
-              "hard_min_net_pct must be >= 0.003 (invariant)")
+        _need(self.hard_min_net_pct >= Decimal("0.002"),
+              "hard_min_net_pct must be >= 0.002 (invariant; the executable "
+              "net gate is strict > 0.20%)")
         _need(self.min_cells >= 1, "min_cells must be >= 1")
         _need(self.max_levels > self.min_cells, "max_levels must be > min_cells")
         _need(self.max_equity_drawdown_pct == Decimal("0.02"),
@@ -1029,7 +1030,8 @@ class TestnetCycleRunner:
             return report
         # Round 9: report BOTH nets — theoretical (raw grid step) and
         # executable (worst cell after tick/step quantization, which is the
-        # gate; hard min 0.003, never rounded upward to pass).
+        # gate; hard min 0.002 with strict `>` semantics, never rounded
+        # upward to pass).
         report["plan_net"] = {
             "theoretical": str(net_pct_from_step(
                 self.config.grid_step_pct, self.config.maker_fee,

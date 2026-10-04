@@ -355,7 +355,7 @@ def test_terminal_order_identity_remains_protected_from_recreation(tmp_path, ter
 
 
 @pytest.mark.parametrize("risk", [
-    profit_gate(Decimal("0.002"), Decimal("0.003")),
+    profit_gate(Decimal("0.002"), Decimal("0.002")),  # 0.200% == floor: STRICT > veto
     equity_dd_kill(Decimal("0.02"), Decimal("0.02")),
     strict_order_price_gate(Decimal("90"), Decimal("110"), Decimal("111")),
     open_orders_gate(40, 40),

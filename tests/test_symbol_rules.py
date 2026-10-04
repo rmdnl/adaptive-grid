@@ -48,7 +48,7 @@ def test_quantized_order_plan_applies_price_lot_notional_and_profit_rules():
     levels = [GridLevel(0, Decimal("100.009")), GridLevel(1, Decimal("100.609"))]
 
     plan = validate_quantized_order_plan(
-        levels, rules, "25", "100", "0.001", "0.001", "0.0005", "0.003", 40
+        levels, rules, "25", "100", "0.001", "0.001", "0.0005", "0.002", 40
     )
 
     assert plan.allowed
@@ -57,7 +57,7 @@ def test_quantized_order_plan_applies_price_lot_notional_and_profit_rules():
     assert cell.sell_price == Decimal("100.60")
     assert cell.quantity == Decimal("0.250")
     assert cell.gross_pct == Decimal("0.006")
-    assert cell.net_pct > Decimal("0.003")
+    assert cell.net_pct > Decimal("0.002")
     assert plan.effective_upper == Decimal("100.60")
 
 def test_quantized_order_plan_rejects_min_notional_and_notional_maximum():
@@ -65,13 +65,13 @@ def test_quantized_order_plan_rejects_min_notional_and_notional_maximum():
     levels = [GridLevel(0, Decimal("100")), GridLevel(1, Decimal("100.60"))]
 
     too_small = validate_quantized_order_plan(
-        levels, rules, "5", "100", "0.001", "0.001", "0.0005", "0.003", 40
+        levels, rules, "5", "100", "0.001", "0.001", "0.0005", "0.002", 40
     )
     assert not too_small.allowed
     assert "Notional below minimum" in too_small.reason
 
     too_large = validate_quantized_order_plan(
-        levels, rules, "100001", "100", "0.001", "0.001", "0.0005", "0.003", 40
+        levels, rules, "100001", "100", "0.001", "0.001", "0.0005", "0.002", 40
     )
     assert not too_large.allowed
     assert "Notional above maximum" in too_large.reason
@@ -85,13 +85,13 @@ def test_quantized_order_plan_rejects_percent_price_and_order_limit():
     ]
 
     percent_block = validate_quantized_order_plan(
-        levels, rules, "25", "90", "0.001", "0.001", "0.0005", "0.003", 40
+        levels, rules, "25", "90", "0.001", "0.001", "0.0005", "0.002", 40
     )
     assert not percent_block.allowed
     assert "PERCENT_PRICE" in percent_block.reason
 
     limit_block = validate_quantized_order_plan(
-        levels, rules, "25", "100", "0.001", "0.001", "0.0005", "0.003", 1
+        levels, rules, "25", "100", "0.001", "0.001", "0.0005", "0.002", 1
     )
     assert not limit_block.allowed
     assert limit_block.reason == "MAX_OPEN_ORDERS_PLAN_EXCEEDED"
@@ -104,7 +104,7 @@ def test_quantized_order_plan_rejects_percent_price_and_order_limit():
     ]
     exchange_limit_block = validate_quantized_order_plan(
         levels, parse_symbol_info(exchange_limited), "25", "100",
-        "0.001", "0.001", "0.0005", "0.003", 40,
+        "0.001", "0.001", "0.0005", "0.002", 40,
     )
     assert not exchange_limit_block.allowed
     assert exchange_limit_block.reason == "MAX_OPEN_ORDERS_PLAN_EXCEEDED"
@@ -119,7 +119,7 @@ def test_quantized_order_plan_applies_percent_price_by_side():
     plan = validate_quantized_order_plan(
         [GridLevel(0, Decimal("100")), GridLevel(1, Decimal("100.60"))],
         parse_symbol_info(payload), "25", "99.90",
-        "0.001", "0.001", "0.0005", "0.003", 40,
+        "0.001", "0.001", "0.0005", "0.002", 40,
     )
 
     assert not plan.allowed
@@ -130,10 +130,10 @@ def test_quantized_order_plan_blocks_cell_below_hard_min_after_rounding():
     levels = [GridLevel(0, Decimal("100.009")), GridLevel(1, Decimal("100.309"))]
 
     plan = validate_quantized_order_plan(
-        levels, rules, "25", "100", "0.001", "0.001", "0.0005", "0.003", 40
+        levels, rules, "25", "100", "0.001", "0.001", "0.0005", "0.002", 40
     )
 
     assert not plan.allowed
     assert plan.cells[0].gross_pct == Decimal("0.003")
-    assert plan.cells[0].net_pct < Decimal("0.003")
+    assert plan.cells[0].net_pct <= Decimal("0.002")
     assert "NET_PROFIT_BELOW_HARD_MIN_AFTER_QUANTIZATION" in plan.reason

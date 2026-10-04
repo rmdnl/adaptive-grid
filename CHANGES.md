@@ -5,6 +5,32 @@ in DRY_RUN / paper mode. Live trading is not implemented and must not be
 enabled without explicit authorization. All changes below preserve that
 invariant.
 
+## Economics update — grid-economics thresholds (strict executable-net gate)
+
+ECONOMICS-ONLY change. Entry/exit conditions, risk management, the
+multi-symbol architecture, grid types and ATR logic are all UNCHANGED.
+
+- **`GRID_GROSS_MIN=0.005`** — minimum GROSS profit per completed grid:
+  every grid spacing must be `>= 0.50%` gross (gate unchanged).
+- **`MIN_NET_PROFIT_PER_GRID=0.002`** — minimum EXECUTABLE net profit per
+  completed grid: STRICTLY greater than 0.20%.  The executable/quantized
+  value (after buy fee, sell fee, slippage, tick-size and quantity rounding,
+  and Binance minNotional/filter constraints) is the authoritative value:
+  - 0.200% net → REJECT
+  - 0.199% net → REJECT
+  - 0.201% net → PASS
+- Every net-profit comparison in the gate chain (`profit_model.passes`,
+  `risk_engine.profit_gate`, `grid_engine.validate_grid_profit`,
+  `symbol_rules.validate_quantized_order_plan`, `grid_planner` spacing
+  gate, `paper_orchestrator` post-quant gate) is now strict `>`
+  (`net <= hard_min` blocks).  0.200% = floor is rejected.
+- Updated: `config.yaml`, `.env.example`, `config_loader.py` validation
+  (floor 0.002), docs (AGENTS.md, SKILL.md, README, LIMITATIONS,
+  AUDIT_MULTI_SYMBOL), and boundary tests (0.199/0.200/0.201).
+- **Unchanged / preserved**: DRY_RUN=true, ALLOW_LIVE_EXECUTION=false,
+  0.50% gross gate, 0.60% step, 2% drawdown kill, range-break kill,
+  15m lower-boundary stop, risk-engine veto authority.
+
 ## Release line: v5.0.0 (strategy replacement — locked multi-symbol spec)
 
 ### Milestone: the NEW strategy is the ONLY authoritative trading strategy
@@ -26,7 +52,7 @@ invariant.
   ATR, an invalid ATR fails closed, and the 0.5% gross minimum is now a
   GATE (`GRID_GROSS_BELOW_MIN`) that BLOCKS low-volatility grids with a
   recorded reason instead of widening the step.  Executable/quantized net
-  ≥ 0.30% remains the authoritative economics gate.
+  strictly > 0.20% remains the authoritative executable-net economics gate (0.200% = REJECT, 0.201% = PASS).
 - **Old strategy removed (hard requirement)**: `main.py` (single-symbol
   legacy path), the old market-intelligence eligibility gate
   (`grid_eligibility.py`), the strategy-specific `market_filter` gate and
@@ -55,7 +81,7 @@ invariant.
   ADX/RSI/BB/Z/ATR/VO periods, ADX_ENTRY_MAX=25, RSI_ENTRY_MAX=40,
   BB_ENTRY_MAX_PERCENT_B=0, ADX_EXIT_MIN=25, RSI_EXIT_MIN=70,
   BB_EXIT_MIN_PERCENT_B=1, ZSCORE_ABS_EXIT=2.5, GRID_STEP_ATR_MULTIPLIER=1.0,
-  GRID_GROSS_MIN=0.005, MIN_NET_PROFIT_PER_GRID=0.003, COOLDOWN_HOURS=3,
+  GRID_GROSS_MIN=0.005, MIN_NET_PROFIT_PER_GRID=0.002, COOLDOWN_HOURS=3,
   MAX_DRAWDOWN_PERCENT=2, STOP_IF_BELOW_LOWER_PERCENT=2.
 - **Dashboard**: per-symbol indicator snapshot (ADX, RSI, %B, Z, ATR%),
   strategy state, entry signal, last exit reason, cooldown end time —

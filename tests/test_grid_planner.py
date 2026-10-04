@@ -31,7 +31,7 @@ def base_cfg() -> dict:
     return {
         "grid": {
             "step_pct": 0.006,
-            "hard_min_net_pct": 0.003,
+            "hard_min_net_pct": 0.002,
             "min_cells": 6,
             "max_levels": 40,
         },
@@ -81,27 +81,27 @@ def default_params(**overrides) -> dict:
 class TestComputePlanId:
     def test_deterministic_same_inputs(self):
         args = ("BNBUSDT", D("550"), D("650"), D("0.006"), 10,
-                MarketRegime.RANGE, D("0.006"), D("0.003"))
+                MarketRegime.RANGE, D("0.006"), D("0.002"))
         assert compute_plan_id(*args) == compute_plan_id(*args)
 
     def test_prefix_and_length(self):
         pid = compute_plan_id("BNBUSDT", D("550"), D("650"), D("0.006"), 10,
-                              MarketRegime.RANGE, D("0.006"), D("0.003"))
+                              MarketRegime.RANGE, D("0.006"), D("0.002"))
         assert pid.startswith("plan_")
         assert len(pid) == 5 + 16
 
     def test_different_regime_different_id(self):
         a = compute_plan_id("BNBUSDT", D("550"), D("650"), D("0.006"), 10,
-                            MarketRegime.RANGE, D("0.006"), D("0.003"))
+                            MarketRegime.RANGE, D("0.006"), D("0.002"))
         b = compute_plan_id("BNBUSDT", D("550"), D("650"), D("0.006"), 10,
-                            MarketRegime.TREND_UP, D("0.006"), D("0.003"))
+                            MarketRegime.TREND_UP, D("0.006"), D("0.002"))
         assert a != b
 
     def test_different_range_different_id(self):
         a = compute_plan_id("BNBUSDT", D("550"), D("650"), D("0.006"), 10,
-                            MarketRegime.RANGE, D("0.006"), D("0.003"))
+                            MarketRegime.RANGE, D("0.006"), D("0.002"))
         b = compute_plan_id("BNBUSDT", D("551"), D("650"), D("0.006"), 10,
-                            MarketRegime.RANGE, D("0.006"), D("0.003"))
+                            MarketRegime.RANGE, D("0.006"), D("0.002"))
         assert a != b
 
 
@@ -173,19 +173,35 @@ class TestComputeGridCount:
 class TestValidateSpacingProfit:
     def test_pass_at_default(self):
         net, reasons = _validate_spacing_profit(
-            D("0.006"), D("0.001"), D("0.001"), D("0.0005"), D("0.003"))
+            D("0.006"), D("0.001"), D("0.001"), D("0.0005"), D("0.002"))
         assert reasons == []
-        assert net >= D("0.003")
+        assert net > D("0.002")
 
     def test_fail_when_step_too_small(self):
         net, reasons = _validate_spacing_profit(
-            D("0.001"), D("0.001"), D("0.001"), D("0.0005"), D("0.003"))
+            D("0.001"), D("0.001"), D("0.001"), D("0.0005"), D("0.002"))
         assert PlanBlockReason.NET_PROFIT_BELOW_MINIMUM in reasons
 
     def test_zero_step_blocked(self):
         _, reasons = _validate_spacing_profit(
-            D("0"), D("0.001"), D("0.001"), D("0.0005"), D("0.003"))
+            D("0"), D("0.001"), D("0.001"), D("0.0005"), D("0.002"))
         assert PlanBlockReason.NET_PROFIT_BELOW_MINIMUM in reasons
+
+    def test_exact_floor_is_rejected_strict(self, monkeypatch):
+        """STRICT boundary in the planner gate: net == floor (0.200%) blocks;
+        just above the floor (0.201%) passes."""
+        import grid_planner
+        monkeypatch.setattr(grid_planner, "net_pct_from_step",
+                            lambda *a: D("0.002"))
+        _, reasons = _validate_spacing_profit(
+            D("0.006"), D("0.001"), D("0.001"), D("0.0005"), D("0.002"))
+        assert PlanBlockReason.NET_PROFIT_BELOW_MINIMUM in reasons
+
+        monkeypatch.setattr(grid_planner, "net_pct_from_step",
+                            lambda *a: D("0.00201"))
+        _, reasons = _validate_spacing_profit(
+            D("0.006"), D("0.001"), D("0.001"), D("0.0005"), D("0.002"))
+        assert reasons == []
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +582,8 @@ class TestPlanFields:
     def test_estimated_net_profit_at_least_hard_min(self):
         plan = evaluate_adaptive_grid_plan(**default_params())
         assert plan.decision == PlanDecision.GRID_ALLOWED
-        assert plan.estimated_net_profit_per_grid >= D("0.003")
+        # STRICT gate: the estimated net must be > hard_min (0.002 floor).
+        assert plan.estimated_net_profit_per_grid > D("0.002")
 
     def test_plan_is_immutable(self):
         plan = evaluate_adaptive_grid_plan(**default_params())

@@ -20,7 +20,7 @@ repair all defects, and verify on Binance Spot Testnet.
   |Z-Score(20)| > 2.5. On exit: cancel ALL remaining grid orders, liquidate
   ALL held base inventory, then a 3-hour cooldown before new auto-entry.
 - Grid: arithmetic for BTC/ETH/BNB, geometric for SOL; step = 1x ATR(14),
-  floor gross 0.5%/grid; hard minimum net 0.3% after fees (maker+taker
+  floor gross 0.5%/grid; hard minimum net STRICTLY > 0.20% after fees (maker+taker
   0.1% each) and conservative slippage.
 - Equity drawdown kill switch 2% — verified present (`risk.max_equity_drawdown_pct: 0.02`,
   `risk_engine.equity_dd_kill`, fail-closed config validation).
@@ -46,7 +46,7 @@ repair all defects, and verify on Binance Spot Testnet.
 
 ## Interactions preserved (no locked parameter changed)
 
-- Gross grid floor 0.5% + hard net minimum 0.3%: with the conservative
+- Gross grid floor 0.5% + hard net minimum STRICTLY > 0.20%: with the conservative
   0.05% round-trip slippage, a 0.5% gross step nets 0.25% and is correctly
   REJECTED by the profitability guard; the effective gross floor is ~0.55%.
   This is the conservative behavior required by the contract (never weaken
