@@ -437,15 +437,15 @@ class BaseExecutor:
 
     # ----- shared fill accounting (the single accounting path) -----
 
-    def _account_trades(self, order: Dict, trades: List[Dict]) -> float:
+    def _account_trades(self, order: Dict, trades: List[Dict]) -> int:
         """Record every not-yet-recorded trade exactly once.
 
         Each trade carries its exchange trade id (`t["id"]`), the
-        idempotency key. Returns the quantity newly recorded. Fee and
-        quantity always come from the actual trade — never the planned
+        idempotency key. Returns the number of trades newly recorded. Fee
+        and quantity always come from the actual trade — never the planned
         order quantity.
         """
-        new_qty = 0.0
+        new_trades = 0
         for t in trades:
             if self.store.fill_exists(t["id"]):
                 continue
@@ -458,8 +458,8 @@ class BaseExecutor:
                 exchange_order_id=t.get("exchange_order_id"),
             )
             if recorded:
-                new_qty += t["qty"]
-        return new_qty
+                new_trades += 1
+        return new_trades
 
     def _spawn_child_sells(self, order: Dict) -> None:
         """Convert executed-but-unconverted BUY quantity into child SELL
@@ -823,17 +823,87 @@ class LiveExecutor(BaseExecutor):
                 )
 
     def _sync_order_from_remote(
-        self, symbol: str, order: Dict, remote: Dict, allow_renewal: bool
-    ) -> None:
+        self,
+        symbol: str,
+        order: Dict,
+        remote: Dict,
+        allow_renewal: bool,
+        reconcile_only: bool = False,
+    ) -> int:
+        """Mirror one local order to its authoritative exchange status and
+        account any not-yet-recorded exchange trades (idempotent by trade
+        id). Returns the number of fills newly recorded.
+
+        `reconcile_only` (restart reconciliation) suppresses child-sell
+        spawning and grid renewal so the pass creates no new orders; those
+        resume on the next strategy cycle instead.
+        """
         status = remote.get("status", "NEW")
         executed = float(remote.get("executedQty") or 0)
         self.store.update_order_status(order["id"], status, executed)
+        # Always account trades (idempotent by trade id) for inventory tracking.
+        # The order's filled_qty is set from executedQty above; trades drive
+        # inventory and are only recorded once per trade id.
         trades = self._trades_from_exchange(symbol, remote.get("orderId"))
-        self._account_trades(order, trades)
-        if order["side"] == "BUY":
-            self._spawn_child_sells(order)
-        elif status == "FILLED":
-            self._renew_grid_level(order, allow_renewal)
+        new_qty = self._account_trades(order, trades)
+        if not reconcile_only:
+            if order["side"] == "BUY":
+                self._spawn_child_sells(order)
+            elif status == "FILLED":
+                self._renew_grid_level(order, allow_renewal)
+        return new_qty
+
+    # ----- restart reconciliation (read/report; no new orders) -----
+
+    def restart_reconcile(self, symbol: str) -> Dict:
+        """Reconcile local state against the exchange BEFORE resuming.
+
+        Strict, idempotent, no-side-effect: mirrors each local order to its
+        authoritative exchange status (a status the local DB had missed — e.g.
+        a partial fill while offline), accounts any exchange trades not yet in
+        the ledger (idempotent by trade id), and detects unknown local orders
+        or unexpected exchange orders. It creates NO orders, cancels nothing
+        and liquidates nothing. Raises on exchange failure or on unknown
+        state (fail-closed); the caller must then stop, not resume."""
+        report: Dict = {
+            "symbol": symbol,
+            "checked": 0,
+            "updated": 0,
+            "fills_recorded": 0,
+            "unknown": 0,
+            "unknown_orders": [],
+        }
+        for order in list(self.store.open_orders(symbol)):
+            cid = order["client_order_id"]
+            remote = self.spot.get_order(symbol, cid)
+            if remote is None:
+                self.store.update_order_status(order["id"], "UNKNOWN")
+                report["unknown"] += 1
+                report["unknown_orders"].append(cid)
+                continue
+            report["fills_recorded"] += self._sync_order_from_remote(
+                symbol, order, remote, allow_renewal=False, reconcile_only=True
+            )
+            report["checked"] += 1
+            report["updated"] += 1
+        # Detect exchange orders the local DB does not know about.
+        local_cids = {o["client_order_id"] for o in self.store.open_orders(symbol)}
+        # include ids that just became UNKNOWN so we still flag the unknowns
+        local_cids |= set(report["unknown_orders"])
+        for remote_order in self.spot.get_open_orders(symbol):
+            if remote_order.get("clientOrderId") not in local_cids:
+                report["unknown"] += 1
+                report["unknown_orders"].append(str(remote_order.get("clientOrderId")))
+                log.error(
+                    "reconcile %s: unexpected exchange open order %s (no local record)",
+                    symbol, remote_order.get("clientOrderId"),
+                )
+        if report["unknown"]:
+            raise OrderUnknownState(
+                f"reconciliation of {symbol} detected {report['unknown']} "
+                f"unknown order(s): {', '.join(report['unknown_orders'])}"
+            )
+        return report
 
     # ----- helpers -----
 

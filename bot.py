@@ -17,6 +17,7 @@ liquidation verification stops the symbol in ERROR instead of continuing.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 import uuid
@@ -126,6 +127,14 @@ class Bot:
         # the runtime's own record (display only — no gate reads it).
         store.set_meta("mode_binance_env", cfg.binance_env)
         store.set_meta("mode_execution", cfg.execution_mode)
+        # The active session's configured symbol list is the dashboard's
+        # display scope: a JSON array in PAIR_LIST order. Updated on every
+        # startup, so a PAIR_LIST change on a future restart is picked up
+        # deterministically.
+        store.set_meta(
+            "configured_symbols",
+            json.dumps(list(cfg.pair_list), separators=(",", ":")),
+        )
         self._initialize_session()
 
     # ----- execution session (paper/testnet capital) -----
@@ -552,6 +561,87 @@ def _service_loop(bot: Bot) -> None:
         time.sleep(CYCLE_SECONDS)
 
 
+def _reconcile_state(cfg: Config, spot: "BinanceSpot", store: StateStore, out=None) -> int:
+    """Reconcile local state against the exchange BEFORE resuming (testnet).
+
+    Strictly read/report with a no-side-effect guarantee: it mirrors each
+    local order to its authoritative exchange status and accounts any
+    not-yet-recorded exchange trades (idempotent by trade id), but it
+    creates NO new orders, cancels NOTHING and liquidates NOTHING. It also
+    checks ledger consistency (inventory == BUY qty - SELL qty; fills are
+    unique by trade id).
+
+    Exit code: 0 when clean, 1 when a problem or unknown state is found
+    (fail-closed — do NOT resume). PAPER short-circuits with a message.
+    """
+    import sys
+
+    if out is None:
+        out = sys.stdout
+
+    if cfg.execution_mode == "paper":
+        print("RECONCILE: PAPER mode — no exchange reconciliation (offline/deterministic).", file=out)
+        print("OVERALL: OK", file=out)
+        return 0
+    if cfg.execution_mode != "testnet":
+        print("RECONCILE: only available in EXECUTION_MODE=testnet.", file=out)
+        print("OVERALL: FAIL-CLOSED (mode not supported)", file=out)
+        return 1
+
+    from exchange import LiveExecutor
+
+    executor = LiveExecutor(cfg, spot, store)
+    overall_ok = True
+    print("RESTART RECONCILIATION", file=out)
+    for symbol in cfg.pair_list:
+        print(f"\nSYMBOL: {symbol}", file=out)
+        try:
+            report = executor.restart_reconcile(symbol)
+        except OrderUnknownState as exc:
+            # Fail closed for this symbol: stop it, do not resume.
+            store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
+            store.add_risk_event(symbol, "reconcile_unknown_state", str(exc))
+            print(f"  UNKNOWN: {exc}", file=out)
+            print(f"  SYMBOL STATE: STOPPED (fail-closed)", file=out)
+            overall_ok = False
+            continue
+        except ExchangeError as exc:
+            # Exchange unavailable / error: cannot verify — fail closed.
+            store.add_risk_event(symbol, "reconcile_failed", str(exc))
+            print(f"  ERROR: {exc}", file=out)
+            print(f"  SYMBOL STATE: UNVERIFIED (fail-closed)", file=out)
+            overall_ok = False
+            continue
+
+        print(f"  open orders checked: {report['checked']}", file=out)
+        print(f"  statuses updated:    {report['updated']}", file=out)
+        print(f"  fills recorded:      {report['fills_recorded']}", file=out)
+        print(f"  unknown orders:      {report['unknown']}", file=out)
+
+        # Ledger consistency: inventory must equal BUY qty - SELL qty.
+        st = store.get_symbol(symbol)
+        inventory = float(st.inventory_qty or 0.0) if st else 0.0
+        buy_qty, sell_qty = store.fill_quantities(symbol)
+        expected = buy_qty - sell_qty
+        ledger_ok = abs(inventory - expected) <= QTY_TOLERANCE
+        print(
+            f"  ledger: inventory={inventory:.8f} buys={buy_qty:.8f} "
+            f"sells={sell_qty:.8f} "
+            f"{'OK' if ledger_ok else 'MISMATCH'}",
+            file=out,
+        )
+        if not ledger_ok:
+            store.add_risk_event(
+                symbol, "reconcile_ledger_mismatch",
+                f"inventory={inventory} expected={expected}",
+            )
+            overall_ok = False
+
+    print("", file=out)
+    print("OVERALL:", "OK" if overall_ok else "FAIL-CLOSED", file=out)
+    return 0 if overall_ok else 1
+
+
 def reset_execution_session(cfg: Config, store: StateStore) -> None:
     """Explicit operator reset of the execution session. This is the
     deterministic escape hatch for mode switches: it wipes session-scoped
@@ -887,6 +977,11 @@ def main(argv=None) -> int:
         "--testnet-order-selftest", metavar="SYMBOL",
         help="place and cancel one far-from-market LIMIT_MAKER order on Binance Spot Testnet, then exit",
     )
+    parser.add_argument(
+        "--reconcile", action="store_true",
+        help="reconcile local state against the exchange before resuming (read-only; "
+             "reports open-order statuses and unreconciled fills, never places orders) and exit",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -927,6 +1022,16 @@ def main(argv=None) -> int:
             return 1
 
     spot = BinanceSpot(cfg)
+
+    # --reconcile: read-only pre-resume verification. It never creates a
+    # session, places orders, or enters the service loop.
+    if args.reconcile:
+        try:
+            return _reconcile_state(cfg, spot, store)
+        except Exception as exc:  # fail closed: report, do not resume
+            log.error("reconcile failed (fail-closed): %s", exc)
+            return 1
+
     try:
         if args.check_exchange:
             _validate_exchange_access(cfg, spot)

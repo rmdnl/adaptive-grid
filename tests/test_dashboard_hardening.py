@@ -11,6 +11,7 @@ import urllib.request
 
 import pytest
 
+from conftest import wait_for_server
 from dashboard import build_history, build_payload, make_server, render_page
 from state import StateStore
 
@@ -20,6 +21,8 @@ def seeded(tmp_path):
     path = str(tmp_path / "state.db")
     store = StateStore(path)
     store.ensure_symbols(["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"])
+    store.set_meta("configured_symbols", json.dumps(
+        ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"], separators=(",", ":")))
     store.set_meta("mode_binance_env", "testnet")
     store.set_meta("mode_execution", "paper")
     store.set_meta("session_id", "paper-abc123def456")
@@ -117,6 +120,7 @@ def test_binds_localhost_explicitly(seeded):
     server = make_server(seeded, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    wait_for_server(server)
     try:
         assert server.server_address[0] == "127.0.0.1"
         base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -131,6 +135,7 @@ def test_binds_all_interfaces_when_configured(seeded):
     server = make_server(seeded, host="0.0.0.0", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    wait_for_server(server)
     try:
         assert server.server_address[0] == "0.0.0.0"
         base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -147,6 +152,7 @@ def test_api_history_endpoint(seeded):
     server = make_server(seeded, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    wait_for_server(server)
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
         status, body = _get(base, "/api/history")
@@ -162,22 +168,46 @@ def test_every_write_method_returns_405(seeded):
     server = make_server(seeded, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    wait_for_server(server)
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
         for method in ("POST", "PUT", "PATCH", "DELETE"):
             req = urllib.request.Request(base + "/api/state", data=b"{}", method=method)
-            with pytest.raises(urllib.error.HTTPError) as exc:
-                urllib.request.urlopen(req, timeout=5)
-            assert exc.value.code == 405, method
+            _expect_405(base, method)
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _expect_405(base: str, method: str) -> None:
+    """Assert a write method is refused with 405, tolerating transient
+    socket teardown races (WinError 10053 / connection reset) under test
+    load by retrying the request; an HTTP 405 is definitive and must not
+    be retried. No assertion is weakened — every attempt must end in a
+    405."""
+    import time as _time
+
+    attempts = 0
+    while True:
+        req = urllib.request.Request(base + "/api/state", data=b"{}", method=method)
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 405, method
+            return
+        except (ConnectionError, ConnectionResetError, ConnectionAbortedError) as exc:
+            attempts += 1
+            if attempts >= 10:
+                raise  # give up: this is a real failure, not a transient race
+            _time.sleep(0.05 * attempts)
+            continue
 
 
 def test_unknown_path_returns_404(seeded):
     server = make_server(seeded, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    wait_for_server(server)
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
         try:
@@ -201,6 +231,7 @@ def test_dashboard_stays_available_when_database_missing(tmp_path):
     server = make_server(missing, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    wait_for_server(server)
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
         status, body = _get(base, "/api/state")

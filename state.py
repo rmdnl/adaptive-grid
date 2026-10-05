@@ -9,6 +9,7 @@ compatibility tables for any deleted architecture.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -219,6 +220,22 @@ class StateStore:
             return None
         return float(raw)
 
+    def configured_symbols(self) -> Optional[List[str]]:
+        """The symbol list of the active runtime session, persisted by the
+        bot at startup as a JSON array in meta (PAIR_LIST order). None when
+        the key is absent or the value is corrupt — the dashboard must fail
+        closed for display instead of showing all historical symbols."""
+        raw = self.get_meta("configured_symbols")
+        if raw is None:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(parsed, list) or not all(isinstance(s, str) for s in parsed):
+            return None
+        return [s for s in parsed if s]
+
     def set_global_kill(self, reason: str) -> None:
         self.set_meta("kill_active", "1")
         self.set_meta("kill_reason", reason)
@@ -411,6 +428,20 @@ class StateStore:
 
     def count_open_orders(self, symbol: Optional[str] = None) -> int:
         return len(self.open_orders(symbol))
+
+    def fill_quantities(self, symbol: str) -> Tuple[float, float]:
+        """Total BUY and SELL fill quantities for a symbol (from the fills
+        ledger). Used by the ledger-consistency check: held inventory must
+        equal BUY qty - SELL qty; a mismatch signals corrupted accounting."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN qty ELSE 0 END), 0) AS b, "
+            "COALESCE(SUM(CASE WHEN side='SELL' THEN qty ELSE 0 END), 0) AS s "
+            "FROM fills WHERE symbol=?",
+            (symbol,),
+        ).fetchone()
+        conn.close()
+        return float(row["b"]), float(row["s"])
 
     # ----- fills / pnl / fees -----
 

@@ -245,3 +245,30 @@ class FakeSpot:
         if self.fail_balance:
             raise self._exchange.ExchangeError("balance unavailable")
         return float(self.balances.get(asset, 0.0))
+
+
+def wait_for_server(server, timeout_s: float = 10.0):
+    """Remove the thread-start race in the dashboard socket tests: after
+    `thread.start()` the accept loop is not guaranteed to be listening yet,
+    so the first HTTP request intermittently hits ConnectionRefused under
+    load (notably on Windows). Poll an accepted connection until it can be
+    established (bounded), so the assertions on response codes stay strict.
+
+    Wildcard binds (0.0.0.0 / ::) must be polled via the loopback address:
+    connecting directly to a wildcard is unreliable cross-platform."""
+    import socket
+    import time as _time
+
+    bound_host, port = server.server_address
+    host = "127.0.0.1" if bound_host in ("0.0.0.0", "::", "") else bound_host
+    deadline = _time.monotonic() + timeout_s
+    last = None
+    while _time.monotonic() < deadline:
+        try:
+            conn = socket.create_connection((host, port), timeout=0.25)
+            conn.close()
+            return
+        except OSError as exc:
+            last = exc
+            _time.sleep(0.05)
+    raise TimeoutError(f"server on {bound_host}:{port} not accepting connections: {last}")

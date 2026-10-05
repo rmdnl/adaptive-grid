@@ -8,8 +8,10 @@ import threading
 import urllib.error
 import urllib.request
 
+import json
 import pytest
 
+from conftest import wait_for_server
 from dashboard import KNOWN_STATES, build_payload, build_history, make_server, render_page
 from state import StateStore
 
@@ -19,6 +21,8 @@ def seeded(tmp_path):
     path = str(tmp_path / "state.db")
     store = StateStore(path)
     store.ensure_symbols(["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"])
+    store.set_meta("configured_symbols", json.dumps(
+        ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"], separators=(",", ":")))
     store.update_symbol(
         "BTC/USDT",
         timeframe="4h",
@@ -72,8 +76,9 @@ def test_payload_global_fields(seeded):
 
 def test_payload_lists_all_four_symbols(seeded):
     payload = build_payload(seeded)
+    # Dashboard ordering follows the active session's PAIR_LIST, not the DB
     assert [s["symbol"] for s in payload["symbols"]] == [
-        "BNB/USDT", "BTC/USDT", "ETH/USDT", "SOL/USDT",
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
     ]
 
 
@@ -154,6 +159,7 @@ def test_dashboard_server_read_only(seeded):
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    wait_for_server(server)
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
         with urllib.request.urlopen(f"{base}/api/state", timeout=5) as resp:

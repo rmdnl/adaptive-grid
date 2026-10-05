@@ -29,7 +29,7 @@ import argparse
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from state import StateStore
 
@@ -113,15 +113,41 @@ def _symbol_payload(store: StateStore, st) -> Dict:
     }
 
 
+def _active_symbol_payloads(store: StateStore) -> Tuple[List[Dict], Optional[List[str]]]:
+    """Per-symbol payloads for the ACTIVE runtime session only.
+
+    The bot persists its configured symbol list (PAIR_LIST, PAIR_LIST
+    order) in the read-only state DB at startup. Dashboard rendering is
+    filtered against that list so historical symbols (e.g. a pair that
+    left PAIR_LIST) never reappear. When the key is absent the display
+    fails closed: an empty symbol list plus the explicit NO ACTIVE SYMBOL
+    CONFIGURATION marker — historical symbols are not shown silently.
+    """
+    configured = store.configured_symbols()
+    if configured is None:
+        return [], None
+    by_symbol = {st.symbol: st for st in store.all_symbols()}
+    payloads = [
+        _symbol_payload(store, by_symbol[symbol])
+        for symbol in configured
+        if symbol in by_symbol
+    ]
+    return payloads, configured
+
+
 def build_payload(db_path: str, max_drawdown_percent: Optional[float] = None) -> Dict:
     """Read-only snapshot of global and per-symbol state. Missing data is
-    reported as None — never inferred, never fabricated."""
+    reported as None — never inferred, never fabricated. Symbol rows are
+    restricted to the active session's configured symbols."""
     symbols: List[Dict] = []
     store: Optional[StateStore] = None
+    configured: Optional[List[str]] = None
     try:
         store = StateStore(db_path, read_only=True)
-        symbols = [_symbol_payload(store, st) for st in store.all_symbols()]
+        symbols, configured = _active_symbol_payloads(store)
         glob = _global_payload(store)
+        glob["configured_symbols"] = configured
+        glob["active_symbol_config"] = configured is not None
     except Exception as exc:
         glob = {
             "equity": None,
@@ -140,6 +166,8 @@ def build_payload(db_path: str, max_drawdown_percent: Optional[float] = None) ->
             "wallet_usdt": None,
             "session": None,
             "binance_env": None,
+            "configured_symbols": None,
+            "active_symbol_config": False,
         }
         return {"global": glob, "symbols": symbols}
     glob["max_drawdown_percent"] = max_drawdown_percent
@@ -466,13 +494,17 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     } else { kr.className = "killreason"; }
   }
 
-  function renderSymbols(symbols) {
+  function renderSymbols(symbols, activeConfig) {
     var grid = $("symbols");
     grid.textContent = "";
     if (!symbols || !symbols.length) {
       var empty = document.createElement("div");
       empty.className = "panel"; empty.style.gridColumn = "1 / -1";
-      empty.textContent = "NO SYMBOLS CONFIGURED";
+      // Fail closed: when the active runtime has no configured symbol list,
+      // say so explicitly instead of silently showing historical symbols.
+      empty.textContent = activeConfig
+        ? "NO SYMBOLS CONFIGURED"
+        : "NO ACTIVE SYMBOL CONFIGURATION";
       grid.appendChild(empty);
       return;
     }
@@ -588,8 +620,9 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
 
   function renderAll(p) {
     if (!p) return;
-    renderGlobal(p.global || {});
-    renderSymbols(p.symbols || []);
+    var g = p.global || {};
+    renderGlobal(g);
+    renderSymbols(p.symbols || [], g.active_symbol_config);
   }
 
   function setDataFlag(live) {
