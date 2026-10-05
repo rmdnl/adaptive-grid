@@ -197,7 +197,8 @@ def build_grid(
             return _blocked(symbol, mode, step, "no_valid_levels")
 
     # TOTAL_GRIDS is the authoritative production limit (Phase 1).
-    total_grids = getattr(cfg, "total_grids", 5)
+    # Config validation enforces TOTAL_GRIDS as mandatory; no fallback.
+    total_grids = cfg.total_grids
 
     levels: List[GridLevel] = []
     dropped_levels = 0
