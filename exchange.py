@@ -29,7 +29,7 @@ import urllib.request
 import uuid
 from typing import Dict, List, Optional
 
-from grid import ExchangeFilters, validate_price
+from grid import ExchangeFilters, validate_price, quantize_qty_floor
 from state import StateStore
 
 log = logging.getLogger("exchange")
@@ -232,6 +232,25 @@ class BinanceSpot:
             {"symbol": exchange_symbol(symbol)},
             retries=2,
         )
+
+    def get_ticker_price(self, symbol: str) -> Optional[float]:
+        """Current market price from /api/v3/ticker/price (public endpoint).
+        
+        Returns the live last traded price for risk/equity/liquidation valuation.
+        None when unavailable — callers must fail closed for safety-critical operations.
+        """
+        try:
+            data = self._request(
+                "GET",
+                "/api/v3/ticker/price",
+                {"symbol": exchange_symbol(symbol)},
+                retries=2,
+            )
+            price = float(data.get("price") or 0)
+            return price if price > 0 else None
+        except ExchangeError as exc:
+            log.warning("ticker price unavailable for %s: %s", symbol, exc)
+            return None
 
     # ----- trading (signed; disabled under DRY_RUN) -----
 
@@ -485,11 +504,19 @@ class BaseExecutor:
         """Convert executed-but-unconverted BUY quantity into child SELL
         orders. The conversion bookkeeping (`child_sell_qty`) is updated
         atomically with child creation, so the sum of child sells always
-        equals the acquired quantity — never more, never duplicated."""
+        equals the acquired quantity — never more, never duplicated.
+
+        Uses the NET filled quantity from the fills ledger (which accounts for
+        base-asset commission on BUY orders) rather than the gross executedQty
+        from the exchange order status. This ensures child SELL quantity never
+        exceeds actual usable base inventory.
+        """
         parent = self.store.get_order(order["id"])
         if parent is None or parent["side"] != "BUY":
             return
-        executed = float(parent["filled_qty"] or 0.0)
+        # Use net filled quantity from fills ledger (net of base commission).
+        # This is the authoritative acquired quantity for child SELL spawning.
+        executed = self.store.order_net_filled_qty(parent["id"])
         converted = float(parent["child_sell_qty"] or 0.0)
         delta = executed - converted
         if delta <= QTY_TOLERANCE:
@@ -566,6 +593,14 @@ class DryRunExecutor(BaseExecutor):
                  parent["symbol"], qty, parent["target_sell_price"])
 
     def place_market_sell(self, symbol: str, qty: float, ref_price: float) -> bool:
+        # Quantize quantity down to step size for consistency with live executor
+        try:
+            filters = self._filters_for(symbol)
+            if filters and filters.step_size > 0:
+                qty = quantize_qty_floor(qty, filters.step_size)
+        except Exception:
+            pass  # In dry-run, filters may not be available; proceed with original qty
+        
         price = ref_price * (1.0 - self.cfg.slippage_estimate)
         fee = price * qty * max(self.cfg.maker_fee, self.cfg.taker_fee)
         cid = _new_client_id("dry-liq")
@@ -722,6 +757,29 @@ class LiveExecutor(BaseExecutor):
         False (the caller must treat the symbol as NOT liquidated).
         """
         base = symbol.split("/")[0]
+        # Get exchange filters for step-size quantization
+        try:
+            filters = self.spot.get_filters(symbol)
+        except ExchangeError as exc:
+            log.error("filters unavailable for liquidation %s: %s", symbol, exc)
+            self.store.add_risk_event(symbol, "liquidation_verify_failed", f"filters unavailable: {exc}")
+            return False
+        
+        step_size = filters.step_size
+        if step_size <= 0:
+            log.error("invalid step size for %s: %s", symbol, step_size)
+            self.store.add_risk_event(symbol, "liquidation_verify_failed", f"invalid step size: {step_size}")
+            return False
+        
+        # Quantize DOWN to step size — never round up during liquidation
+        qty = quantize_qty_floor(qty, step_size)
+        
+        # Check minimum quantity after quantization
+        if qty < filters.min_qty - QTY_TOLERANCE:
+            self.store.add_risk_event(symbol, "liquidation_verify_failed", 
+                f"quantity {qty} below min_qty {filters.min_qty} after step-size quantization")
+            return False
+        
         tol = max(QTY_TOLERANCE, qty * LIQ_REL_TOLERANCE)
         try:
             balance_before = self.spot.get_balance(base)

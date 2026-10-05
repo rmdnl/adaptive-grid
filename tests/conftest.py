@@ -261,6 +261,15 @@ class FakeSpot:
             raise self._exchange.ExchangeError("balance unavailable")
         return float(self.balances.get(asset, 0.0))
 
+    def get_filters(self, symbol):
+        from grid import ExchangeFilters
+        return ExchangeFilters(
+            tick_size=0.01,
+            step_size=0.00001,
+            min_notional=10.0,
+            min_qty=0.0,
+        )
+
 
 def wait_for_server(server, timeout_s: float = 10.0):
     """Remove the thread-start race in the dashboard socket tests: after

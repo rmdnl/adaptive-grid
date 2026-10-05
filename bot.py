@@ -110,6 +110,18 @@ class MarketData:
             log.warning("reference price unavailable for %s: %s", symbol, exc)
             return None
 
+    def live_price(self, symbol: str) -> Optional[float]:
+        """Current market price from ticker/price endpoint for risk/equity/liquidation.
+        
+        Separate from indicator close (which uses CLOSED candles only).
+        None when unavailable — callers must fail closed for safety-critical operations.
+        """
+        try:
+            return self.spot.get_ticker_price(symbol)
+        except ExchangeError as exc:
+            log.warning("live price unavailable for %s: %s", symbol, exc)
+            return None
+
 
 class Bot:
     def __init__(
@@ -248,12 +260,13 @@ class Bot:
                 st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
                 inventory = st.inventory_qty or 0.0
                 if inventory > QTY_TOLERANCE:
-                    ref_price = st.last_price or 0.0
-                    if ref_price <= 0:
-                        self.store.add_risk_event(symbol, "liquidation_verify_failed", "no price reference during kill cleanup")
+                    # Use live market price for liquidation, NOT the stale indicator close.
+                    live_price = self.market.live_price(symbol)
+                    if live_price is None:
+                        self.store.add_risk_event(symbol, "liquidation_verify_failed", "no live price reference during kill cleanup (fail-closed)")
                         self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
                         continue
-                    liquidated = self.executor.place_market_sell(symbol, inventory, ref_price)
+                    liquidated = self.executor.place_market_sell(symbol, inventory, live_price)
                     st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
                     if not liquidated or (st.inventory_qty or 0.0) > QTY_TOLERANCE:
                         self.store.add_risk_event(symbol, "liquidation_verify_failed", kill_reason)
@@ -623,12 +636,13 @@ class Bot:
         st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
         inventory = st.inventory_qty or 0.0
         if inventory > 0.0:
-            ref_price = st.last_price or 0.0
-            if ref_price <= 0:
-                self.store.add_risk_event(symbol, "liquidation_verify_failed", "no price reference")
+            # Use live market price for liquidation, NOT the stale indicator close.
+            live_price = self.market.live_price(symbol)
+            if live_price is None:
+                self.store.add_risk_event(symbol, "liquidation_verify_failed", "no live price reference (fail-closed)")
                 self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
                 return
-            liquidated = self.executor.place_market_sell(symbol, inventory, ref_price)
+            liquidated = self.executor.place_market_sell(symbol, inventory, live_price)
             st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
             if not liquidated or (st.inventory_qty or 0.0) > QTY_TOLERANCE:
                 self.store.add_risk_event(symbol, "liquidation_verify_failed", reason)
@@ -636,12 +650,35 @@ class Bot:
                 log.error("fail-closed: liquidation verification failed for %s", symbol)
                 return
         self.store.add_risk_event(symbol, "auto_exit", reason)
+        
+        # Clear adaptive grid parameters on successful exit — they were locked
+        # for the grid that just exited and must not be reused as an active
+        # boundary when no grid is running. Historical values are preserved
+        # implicitly in the fills/order/risk-event ledger.
+        clear_adaptive = {
+            "adaptive_lower_price": None,
+            "adaptive_upper_price": None,
+            "adaptive_total_grids": None,
+            "adaptive_quote_budget": None,
+            "adaptive_grid_step": None,
+            "adaptive_reference_price": None,
+            "adaptive_timeframe": None,
+            "grid_mode": None,
+            "grid_step": None,
+            "grid_lower": None,
+            "gross_pct": None,
+            "net_pct": None,
+        }
+        
         if cooldown:
             self.store.set_cooldown(symbol, now + self.cfg.cooldown_hours * 3600.0)
-            self.store.set_symbol_state(symbol, "COOLDOWN", exit_reason=reason)
+            self.store.set_symbol_state(symbol, "COOLDOWN", exit_reason=reason, **clear_adaptive)
         else:
             # Risk stop (e.g. lower-boundary breach): no automatic re-entry.
             self.risk.stop_symbol(symbol, reason)
+            # Also clear adaptive fields for risk stops — the stopped grid's
+            # boundary must not be enforced after exit.
+            self.store.update_symbol(symbol, **clear_adaptive)
 
     def _global_kill(self, reason: str) -> None:
         """Global kill switch.
@@ -669,14 +706,15 @@ class Bot:
                 st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
                 inventory = st.inventory_qty or 0.0
                 if inventory > QTY_TOLERANCE:
-                    ref_price = st.last_price or 0.0
-                    if ref_price <= 0:
+                    # Use live market price for liquidation, NOT the stale indicator close.
+                    live_price = self.market.live_price(symbol)
+                    if live_price is None:
                         self.store.add_risk_event(
-                            symbol, "liquidation_verify_failed", "no price reference during global kill"
+                            symbol, "liquidation_verify_failed", "no live price reference during global kill (fail-closed)"
                         )
                         self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
                         continue
-                    liquidated = self.executor.place_market_sell(symbol, inventory, ref_price)
+                    liquidated = self.executor.place_market_sell(symbol, inventory, live_price)
                     st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
                     if not liquidated or (st.inventory_qty or 0.0) > QTY_TOLERANCE:
                         self.store.add_risk_event(symbol, "liquidation_verify_failed", reason)
@@ -686,7 +724,23 @@ class Bot:
                             symbol,
                         )
                         continue
-                self.store.set_symbol_state(symbol, "KILL_ACTIVE")
+                # Clear adaptive grid parameters on successful kill cleanup —
+                # the killed grid's boundary must not be reused.
+                clear_adaptive = {
+                    "adaptive_lower_price": None,
+                    "adaptive_upper_price": None,
+                    "adaptive_total_grids": None,
+                    "adaptive_quote_budget": None,
+                    "adaptive_grid_step": None,
+                    "adaptive_reference_price": None,
+                    "adaptive_timeframe": None,
+                    "grid_mode": None,
+                    "grid_step": None,
+                    "grid_lower": None,
+                    "gross_pct": None,
+                    "net_pct": None,
+                }
+                self.store.set_symbol_state(symbol, "KILL_ACTIVE", **clear_adaptive)
             except OrderUnknownState as exc:
                 self.store.add_risk_event(symbol, "order_unknown_state", str(exc))
                 self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
@@ -713,8 +767,14 @@ class Bot:
         fees = self.store.sum_fees()
         unrealized = 0.0
         for st in self.store.all_symbols():
-            if (st.inventory_qty or 0.0) > 0.0 and st.last_price:
-                unrealized += st.inventory_qty * (st.last_price - (st.avg_cost or 0.0))
+            if (st.inventory_qty or 0.0) > 0.0:
+                # Use live market price for equity valuation, NOT the stale indicator close.
+                # Indicator close is for strategy signals; live price is for risk/valuation.
+                live_price = self.market.live_price(st.symbol)
+                if live_price is None:
+                    log.warning("live price unavailable for %s equity valuation — skipping unrealized PnL (fail-closed)", st.symbol)
+                    continue
+                unrealized += st.inventory_qty * (live_price - (st.avg_cost or 0.0))
         # The session capital (paper start equity, derived from the testnet
         # USDT balance or START_EQUITY) anchors the PnL-based equity model.
         capital = self.store.get_meta_float("session_start_equity")

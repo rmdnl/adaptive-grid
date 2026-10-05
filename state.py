@@ -606,6 +606,22 @@ class StateStore:
         conn.close()
         return int(row["n"])
 
+    def order_net_filled_qty(self, order_id: int) -> float:
+        """Total NET filled quantity for a BUY order from the fills ledger.
+
+        This sums the qty from fills recorded for this order. For BUY orders
+        with base-asset commission, the fills qty is already the NET received
+        quantity (gross - commission). This is the authoritative quantity for
+        child SELL spawning and inventory reconciliation.
+        """
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(qty), 0) AS q FROM fills WHERE order_id=? AND side='BUY'",
+            (order_id,),
+        ).fetchone()
+        conn.close()
+        return float(row["q"] or 0.0)
+
     def net_pnl_history(self) -> List[Dict]:
         """Reconstructable telemetry: cumulative net PnL (realized - fees)
         over time from the fills ledger. Read-only; no invented data."""
