@@ -336,9 +336,12 @@ class Bot:
 
         # Refresh the market/indicator view; a STOPPED symbol keeps its
         # recorded exit reason (the state must stay authoritative).
+        # 
+        # last_price: live ticker price for dashboard telemetry and equity
+        # valuation. Must NOT be the closed candle price.
+        # Indicator/strategy calculations continue to use snap.last_close.
         market_fields = dict(
             timeframe=self.cfg.indicator_timeframe,
-            last_price=snap.last_close,
             adx=snap.adx,
             rsi=snap.rsi,
             percent_b=snap.percent_b,
@@ -348,6 +351,17 @@ class Bot:
         )
         if st.risk_status != "stopped":
             market_fields.update(exit_status=0, exit_reason=None)
+
+        # Fetch live ticker price for dashboard/equity telemetry.
+        # This is SEPARATE from the closed-candle indicator snapshot.
+        # Fail-closed: if unavailable, do NOT fabricate — omit last_price
+        # so the previous value (if any) persists, and dashboard shows stale.
+        live_price = self.market.live_price(symbol)
+        if live_price is not None and live_price > 0:
+            market_fields["last_price"] = live_price
+        else:
+            log.debug("live price unavailable for %s — last_price not updated (fail-closed)", symbol)
+
         self.store.update_symbol(symbol, **market_fields)
 
         if st.risk_status == "stopped":

@@ -36,22 +36,30 @@ class StubMarket:
     """Same interface as MarketData, but returns canned cycle views.
     Symbols without an explicit view report insufficient data (realistic)."""
 
+    # Sentinel for "live_price not provided"
+    _LIVE_PRICE_UNSET = object()
+
     def __init__(self):
         self.views = {}
         self.filters_obj = FILTERS
+        # Separate live prices from closed candle closes
+        self.live_prices = {}
         # For adaptive_grid tests, provide a spot with get_balance
         class _StubSpot:
             def get_balance(self, asset):
                 return 10000.0  # ample USDT
         self.spot = _StubSpot()
 
-    def set(self, symbol, snapshot, close_15m=None, candle=None):
+    def set(self, symbol, snapshot, close_15m=None, candle=None, live_price=_LIVE_PRICE_UNSET):
         # Use current time for fresh candles
         now_ms = int(time.time() * 1000)
         # Add close_time to candle if not present
         if candle is not None and "close_time" not in candle:
             candle = {**candle, "close_time": now_ms}
         self.views[symbol] = CycleView(snapshot, close_15m, candle, candle_15m_time=now_ms if close_15m is not None else None)
+        # Only store live_price if explicitly provided (including None for failure simulation)
+        if live_price is not self._LIVE_PRICE_UNSET:
+            self.live_prices[symbol] = live_price
 
     def snapshot(self, symbol, cfg, now_ms):
         if symbol in self.views:
@@ -66,7 +74,10 @@ class StubMarket:
         return None
 
     def live_price(self, symbol):
-        # Return the indicator close as live price for tests (deterministic)
+        # Return configured live price if explicitly set (including None)
+        if symbol in self.live_prices:
+            return self.live_prices[symbol]
+        # Otherwise fall back to indicator close
         view = self.views.get(symbol)
         if view and view.snapshot.last_close is not None:
             return view.snapshot.last_close
@@ -772,3 +783,103 @@ def test_service_loop_survives_cycle_exceptions(monkeypatch):
         bot_module._service_loop(FlakyBot())
     assert calls["n"] == 2  # the failure did not stop the loop
     assert sleeps == [bot_module.CYCLE_SECONDS, bot_module.CYCLE_SECONDS]
+
+
+def test_live_price_persisted_to_state_separate_from_closed_candle(tmp_path):
+    """TEST 1: state.last_price reflects live ticker price while indicators use closed candle."""
+    bot, store, market = _env(tmp_path)
+    # Configure different values for live price vs closed candle
+    market.set("BTC/USDT", snap_entry(last_close=120.0), close_15m=49000.0, candle=NO_FILL_CANDLE, live_price=123.45)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    # Dashboard/equity price should be live ticker
+    assert st.last_price == 123.45
+    # Indicator snapshot should still use closed candle data
+    assert st.adx == 15.0
+    assert st.rsi == 30.0
+    assert st.percent_b == -0.1
+    assert st.volume_osc == 0.2
+    assert st.zscore == 0.5
+    assert st.atr == 350.0
+
+
+def test_live_price_updates_without_new_closed_candle(tmp_path):
+    """TEST 2: state.last_price changes with live ticker without requiring new closed candle."""
+    bot, store, market = _env(tmp_path)
+    # Cycle 1: ticker = 123.45, closed candle = 120.00
+    market.set("BTC/USDT", snap_entry(last_close=120.0), close_15m=49000.0, candle=NO_FILL_CANDLE, live_price=123.45)
+    bot.run_once()
+    st1 = store.get_symbol("BTC/USDT")
+    assert st1.last_price == 123.45
+    # Cycle 2: ticker = 124.10, SAME closed candle = 120.00
+    market.set("BTC/USDT", snap_entry(last_close=120.0), close_15m=49000.0, candle=NO_FILL_CANDLE, live_price=124.10)
+    bot.run_once()
+    st2 = store.get_symbol("BTC/USDT")
+    # last_price updated to new live ticker
+    assert st2.last_price == 124.10
+    # Indicators unchanged (same closed candle)
+    assert st2.adx == 15.0
+    assert st2.rsi == 30.0
+    assert st2.atr == 350.0
+
+
+def test_dashboard_payload_uses_live_price(tmp_path):
+    """TEST 3: Dashboard build_payload returns live ticker price persisted by bot."""
+    from dashboard import _symbol_payload
+    bot, store, market = _env(tmp_path)
+    market.set("BTC/USDT", snap_entry(last_close=120.0), close_15m=49000.0, candle=NO_FILL_CANDLE, live_price=123.45)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    payload = _symbol_payload(store, st)
+    # Dashboard shows the live ticker price, not closed candle
+    assert payload["last_price"] == 123.45
+
+
+def test_strategy_uses_closed_candle_not_ticker(tmp_path):
+    """TEST 4: Strategy indicators (RSI/ADX/BB/VO/Z-score/ATR) use closed candle, not ticker."""
+    bot, store, market = _env(tmp_path)
+    # Different live price that would change RSI/ADX if used
+    market.set("BTC/USDT", snap_entry(last_close=50000.0, atr=350.0), close_15m=49000.0, candle=NO_FILL_CANDLE, live_price=123.45)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    # Indicators must reflect closed candle values, not the fake live price
+    assert st.last_price == 123.45  # dashboard gets live price
+    assert st.atr == 350.0  # ATR from closed candle
+    assert st.rsi == 30.0   # RSI from closed candle
+    assert st.adx == 15.0   # ADX from closed candle
+    # The strategy decision is based on snap (closed candle), not live price
+    # Verify grid was placed using closed-candle economics (50000 price, 350 ATR)
+    assert st.strategy_state == "ACTIVE"
+    assert st.grid_lower == pytest.approx(48250.0)  # based on 50000 price, not 123.45
+
+
+def test_ticker_failure_does_not_fabricate_live_price(tmp_path):
+    """TEST 5: When live_price() fails, no fabricated price written; fail-safe intact."""
+    bot, store, market = _env(tmp_path)
+    # Set up with no live price available - explicitly set live_price to None
+    # The stub will return None when live_price is explicitly set to None
+    market.set("BTC/USDT", snap_entry(last_close=120.0), close_15m=49000.0, candle=NO_FILL_CANDLE, live_price=None)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    # last_price should NOT be set to the closed candle (120.0) or any fabricated value
+    # It should remain whatever it was before (None on first cycle)
+    assert st.last_price is None
+    # Strategy still works with closed candle
+    assert st.adx == 15.0
+    assert st.rsi == 30.0
+
+
+def test_multiple_symbols_independent_live_prices(tmp_path):
+    """TEST 6: Each configured symbol gets its own live ticker price; no cross-contamination."""
+    bot, store, market = _env(tmp_path)
+    # Configure different live prices for different symbols
+    market.set("BTC/USDT", snap_entry(last_close=50000.0, atr=350.0), close_15m=49000.0, candle=NO_FILL_CANDLE, live_price=50100.0)
+    market.set("ETH/USDT", snap_entry(last_close=3000.0, atr=20.0, symbol="ETH/USDT"), close_15m=2950.0, candle=NO_FILL_CANDLE, live_price=3010.0)
+    bot.run_once()
+    st_btc = store.get_symbol("BTC/USDT")
+    st_eth = store.get_symbol("ETH/USDT")
+    # Each symbol has its own live price
+    assert st_btc.last_price == 50100.0
+    assert st_eth.last_price == 3010.0
+    # No cross-contamination
+    assert st_btc.last_price != st_eth.last_price
