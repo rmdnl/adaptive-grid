@@ -22,6 +22,11 @@ logs/
 # Local tooling scratch
 .pytest-tmp*/
 
+# Operational scripts (read-only, not part of the repo)
+run_dryrun_planner.py
+run_testnet_integration.py
+testnet_integration_report.txt
+
 # Internal AI/autonomous-coding artifacts — local only, not part of the repo
 AGENTS.md
 SKILL.md

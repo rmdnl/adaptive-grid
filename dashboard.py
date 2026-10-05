@@ -40,6 +40,114 @@ KNOWN_STATES = (
     "EXITING", "STOPPED", "KILL_ACTIVE", "ERROR",
 )
 
+# Human-readable labels for technical state/blocker/reason codes
+STATE_LABELS = {
+    "WAITING": "WAITING FOR ENTRY",
+    "ENTRY_BLOCKED": "ENTRY BLOCKED",
+    "GRID_BLOCKED": "GRID BLOCKED",
+    "ACTIVE": "ACTIVE — GRID RUNNING",
+    "COOLDOWN": "COOLDOWN AFTER EXIT",
+    "EXITING": "EXITING — LIQUIDATING",
+    "STOPPED": "STOPPED — MANUAL/BOUNDARY",
+    "KILL_ACTIVE": "KILL SWITCH ACTIVE",
+    "ERROR": "ERROR — INVESTIGATE",
+}
+
+ENTRY_BLOCKER_LABELS = {
+    "exit_priority": "Exit signal takes priority",
+    "rsi_not_low": "RSI above entry threshold",
+    "adx_trending": "ADX indicates trending market",
+    "bb_not_low": "Price not at lower Bollinger Band",
+    "volume_osc_insufficient": "Volume oscillator too low",
+    "zscore_too_high": "Z-score exceeds entry limit",
+    "boundary_breach": "15m candle breached lower boundary",
+    "boundary_unknown": "15m boundary data unavailable",
+    "risk_veto": "Risk engine vetoed entry",
+    "grid_placement_failed": "Grid generation failed",
+    "insufficient_balance": "Insufficient USDT balance",
+    "no_active_symbol_config": "No active symbol configuration",
+    "stale_data": "Market data too old",
+}
+
+EXIT_REASON_LABELS = {
+    "adx_trending": "ADX trending — trend strength confirmed",
+    "rsi_overbought": "RSI overbought — mean reversion likely",
+    "bb_percent_b_max": "Price at upper Bollinger Band",
+    "zscore_abs_max": "Z-score extreme — statistical edge exhausted",
+    "exit_adx_min": "ADX minimum threshold met",
+    "exit_rsi_min": "RSI minimum threshold met",
+    "exit_bb_percent_b_min": "BB %B minimum threshold met",
+    "exit_zscore_abs_max": "Z-score absolute maximum exceeded",
+    "lower_boundary_breach": "15m close breached lower stop boundary",
+    "global_drawdown": "Global equity drawdown limit hit",
+    "risk_engine_veto": "Risk engine vetoed continuation",
+}
+
+BLOCK_REASON_LABELS = {
+    "exit_priority": "Exit signal active — new entry blocked",
+    "rsi_not_low": "RSI not in oversold zone",
+    "adx_trending": "ADX shows trending — no ranging entry",
+    "boundary_unknown": "15m boundary data missing — fail-closed",
+    "boundary_breach": "15m close below lower boundary — STOPPED",
+    "risk_veto": "Risk engine veto",
+    "stale_data": "Market data stale — cannot verify safety",
+    "insufficient_balance": "USDT balance below grid minimum",
+    "grid_placement_failed": "Grid economics failed validation",
+    "unknown": "Unknown blocker — check logs",
+}
+
+RISK_STATUS_LABELS = {
+    "ok": "OK — All risk gates clear",
+    "drawdown_breach": "DRAWDOWN BREACH — Global limit exceeded",
+    "lower_boundary": "15M BOUNDARY BREACH — Price below stop",
+    "stale_data": "STALE DATA — Candle freshness check failed",
+    "spread_wide": "SPREAD WIDE — Liquidity risk detected",
+    "inventory_high": "INVENTORY HIGH — Position limit approached",
+    "unknown": "UNKNOWN RISK STATE — Investigate",
+}
+
+EXECUTION_MODE_LABELS = {
+    "paper": "PAPER TRADING — SIMULATED ONLY",
+    "testnet": "BINANCE TESTNET — REAL ORDERS, TEST FUNDS",
+    "live": "LIVE MAINNET — REAL CAPITAL AT RISK",
+}
+
+BINANCE_ENV_LABELS = {
+    "testnet": "TESTNET ENVIRONMENT",
+    "live": "LIVE MAINNET ENVIRONMENT",
+}
+
+def human_state(state: str) -> str:
+    return STATE_LABELS.get(state, state)
+
+def human_entry_blocker(blocker: Optional[str]) -> str:
+    if not blocker:
+        return "No blocker"
+    return ENTRY_BLOCKER_LABELS.get(blocker, blocker.replace("_", " ").title())
+
+def human_exit_reason(reason: Optional[str]) -> str:
+    if not reason:
+        return "No exit reason"
+    return EXIT_REASON_LABELS.get(reason, reason.replace("_", " ").title())
+
+def human_block_reason(reason: Optional[str]) -> str:
+    if not reason:
+        return "No block reason"
+    return BLOCK_REASON_LABELS.get(reason, reason.replace("_", " ").title())
+
+def human_risk_status(status: str) -> str:
+    return RISK_STATUS_LABELS.get(status, status.replace("_", " ").title())
+
+def human_execution_mode(mode: Optional[str]) -> str:
+    if not mode:
+        return "UNKNOWN"
+    return EXECUTION_MODE_LABELS.get(mode.lower(), mode.upper())
+
+def human_binance_env(env: Optional[str]) -> str:
+    if not env:
+        return "UNKNOWN"
+    return BINANCE_ENV_LABELS.get(env.lower(), env.upper())
+
 
 def _global_payload(store: StateStore) -> Dict:
     equity = store.get_meta_float("equity")
@@ -50,6 +158,7 @@ def _global_payload(store: StateStore) -> Dict:
     if reference is not None and reference > 0 and equity is not None:
         drawdown = (reference - equity) / reference
     binance_env = store.get_meta("mode_binance_env")
+    execution_mode = store.get_meta("mode_execution")
     session = {
         "id": store.get_meta("session_id"),
         "mode": store.get_meta("session_mode"),
@@ -59,7 +168,8 @@ def _global_payload(store: StateStore) -> Dict:
         "initial_cash": store.get_meta_float("session_initial_cash"),
     }
     return {
-        "execution_mode": store.get_meta("mode_execution"),
+        "execution_mode": execution_mode,
+        "execution_mode_human": human_execution_mode(execution_mode),
         "wallet_usdt": store.get_meta_float("wallet_usdt"),
         "session": session,
         "equity": equity,
@@ -76,6 +186,7 @@ def _global_payload(store: StateStore) -> Dict:
         "database": store.database_status(),
         # operating mode, as persisted by the trading runtime itself
         "binance_env": binance_env,
+        "binance_env_human": human_binance_env(binance_env),
     }
 
 
@@ -91,11 +202,15 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "zscore": st.zscore,
         "atr": st.atr,
         "strategy_state": st.strategy_state,
+        "strategy_state_human": human_state(st.strategy_state),
         "entry_status": "blocked" if st.entry_blocker else "allowed",
         "entry_blocker": st.entry_blocker,
+        "entry_blocker_human": human_entry_blocker(st.entry_blocker),
         "block_reason": st.block_reason,
+        "block_reason_human": human_block_reason(st.block_reason),
         "exit_status": "triggered" if st.exit_status else "none",
         "exit_reason": st.exit_reason,
+        "exit_reason_human": human_exit_reason(st.exit_reason),
         "cooldown": st.cooldown_until is not None,
         "cooldown_until": st.cooldown_until,
         "grid_mode": st.grid_mode,
@@ -109,6 +224,7 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "realized_pnl": store.sum_realized_pnl(st.symbol),
         "fees": store.sum_fees(st.symbol),
         "risk_status": st.risk_status,
+        "risk_status_human": human_risk_status(st.risk_status),
         "updated_at": st.updated_at,
     }
     # Adaptive grid parameters (Phase 1) - only include when grid is/was active
@@ -451,7 +567,7 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
   }
   function hr() { var h = document.createElement("div"); h.className = "hr"; return h; }
 
-  function renderGlobal(g) {
+function renderGlobal(g) {
     set("k-equity", fmtNum(g.equity, 2));
     set("k-ref", fmtNum(g.reference_equity, 2));
     set("k-dd", g.drawdown === null || g.drawdown === undefined ? DASH : fmtPctFrac(g.drawdown).replace("+", ""));
@@ -477,9 +593,9 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     setCls("ind-system", "ind " + (g.runtime_status === "KILL_ACTIVE" ? "offline" : online ? "online" : "offline"));
     var env = (g.binance_env || "").toUpperCase();
     var mode = (g.execution_mode || "").toUpperCase();   // PAPER / TESTNET / LIVE
-    set("binance", env || "UNKNOWN");
+    set("binance", g.binance_env_human || env || "UNKNOWN");
     setCls("ind-binance", "ind" + (env === "LIVE" ? " live" : " testnet"));
-    set("execution", mode || "UNKNOWN");
+    set("execution", g.execution_mode_human || mode || "UNKNOWN");
     setCls("ind-exec", "ind" + (mode === "LIVE" ? " live" : mode === "PAPER" ? " paper" : " testnet"));
     set("lastcycle", fmtTs(g.last_cycle_ts));
     // mode-aware capital labels
@@ -491,9 +607,9 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     setCls("s-runtime", "v " + (online ? "ok" : g.runtime_status === "KILL_ACTIVE" ? "danger" : "warn"));
     set("s-db", g.database && g.database.ok ? "OK" : "UNAVAILABLE");
     setCls("s-db", "v " + (g.database && g.database.ok ? "ok" : "danger"));
-    set("s-binance", env || "UNKNOWN");
+    set("s-binance", g.binance_env_human || env || "UNKNOWN");
     setCls("s-binance", "v " + (env === "LIVE" ? "magenta" : "cyan"));
-    set("s-exec", mode || "UNKNOWN");
+    set("s-exec", g.execution_mode_human || mode || "UNKNOWN");
     setCls("s-exec", "v " + (mode === "LIVE" ? "magenta" : mode === "PAPER" ? "warn" : "cyan"));
     var sess = g.session || {};
     set("s-session", sess.id
@@ -530,21 +646,21 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
       var name = document.createElement("span"); name.className = "symname"; name.textContent = s.symbol;
       var badge = document.createElement("span");
       badge.className = "badge " + stateClass(s.strategy_state);
-      badge.textContent = s.strategy_state || DASH;
+      badge.textContent = s.strategy_state_human || s.strategy_state || DASH;
       head.appendChild(name); head.appendChild(badge);
       m.appendChild(head);
 
       var riskOk = s.risk_status === "ok";
-      m.appendChild(kv("STATE", s.strategy_state || DASH));
-      m.appendChild(kv("RISK", riskOk ? "OK" : String(s.risk_status || DASH).toUpperCase(),
+      m.appendChild(kv("STATE", s.strategy_state_human || s.strategy_state || DASH));
+      m.appendChild(kv("RISK", s.risk_status_human || (riskOk ? "OK" : String(s.risk_status || DASH).toUpperCase()),
                       riskOk ? "ok" : "danger"));
       m.appendChild(kv("PRICE", fmtPrice(s.last_price), "cyan"));
       m.appendChild(kv("TIMEFRAME", s.timeframe ? String(s.timeframe).toUpperCase() : DASH));
       m.appendChild(kv("ENTRY", s.entry_status ? String(s.entry_status).toUpperCase() : DASH));
-      m.appendChild(kv("BLOCKER", s.entry_blocker || s.block_reason || DASH,
+      m.appendChild(kv("BLOCKER", s.entry_blocker_human || s.block_reason_human || DASH,
                        (s.entry_blocker || s.block_reason) ? "warn" : ""));
       m.appendChild(kv("EXIT", s.exit_status === "triggered"
-                       ? "TRIGGERED" + (s.exit_reason ? " \\u00b7 " + s.exit_reason : "")
+                       ? "TRIGGERED" + (s.exit_reason_human ? " \u00b7 " + s.exit_reason_human : "")
                        : "NONE", s.exit_status === "triggered" ? "warn" : ""));
       m.appendChild(kv("COOLDOWN", s.cooldown ? "UNTIL " + fmtTs(s.cooldown_until) : "INACTIVE",
                        s.cooldown ? "warn" : ""));
