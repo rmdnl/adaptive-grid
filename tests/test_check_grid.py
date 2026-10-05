@@ -297,6 +297,8 @@ def test_cli_check_grid_is_read_only_and_offline(tmp_path, monkeypatch):
         PAIR_LIST="AAA/USDT",
         BINANCE_TESTNET_API_KEY="tk",
         BINANCE_TESTNET_API_SECRET="ts",
+        ADAPTIVE_GRID="false",
+        TOTAL_GRIDS="5",
         LOWER_PRICE='{"AAA/USDT": 90.0}',
         UPPER_PRICE='{"AAA/USDT": 120.0}',
         TOTAL_QUOTE_BUDGET='{"AAA/USDT": 500.0}',

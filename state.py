@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS symbols (
     cooldown_until REAL,
     grid_mode TEXT, grid_step REAL, grid_lower REAL,
     gross_pct REAL, net_pct REAL,
+    -- Adaptive grid parameters (Phase 1): locked when grid becomes active
+    adaptive_lower_price REAL, adaptive_upper_price REAL,
+    adaptive_total_grids INTEGER, adaptive_quote_budget REAL,
+    adaptive_grid_step REAL, adaptive_reference_price REAL,
+    adaptive_timeframe TEXT,
     inventory_qty REAL DEFAULT 0, avg_cost REAL DEFAULT 0,
     risk_status TEXT DEFAULT 'ok',
     updated_at REAL DEFAULT 0
@@ -74,15 +79,20 @@ _SYMBOL_COLUMNS = {
     "timeframe", "last_price", "adx", "rsi", "percent_b", "volume_osc",
     "zscore", "atr", "strategy_state", "entry_blocker", "block_reason",
     "exit_status", "exit_reason", "cooldown_until", "grid_mode", "grid_step",
-    "grid_lower", "gross_pct", "net_pct", "inventory_qty", "avg_cost",
-    "risk_status",
+    "grid_lower", "gross_pct", "net_pct",
+    # Adaptive grid parameters (Phase 1): locked when grid becomes active
+    "adaptive_lower_price", "adaptive_upper_price", "adaptive_total_grids",
+    "adaptive_quote_budget", "adaptive_grid_step", "adaptive_reference_price",
+    "adaptive_timeframe",
+    "inventory_qty", "avg_cost", "risk_status",
 }
 
 OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
 
 # orders.child_sell_qty tracks how much executed BUY quantity has already
 # been converted into child SELL orders (prevents duplicate child sells).
-SCHEMA_VERSION = 3
+# Schema v4 adds adaptive grid parameters for automatic grid range/count/budget.
+SCHEMA_VERSION = 4
 
 # Inventory dust below this absolute quantity is zeroed after a SELL.
 _INVENTORY_DUST = 1e-12
@@ -110,6 +120,14 @@ class SymbolState:
     grid_lower: Optional[float] = None
     gross_pct: Optional[float] = None
     net_pct: Optional[float] = None
+    # Adaptive grid parameters (Phase 1): locked when grid becomes active
+    adaptive_lower_price: Optional[float] = None
+    adaptive_upper_price: Optional[float] = None
+    adaptive_total_grids: Optional[int] = None
+    adaptive_quote_budget: Optional[float] = None
+    adaptive_grid_step: Optional[float] = None
+    adaptive_reference_price: Optional[float] = None
+    adaptive_timeframe: Optional[str] = None
     inventory_qty: float = 0.0
     avg_cost: float = 0.0
     risk_status: str = "ok"
@@ -141,7 +159,8 @@ class StateStore:
         rebuild schema; version 2 adds orders.child_sell_qty for
         duplicate-free child-sell conversion; version 3 adds fill
         provenance columns (quote_qty, commission_asset, client_order_id,
-        exchange_order_id). Idempotent."""
+        exchange_order_id); version 4 adds adaptive grid parameters for
+        automatic grid range/count/budget. Idempotent."""
         conn = self._connect()
         try:
             row = conn.execute(
@@ -170,6 +189,22 @@ class StateStore:
                 ):
                     if column not in cols:
                         conn.execute(f"ALTER TABLE fills ADD COLUMN {column} {decl}")
+            if version < 4:
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(symbols)").fetchall()
+                }
+                for column, decl in (
+                    ("adaptive_lower_price", "REAL"),
+                    ("adaptive_upper_price", "REAL"),
+                    ("adaptive_total_grids", "INTEGER"),
+                    ("adaptive_quote_budget", "REAL"),
+                    ("adaptive_grid_step", "REAL"),
+                    ("adaptive_reference_price", "REAL"),
+                    ("adaptive_timeframe", "TEXT"),
+                ):
+                    if column not in cols:
+                        conn.execute(f"ALTER TABLE symbols ADD COLUMN {column} {decl}")
             if version < SCHEMA_VERSION:
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('schema_version', ?) "

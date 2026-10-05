@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+import adaptive_grid
 import grid as grid_mod
 import indicators
 import strategy as strategy_mod
@@ -348,9 +349,12 @@ class Bot:
         if self._is_active(symbol, st):
             # 15m lower-boundary gate: independent of exit evaluation,
             # based on the latest CLOSED 15m candle close against the
-            # configured LOWER_PRICE (not the dynamic grid_lower).
+            # active adaptive LOWER_PRICE (locked when grid became active).
+            # Fall back to configured LOWER_PRICE for legacy static grids.
+            adaptive_lower = st.adaptive_lower_price
             configured_lower = self.cfg.lower_price.get(symbol) if hasattr(self.cfg, "lower_price") else None
-            boundary = self.risk.boundary_status(close_15m_for_boundary, configured_lower)
+            effective_lower = adaptive_lower if adaptive_lower is not None else configured_lower
+            boundary = self.risk.boundary_status(close_15m_for_boundary, effective_lower)
             if boundary == BREACH:
                 self.store.update_symbol(symbol, exit_status=1, exit_reason="lower_boundary_breach")
                 self._exit_symbol(symbol, "lower_boundary_breach", now, cooldown=False)
@@ -383,22 +387,34 @@ class Bot:
             return
 
         # No active grid: entry path (exit conditions take priority).
-        # 15m lower-boundary protection applies even without an active grid (Phase 3).
-        configured_lower = self.cfg.lower_price.get(symbol) if hasattr(self.cfg, "lower_price") else None
-        boundary = self.risk.boundary_status(close_15m_for_boundary, configured_lower)
-        if boundary == BREACH:
-            self.store.update_symbol(symbol, exit_status=1, exit_reason="lower_boundary_breach")
-            self.risk.stop_symbol(symbol, "lower_boundary_breach")
-            self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
-            log.warning("lower boundary breach for %s (no active grid) — symbol STOPPED", symbol)
-            return
-        if boundary == UNKNOWN:
-            log.warning(
-                "boundary status UNKNOWN for %s (no active grid) — no entry this cycle (fail-closed)",
-                symbol,
-            )
-            self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="boundary_unknown")
-            return
+        # 15m lower-boundary protection applies when a configured LOWER_PRICE exists
+        # (static mode) or when an adaptive grid was previously active (restart recovery).
+        # In pure adaptive mode with no prior grid, there's no boundary to check yet.
+        if self.cfg.adaptive_grid:
+            # Adaptive mode: no static LOWER_PRICE configured.
+            # If we have a persisted adaptive_lower_price from a previous grid,
+            # use it for boundary protection (restart with active grid handled by _is_active).
+            # Otherwise, no boundary check on entry.
+            effective_lower = st.adaptive_lower_price if hasattr(st, "adaptive_lower_price") else None
+        else:
+            # Static mode: use configured LOWER_PRICE
+            effective_lower = self.cfg.lower_price.get(symbol) if hasattr(self.cfg, "lower_price") else None
+
+        if effective_lower is not None:
+            boundary = self.risk.boundary_status(close_15m_for_boundary, effective_lower)
+            if boundary == BREACH:
+                self.store.update_symbol(symbol, exit_status=1, exit_reason="lower_boundary_breach")
+                self.risk.stop_symbol(symbol, "lower_boundary_breach")
+                self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
+                log.warning("lower boundary breach for %s (no active grid) — symbol STOPPED", symbol)
+                return
+            if boundary == UNKNOWN:
+                log.warning(
+                    "boundary status UNKNOWN for %s (no active grid) — no entry this cycle (fail-closed)",
+                    symbol,
+                )
+                self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="boundary_unknown")
+                return
 
         if entry_decision.allowed:
             veto = self.risk.order_veto(symbol)
@@ -407,40 +423,114 @@ class Bot:
                 return
             filters = self.market.filters(symbol)
             reference = self.market.avg_price(symbol)
-            plan = grid_mod.build_grid(
-                symbol,
-                self.cfg.grid_mode(symbol),
-                snap.last_close,
-                snap.atr,
-                filters,
-                self.cfg,
-                reference_price=reference,
-            )
-            if not plan.executable:
+
+            # Adaptive grid planning (Phase 1) or static grid from config
+            if self.cfg.adaptive_grid:
+                # Fetch available USDT balance for quote budget calculation
+                try:
+                    available_usdt = self.market.spot.get_balance("USDT")
+                except ExchangeError as exc:
+                    log.warning("USDT balance unavailable for %s: %s", symbol, exc)
+                    self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="balance_unavailable")
+                    return
+                if available_usdt is None or available_usdt <= 0:
+                    self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="insufficient_balance")
+                    return
+
+                # Compute adaptive grid plan
+                try:
+                    adaptive_plan = adaptive_grid.AdaptiveGridPlanner.plan(
+                        symbol=symbol,
+                        current_price=snap.last_close,
+                        atr=snap.atr,
+                        cfg=self.cfg,
+                        filters=filters,
+                        reference_price=reference,
+                        available_usdt=available_usdt,
+                    )
+                except ValueError as exc:
+                    log.info("adaptive grid blocked for %s: %s", symbol, exc)
+                    self.store.set_symbol_state(
+                        symbol,
+                        "GRID_BLOCKED",
+                        entry_blocker=None,
+                        block_reason=f"adaptive_grid_failed: {exc}",
+                        grid_mode=self.cfg.grid_mode(symbol),
+                    )
+                    return
+
+                # Convert to GridPlan for placement
+                plan = grid_mod.GridPlan(
+                    symbol=symbol,
+                    mode=adaptive_plan.mode,
+                    step=adaptive_plan.step,
+                    levels=adaptive_plan.levels,
+                    lower_price=adaptive_plan.lower_price,
+                    upper_price=adaptive_plan.upper_price,
+                    gross_pct=adaptive_plan.gross_pct,
+                    net_pct=adaptive_plan.net_pct,
+                    executable=True,
+                    block_reason=None,
+                )
+
+                # Place grid and persist adaptive parameters
+                self._place_grid(symbol, plan)
+                self.store.update_symbol(
+                    symbol,
+                    strategy_state="ACTIVE",
+                    entry_blocker=None,
+                    block_reason=None,
+                    grid_mode=plan.mode,
+                    grid_step=plan.step,
+                    grid_lower=plan.lower_price,
+                    gross_pct=plan.gross_pct,
+                    net_pct=plan.net_pct,
+                    # Persist adaptive parameters (locked for active grid)
+                    adaptive_lower_price=adaptive_plan.lower_price,
+                    adaptive_upper_price=adaptive_plan.upper_price,
+                    adaptive_total_grids=adaptive_plan.total_grids,
+                    adaptive_quote_budget=adaptive_plan.quote_budget,
+                    adaptive_grid_step=adaptive_plan.step,
+                    adaptive_reference_price=adaptive_plan.reference_price,
+                    adaptive_timeframe=self.cfg.indicator_timeframe,
+                )
+                return
+            else:
+                # Static grid from config (legacy mode)
+                plan = grid_mod.build_grid(
+                    symbol,
+                    self.cfg.grid_mode(symbol),
+                    snap.last_close,
+                    snap.atr,
+                    filters,
+                    self.cfg,
+                    reference_price=reference,
+                )
+                if not plan.executable:
+                    self.store.set_symbol_state(
+                        symbol,
+                        "GRID_BLOCKED",
+                        entry_blocker=None,
+                        block_reason=plan.block_reason,
+                        grid_mode=self.cfg.grid_mode(symbol),
+                        gross_pct=plan.gross_pct,
+                        net_pct=plan.net_pct,
+                    )
+                    log.info("grid blocked for %s: %s", symbol, plan.block_reason)
+                    return
+                self._place_grid(symbol, plan)
                 self.store.set_symbol_state(
                     symbol,
-                    "GRID_BLOCKED",
+                    "ACTIVE",
                     entry_blocker=None,
-                    block_reason=plan.block_reason,
-                    grid_mode=self.cfg.grid_mode(symbol),
+                    block_reason=None,
+                    grid_mode=plan.mode,
+                    grid_step=plan.step,
+                    grid_lower=plan.lower_price,
                     gross_pct=plan.gross_pct,
                     net_pct=plan.net_pct,
                 )
-                log.info("grid blocked for %s: %s", symbol, plan.block_reason)
                 return
-            self._place_grid(symbol, plan)
-            self.store.set_symbol_state(
-                symbol,
-                "ACTIVE",
-                entry_blocker=None,
-                block_reason=None,
-                grid_mode=plan.mode,
-                grid_step=plan.step,
-                grid_lower=plan.lower_price,
-                gross_pct=plan.gross_pct,
-                net_pct=plan.net_pct,
-            )
-            return
 
         state = "WAITING" if entry_decision.blocker == "insufficient_data" else "ENTRY_BLOCKED"
         self.store.set_symbol_state(

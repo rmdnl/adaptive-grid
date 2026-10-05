@@ -105,7 +105,20 @@ class Config:
     # Market data freshness (Phase 7 hardening)
     max_market_data_age_seconds: float
 
-    # Grid range and budget (per-symbol, JSON maps symbol -> value)
+    # Adaptive Spot Grid (Phase 1: automatic grid parameters)
+    # When true (default), LOWER_PRICE, UPPER_PRICE, TOTAL_GRIDS, TOTAL_QUOTE_BUDGET
+    # are computed automatically and need not be configured.
+    adaptive_grid: bool
+    # Minimum and maximum candidate grid counts for automatic selection.
+    min_grids: int
+    max_grids: int
+    # Reserve % of available USDT that must not be allocated.
+    quote_reserve_percent: float
+    # Maximum % of available USDT (after reserve) that can be allocated across all symbols.
+    max_quote_allocation_percent: float
+
+    # Grid range and budget (per-symbol, JSON maps symbol -> value).
+    # OPTIONAL when adaptive_grid=true. Required when adaptive_grid=false.
     lower_price: Dict[str, float]
     upper_price: Dict[str, float]
     total_grids: int
@@ -179,10 +192,18 @@ def _get_str(env: dict, key: str, default: Optional[str], errors: list) -> Optio
     return str(env[key]).strip()
 
 
-def _get_int(env: dict, key: str, minimum: Optional[int], errors: list) -> Optional[int]:
+def _get_int(
+    env: dict,
+    key: str,
+    minimum: Optional[int],
+    errors: list,
+    default: Optional[int] = None,
+) -> Optional[int]:
     if _missing(env, key):
-        errors.append(f"missing required key: {key}")
-        return None
+        if default is None:
+            errors.append(f"missing required key: {key}")
+            return None
+        return default
     try:
         val = int(str(env[key]).strip())
     except ValueError:
@@ -336,43 +357,60 @@ def load_config(env_file: str = ".env") -> Config:
     # 0 (or absent) = derive the session capital from the testnet USDT balance.
     start_equity = _get_float(env, "START_EQUITY", default=0.0, minimum=0.0, maximum=None, errors=errors)
 
-    # Grid range and budget configuration (Phase 1 hardening)
-    lower_price_raw = _get_str(env, "LOWER_PRICE", default=None, errors=errors)
+    # Adaptive Spot Grid configuration
+    # When adaptive_grid=true (default), LOWER_PRICE, UPPER_PRICE, TOTAL_GRIDS,
+    # TOTAL_QUOTE_BUDGET are computed automatically and need not be configured.
+    adaptive_grid = _get_bool(env, "ADAPTIVE_GRID", default=True, errors=errors)
+    min_grids = _get_int(env, "MIN_GRIDS", minimum=1, errors=errors, default=3)
+    max_grids = _get_int(env, "MAX_GRIDS", minimum=1, errors=errors, default=12)
+    if min_grids is not None and max_grids is not None and min_grids > max_grids:
+        errors.append("MIN_GRIDS must be <= MAX_GRIDS")
+    quote_reserve_percent = _get_float(env, "QUOTE_RESERVE_PERCENT", minimum=0.0, maximum=100.0, errors=errors, default=20.0)
+    max_quote_allocation_percent = _get_float(env, "MAX_QUOTE_ALLOCATION_PERCENT", minimum=0.0, maximum=100.0, errors=errors, default=80.0)
+
+    # Grid range and budget configuration (OPTIONAL when adaptive_grid=true)
+    # Only parse and validate these when adaptive_grid=false
     lower_price: Dict[str, float] = {}
-    if lower_price_raw is not None:
-        lower_price = _parse_json_map(lower_price_raw, "LOWER_PRICE", errors)
-
-    upper_price_raw = _get_str(env, "UPPER_PRICE", default=None, errors=errors)
     upper_price: Dict[str, float] = {}
-    if upper_price_raw is not None:
-        upper_price = _parse_json_map(upper_price_raw, "UPPER_PRICE", errors)
-
-    total_grids = _get_int(env, "TOTAL_GRIDS", minimum=1, errors=errors)
-    if total_grids is None:
-        errors.append("TOTAL_GRIDS must be explicitly configured (no fallback)")
-
-    total_quote_budget_raw = _get_str(env, "TOTAL_QUOTE_BUDGET", default=None, errors=errors)
+    total_grids: Optional[int] = None
     total_quote_budget: Dict[str, float] = {}
-    if total_quote_budget_raw is not None:
-        total_quote_budget = _parse_json_map(total_quote_budget_raw, "TOTAL_QUOTE_BUDGET", errors)
+
+    if adaptive_grid is False:
+        lower_price_raw = _get_str(env, "LOWER_PRICE", default=None, errors=errors)
+        if lower_price_raw is not None:
+            lower_price = _parse_json_map(lower_price_raw, "LOWER_PRICE", errors)
+
+        upper_price_raw = _get_str(env, "UPPER_PRICE", default=None, errors=errors)
+        if upper_price_raw is not None:
+            upper_price = _parse_json_map(upper_price_raw, "UPPER_PRICE", errors)
+
+        total_grids = _get_int(env, "TOTAL_GRIDS", minimum=1, errors=errors)
+        if total_grids is None:
+            errors.append("TOTAL_GRIDS must be explicitly configured when ADAPTIVE_GRID=false")
+
+        total_quote_budget_raw = _get_str(env, "TOTAL_QUOTE_BUDGET", default=None, errors=errors)
+        if total_quote_budget_raw is not None:
+            total_quote_budget = _parse_json_map(total_quote_budget_raw, "TOTAL_QUOTE_BUDGET", errors)
 
     # Validate per-symbol grid range and budget configuration
-    for symbol in pair_list:
-        if symbol not in lower_price:
-            errors.append(f"LOWER_PRICE must be configured for all symbols in PAIR_LIST: missing {symbol}")
-        elif lower_price[symbol] <= 0:
-            errors.append(f"LOWER_PRICE for {symbol} must be > 0, got {lower_price[symbol]}")
-        if symbol not in upper_price:
-            errors.append(f"UPPER_PRICE must be configured for all symbols in PAIR_LIST: missing {symbol}")
-        elif upper_price[symbol] <= 0:
-            errors.append(f"UPPER_PRICE for {symbol} must be > 0, got {upper_price[symbol]}")
-        if symbol in lower_price and symbol in upper_price:
-            if lower_price[symbol] >= upper_price[symbol]:
-                errors.append(f"LOWER_PRICE for {symbol} ({lower_price[symbol]}) must be < UPPER_PRICE ({upper_price[symbol]})")
-        if symbol not in total_quote_budget:
-            errors.append(f"TOTAL_QUOTE_BUDGET must be configured for all symbols in PAIR_LIST: missing {symbol}")
-        elif total_quote_budget[symbol] <= 0:
-            errors.append(f"TOTAL_QUOTE_BUDGET for {symbol} must be > 0, got {total_quote_budget[symbol]}")
+    # Only required when adaptive_grid=false
+    if adaptive_grid is False:
+        for symbol in pair_list:
+            if symbol not in lower_price:
+                errors.append(f"LOWER_PRICE must be configured for all symbols in PAIR_LIST: missing {symbol}")
+            elif lower_price[symbol] <= 0:
+                errors.append(f"LOWER_PRICE for {symbol} must be > 0, got {lower_price[symbol]}")
+            if symbol not in upper_price:
+                errors.append(f"UPPER_PRICE must be configured for all symbols in PAIR_LIST: missing {symbol}")
+            elif upper_price[symbol] <= 0:
+                errors.append(f"UPPER_PRICE for {symbol} must be > 0, got {upper_price[symbol]}")
+            if symbol in lower_price and symbol in upper_price:
+                if lower_price[symbol] >= upper_price[symbol]:
+                    errors.append(f"LOWER_PRICE for {symbol} ({lower_price[symbol]}) must be < UPPER_PRICE ({upper_price[symbol]})")
+            if symbol not in total_quote_budget:
+                errors.append(f"TOTAL_QUOTE_BUDGET must be configured for all symbols in PAIR_LIST: missing {symbol}")
+            elif total_quote_budget[symbol] <= 0:
+                errors.append(f"TOTAL_QUOTE_BUDGET for {symbol} must be > 0, got {total_quote_budget[symbol]}")
 
     # Phase 9: Additional validation for invalid combinations
     # 1. Validate that max_market_data_age_seconds is not too small for the indicator timeframe
@@ -390,22 +428,23 @@ def load_config(env_file: str = ".env") -> Config:
             )
 
     # 2. Validate that grid range can accommodate TOTAL_GRIDS levels
-    #    Using a conservative minimum step of 0.1% of price
-    for symbol in pair_list:
-        if symbol in lower_price and symbol in upper_price:
-            price_range = upper_price[symbol] - lower_price[symbol]
-            if price_range <= 0:
-                continue
-            # Minimum step needed for total_grids levels
-            min_step = price_range / total_grids
-            # The grid step is derived from ATR, but we can at least validate
-            # that the range is not absurdly small
-            if price_range / upper_price[symbol] < 0.001:  # less than 0.1% range
-                errors.append(
-                    f"Grid range for {symbol} too small: "
-                    f"UPPER_PRICE ({upper_price[symbol]}) - LOWER_PRICE ({lower_price[symbol]}) "
-                    f"= {price_range} ({price_range/upper_price[symbol]*100:.3f}% of price)"
-                )
+    #    Only when static grid parameters are provided (adaptive_grid=false or manually configured)
+    if total_grids is not None:
+        for symbol in pair_list:
+            if symbol in lower_price and symbol in upper_price:
+                price_range = upper_price[symbol] - lower_price[symbol]
+                if price_range <= 0:
+                    continue
+                # Minimum step needed for total_grids levels
+                min_step = price_range / total_grids
+                # The grid step is derived from ATR, but we can at least validate
+                # that the range is not absurdly small
+                if price_range / upper_price[symbol] < 0.001:  # less than 0.1% range
+                    errors.append(
+                        f"Grid range for {symbol} too small: "
+                        f"UPPER_PRICE ({upper_price[symbol]}) - LOWER_PRICE ({lower_price[symbol]}) "
+                        f"= {price_range} ({price_range/upper_price[symbol]*100:.3f}% of price)"
+                    )
 
     # 3. Validate TOTAL_QUOTE_BUDGET is sufficient for minimum notional
     #    (at least min_notional * TOTAL_GRIDS per symbol).
@@ -420,18 +459,19 @@ def load_config(env_file: str = ".env") -> Config:
             errors.append("GRID_STEP_ATR_MULTIPLIER should not exceed 10.0 (excessive step)")
 
     # 5. Validate that the budget is not excessive relative to the grid range
-    #    (prevents accidental misconfiguration like 100000 USDT budget for 100 USDT range)
-    for symbol in pair_list:
-        if symbol in total_quote_budget and symbol in lower_price and symbol in upper_price:
-            budget = total_quote_budget[symbol]
-            price_range = upper_price[symbol] - lower_price[symbol]
-            if price_range > 0:
-                budget_pct_of_range = budget / (upper_price[symbol] * total_grids)
-                if budget_pct_of_range > 10.0:  # budget > 10x notional per grid
-                    errors.append(
-                        f"TOTAL_QUOTE_BUDGET for {symbol} ({budget}) appears excessive "
-                        f"relative to grid range ({price_range}) and {total_grids} grids"
-                    )
+    #    Only when static grid parameters are provided
+    if total_grids is not None:
+        for symbol in pair_list:
+            if symbol in total_quote_budget and symbol in lower_price and symbol in upper_price:
+                budget = total_quote_budget[symbol]
+                price_range = upper_price[symbol] - lower_price[symbol]
+                if price_range > 0:
+                    budget_pct_of_range = budget / (upper_price[symbol] * total_grids)
+                    if budget_pct_of_range > 10.0:  # budget > 10x notional per grid
+                        errors.append(
+                            f"TOTAL_QUOTE_BUDGET for {symbol} ({budget}) appears excessive "
+                            f"relative to grid range ({price_range}) and {total_grids} grids"
+                        )
 
     execution_mode = _get_str(env, "EXECUTION_MODE", default="paper", errors=errors)
     if execution_mode is not None and execution_mode not in ALLOWED_EXECUTION_MODES:
@@ -519,6 +559,11 @@ def load_config(env_file: str = ".env") -> Config:
         cooldown_hours=cooldown_hours,
         start_equity=start_equity,
         max_market_data_age_seconds=max_market_data_age_seconds,
+        adaptive_grid=bool(adaptive_grid),
+        min_grids=min_grids,
+        max_grids=max_grids,
+        quote_reserve_percent=quote_reserve_percent,
+        max_quote_allocation_percent=max_quote_allocation_percent,
         lower_price=lower_price,
         upper_price=upper_price,
         total_grids=total_grids,

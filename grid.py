@@ -62,6 +62,7 @@ class GridPlan:
     step: float
     levels: List[GridLevel] = field(default_factory=list)
     lower_price: Optional[float] = None
+    upper_price: Optional[float] = None
     gross_pct: float = 0.0   # worst-level executable gross (fraction)
     net_pct: float = 0.0     # worst-level executable net (fraction)
     dropped_levels: int = 0   # levels dropped for PERCENT_PRICE_BY_SIDE
@@ -160,6 +161,9 @@ def build_grid(
     filters: ExchangeFilters,
     cfg,
     reference_price: Optional[float] = None,
+    lower_override: Optional[float] = None,
+    upper_override: Optional[float] = None,
+    total_grids_override: Optional[int] = None,
 ) -> GridPlan:
     """Build the grid plan. `reference_price` is the exchange's weighted-
     average price (PERCENT_PRICE_BY_SIDE reference); when the symbol
@@ -167,6 +171,10 @@ def build_grid(
     dropped (or the grid is blocked when no level can be placed).
 
     Enforces configured LOWER_PRICE / UPPER_PRICE bounds and TOTAL_GRIDS limit.
+
+    Override parameters (lower_override, upper_override, total_grids_override)
+    are used by the adaptive planner to test candidate grid configurations.
+    When provided, they take precedence over config values.
     """
     if mode not in ("arithmetic", "geometric"):
         return _blocked(symbol, mode, 0.0, "invalid_mode")
@@ -180,8 +188,13 @@ def build_grid(
         return _blocked(symbol, mode, 0.0, "reference_price_unavailable")
 
     # Hard configured range bounds (Phase 3).
-    lower_bound = cfg.lower_price.get(symbol) if hasattr(cfg, "lower_price") else None
-    upper_bound = cfg.upper_price.get(symbol) if hasattr(cfg, "upper_price") else None
+    # Overrides (from adaptive planner) take precedence over config.
+    lower_bound = lower_override if lower_override is not None else (
+        cfg.lower_price.get(symbol) if hasattr(cfg, "lower_price") else None
+    )
+    upper_bound = upper_override if upper_override is not None else (
+        cfg.upper_price.get(symbol) if hasattr(cfg, "upper_price") else None
+    )
 
     # Current market price must be inside the configured range.
     if lower_bound is not None and price < lower_bound:
@@ -198,7 +211,8 @@ def build_grid(
 
     # TOTAL_GRIDS is the authoritative production limit (Phase 1).
     # Config validation enforces TOTAL_GRIDS as mandatory; no fallback.
-    total_grids = cfg.total_grids
+    # Override (from adaptive planner) takes precedence.
+    total_grids = total_grids_override if total_grids_override is not None else cfg.total_grids
 
     levels: List[GridLevel] = []
     dropped_levels = 0
@@ -312,6 +326,7 @@ def build_grid(
         step=step,
         levels=levels,
         lower_price=min(lvl.buy_price for lvl in levels),
+        upper_price=max(lvl.sell_price for lvl in levels),
         gross_pct=worst.gross_pct,
         net_pct=worst.net_pct,
         dropped_levels=dropped_levels,

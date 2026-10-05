@@ -94,6 +94,12 @@ def make_config(**overrides) -> Config:
         cooldown_hours=3.0,
         start_equity=1000.0,
         max_market_data_age_seconds=21600.0,
+        # Adaptive grid parameters - default to FALSE for backward compatibility tests
+        adaptive_grid=False,
+        min_grids=3,
+        max_grids=12,
+        quote_reserve_percent=20.0,
+        max_quote_allocation_percent=80.0,
         lower_price={"BTC/USDT": 48000.0, "ETH/USDT": 2800.0, "SOL/USDT": 80.0, "BNB/USDT": 480.0},
         upper_price={"BTC/USDT": 70000.0, "ETH/USDT": 4000.0, "SOL/USDT": 200.0, "BNB/USDT": 700.0},
         total_grids=5,

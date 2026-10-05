@@ -80,7 +80,7 @@ def _global_payload(store: StateStore) -> Dict:
 
 
 def _symbol_payload(store: StateStore, st) -> Dict:
-    return {
+    payload = {
         "symbol": st.symbol,
         "timeframe": st.timeframe,
         "last_price": st.last_price,
@@ -111,6 +111,22 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "risk_status": st.risk_status,
         "updated_at": st.updated_at,
     }
+    # Adaptive grid parameters (Phase 1) - only include when grid is/was active
+    if st.adaptive_lower_price is not None:
+        payload["adaptive_lower_price"] = st.adaptive_lower_price
+    if st.adaptive_upper_price is not None:
+        payload["adaptive_upper_price"] = st.adaptive_upper_price
+    if st.adaptive_total_grids is not None:
+        payload["adaptive_total_grids"] = st.adaptive_total_grids
+    if st.adaptive_quote_budget is not None:
+        payload["adaptive_quote_budget"] = st.adaptive_quote_budget
+    if st.adaptive_grid_step is not None:
+        payload["adaptive_grid_step"] = st.adaptive_grid_step
+    if st.adaptive_reference_price is not None:
+        payload["adaptive_reference_price"] = st.adaptive_reference_price
+    if st.adaptive_timeframe is not None:
+        payload["adaptive_timeframe"] = st.adaptive_timeframe
+    return payload
 
 
 def _active_symbol_payloads(store: StateStore) -> Tuple[List[Dict], Optional[List[str]]]:
