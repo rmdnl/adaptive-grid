@@ -9,6 +9,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.zcode/
 
 # Runtime state (SQLite) and logs
 *.db
