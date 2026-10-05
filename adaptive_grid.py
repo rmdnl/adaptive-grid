@@ -183,10 +183,13 @@ class AdaptiveGridPlanner:
                         lvl.buy_price * lvl.qty for lvl in plan.levels
                     )
                     if total_buy_notional <= per_symbol_budget:
+                        if not plan.levels:
+                            # Candidate produced zero executable levels - reject
+                            continue
                         best_plan = plan
-                        best_count = candidate_count
-                        best_lower = quantized_lower
-                        best_upper = quantized_upper
+                        best_count = len(plan.levels)
+                        best_lower = min(lvl.buy_price for lvl in plan.levels)
+                        best_upper = max(lvl.sell_price for lvl in plan.levels)
                         break  # highest passing count found
             except Exception:
                 # Any error in grid building -> try next candidate

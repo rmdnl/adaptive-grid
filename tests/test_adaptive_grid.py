@@ -41,6 +41,7 @@ class TestAdaptiveGridPlanner:
 
     def make_filters(self, tick=0.01, step=0.00001, min_notional=10.0,
                      max_notional=None, min_qty=0.0, max_qty=None,
+                     max_price=None,
                      bid_up=None, bid_down=None, ask_up=None, ask_down=None,
                      avg_price_mins=None) -> ExchangeFilters:
         """Build exchange filters with optional overrides."""
@@ -50,6 +51,8 @@ class TestAdaptiveGridPlanner:
             min_notional=min_notional,
             min_qty=min_qty,
             max_notional=max_notional,
+            max_qty=max_qty,
+            max_price=max_price,
             apply_min_to_market=False,
             apply_max_to_market=False,
             bid_multiplier_up=bid_up,
@@ -121,7 +124,11 @@ class TestAdaptiveGridPlanner:
             AdaptiveGridPlanner.plan("BTC/USDT", 50000.0, 350.0, cfg, filters, 0.0, 10000.0)
 
     def test_automatic_range_calculation(self):
-        """Lower and upper prices computed automatically from ATR."""
+        """Lower and upper prices computed automatically from ATR.
+        
+        The returned bounds must describe the ACTUAL executable grid levels,
+        not the candidate bounds before filter validation.
+        """
         cfg = self.make_cfg()
         filters = self.make_filters()
         plan = AdaptiveGridPlanner.plan(
@@ -133,12 +140,18 @@ class TestAdaptiveGridPlanner:
             reference_price=50000.0,
             available_usdt=10000.0,
         )
-        # Range should be symmetric around current_price
-        assert plan.lower_price < 50000.0
-        assert plan.upper_price > 50000.0
+        # Actual executable bounds
+        assert plan.lower_price < plan.reference_price
+        assert plan.upper_price <= plan.reference_price
+        # Bounds must correspond to actual executable levels
+        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
         # Bounds should be quantized to tick_size (0.01)
         assert plan.lower_price == pytest.approx(round(plan.lower_price, 2))
         assert plan.upper_price == pytest.approx(round(plan.upper_price, 2))
+        # Internal consistency
+        assert plan.total_grids == len(plan.levels)
+        assert plan.total_grids > 0
 
     def test_automatic_grid_count_selection(self):
         """Grid count selected automatically within min/max bounds."""
@@ -383,6 +396,197 @@ class TestAdaptiveGridPlanner:
         # Should use actual min_notional from filters, not hardcoded 10
         for lvl in plan.levels:
             assert lvl.buy_price * lvl.qty >= 100.0 - 1e-9
+
+    def test_adaptive_plan_reports_actual_executable_grid(self):
+        """AdaptiveGridPlan must report actual executable grid, not candidate bounds.
+        
+        NEAR-style scenario: candidate 12 grids, PERCENT_PRICE_BY_SIDE drops 8 levels,
+        leaving 4 executable. Returned plan must reflect the 4 executable levels.
+        """
+        cfg = self.make_cfg(
+            grid_step_atr_multiplier=1.0,
+            min_grids=3,
+            max_grids=12,
+        )
+        # NEAR-like filters: PERCENT_PRICE_BY_SIDE with tight bid_down (0.5)
+        # reference=4.87, bid_down=0.5 -> min buy = 2.435
+        # This will drop lower candidate levels below this threshold
+        filters = self.make_filters(
+            tick=0.001,
+            step=0.1,
+            min_notional=5.0,
+            min_qty=0.1,
+            max_price=1000.0,
+            max_qty=900000.0,
+            max_notional=9000000.0,
+            bid_up=1.2,
+            bid_down=0.5,
+            ask_up=2.0,
+            ask_down=0.8,
+            avg_price_mins=5,
+        )
+        plan = AdaptiveGridPlanner.plan(
+            symbol="NEAR/USDT",
+            current_price=4.869,
+            atr=0.254,
+            cfg=cfg,
+            filters=filters,
+            reference_price=4.87,
+            available_usdt=400000.0,
+        )
+        # Candidate was 12, but executable is 4
+        assert plan.total_grids == 4
+        assert len(plan.levels) == 4
+        assert plan.total_grids == len(plan.levels)
+        # Bounds must be actual executable bounds
+        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
+        # Economics must be based on actual executable levels
+        worst_net = min(lvl.net_pct for lvl in plan.levels)
+        assert plan.net_pct == pytest.approx(worst_net)
+        worst_gross = min(lvl.gross_pct for lvl in plan.levels)
+        assert plan.gross_pct == pytest.approx(worst_gross)
+
+    def test_adaptive_plan_no_levels_dropped_when_filters_allow(self):
+        """BNB-style: candidate 12 = actual 12 when no levels dropped."""
+        cfg = self.make_cfg(
+            grid_step_atr_multiplier=1.0,
+            min_grids=3,
+            max_grids=12,
+        )
+        # BNB-like filters: wide PERCENT_PRICE_BY_SIDE range, all levels pass
+        filters = self.make_filters(
+            tick=0.01,
+            step=0.001,
+            min_notional=5.0,
+            min_qty=0.001,
+            max_price=100000.0,
+            max_qty=900000.0,
+            max_notional=9000000.0,
+            bid_up=1.2,
+            bid_down=0.5,
+            ask_up=2.0,
+            ask_down=0.8,
+            avg_price_mins=5,
+        )
+        plan = AdaptiveGridPlanner.plan(
+            symbol="BNB/USDT",
+            current_price=791.96,
+            atr=12.91,
+            cfg=cfg,
+            filters=filters,
+            reference_price=790.0,
+            available_usdt=400000.0,
+        )
+        # Candidate 12, actual 12
+        assert plan.total_grids == 12
+        assert len(plan.levels) == 12
+        assert plan.total_grids == len(plan.levels)
+        # Bounds must be actual executable bounds
+        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
+
+    def test_adaptive_plan_eth_style_partial_drop(self):
+        """ETH-style: candidate 12, PERCENT_PRICE_BY_SIDE drops 3 levels, actual 9."""
+        cfg = self.make_cfg(
+            grid_step_atr_multiplier=1.0,
+            min_grids=3,
+            max_grids=12,
+        )
+        # ETH-like filters
+        filters = self.make_filters(
+            tick=0.01,
+            step=0.0001,
+            min_notional=5.0,
+            min_qty=0.0001,
+            max_price=1000000.0,
+            max_qty=9000.0,
+            max_notional=9000000.0,
+            bid_up=1.2,
+            bid_down=0.5,
+            ask_up=2.0,
+            ask_down=0.8,
+            avg_price_mins=5,
+        )
+        plan = AdaptiveGridPlanner.plan(
+            symbol="ETH/USDT",
+            current_price=2716.43,
+            atr=62.77,
+            cfg=cfg,
+            filters=filters,
+            reference_price=2700.0,
+            available_usdt=400000.0,
+        )
+        # Candidate was 12, executable is 9
+        assert plan.total_grids == 9
+        assert len(plan.levels) == 9
+        assert plan.total_grids == len(plan.levels)
+        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
+
+    def test_adaptive_plan_sol_style_partial_drop(self):
+        """SOL-style: candidate 12, filters drop 3 levels, actual 9 (geometric mode)."""
+        cfg = self.make_cfg(
+            grid_step_atr_multiplier=1.0,
+            min_grids=3,
+            max_grids=12,
+        )
+        # SOL-like filters
+        filters = self.make_filters(
+            tick=0.01,
+            step=0.001,
+            min_notional=5.0,
+            min_qty=0.001,
+            max_price=10000.0,
+            max_qty=90000.0,
+            max_notional=9000000.0,
+            bid_up=1.2,
+            bid_down=0.5,
+            ask_up=2.0,
+            ask_down=0.8,
+            avg_price_mins=5,
+        )
+        plan = AdaptiveGridPlanner.plan(
+            symbol="SOL/USDT",
+            current_price=120.43,
+            atr=3.11,
+            cfg=cfg,
+            filters=filters,
+            reference_price=120.48,
+            available_usdt=400000.0,
+        )
+        # Candidate was 12, executable is 9
+        assert plan.total_grids == 9
+        assert len(plan.levels) == 9
+        assert plan.total_grids == len(plan.levels)
+        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
+
+    def test_adaptive_plan_general_invariants(self):
+        """General invariant: every successful AdaptiveGridPlan is internally consistent."""
+        cfg = self.make_cfg()
+        filters = self.make_filters()
+        plan = AdaptiveGridPlanner.plan(
+            symbol="BTC/USDT",
+            current_price=50000.0,
+            atr=350.0,
+            cfg=cfg,
+            filters=filters,
+            reference_price=50000.0,
+            available_usdt=10000.0,
+        )
+        # Core invariants
+        assert plan.total_grids == len(plan.levels), "total_grids must equal actual level count"
+        assert plan.total_grids > 0, "must have at least one executable level"
+        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
+        assert plan.net_pct == pytest.approx(min(lvl.net_pct for lvl in plan.levels))
+        assert plan.gross_pct == pytest.approx(min(lvl.gross_pct for lvl in plan.levels))
+        # Budget must cover total buy notional of executable levels
+        total_buy_notional = sum(lvl.buy_price * lvl.qty for lvl in plan.levels)
+        assert total_buy_notional <= plan.quote_budget + 1e-9
+        # Step must match grid step
+        assert plan.step == cfg.grid_step_atr_multiplier * 350.0  # atr
 
 
 class TestAdaptiveConfig:
