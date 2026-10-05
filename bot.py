@@ -842,6 +842,218 @@ def _reconcile_state(cfg: Config, spot: "BinanceSpot", store: StateStore, out=No
     return 0 if overall_ok else 1
 
 
+def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore, out=None) -> int:
+    """Safely clear symbol-level STOPPED state after strict verification.
+
+    This is an explicit operator recovery command. It NEVER weakens the
+    fail-closed design: it only transitions symbols from risk_status="stopped"
+    to risk_status="ok" after ALL of the following are verified:
+
+    1. Reconcile exchange/local state (read-only) is completely clean:
+       - no unknown local orders (orders on exchange that local DB doesn't know)
+       - no unmatched exchange orders (local orders not found on exchange)
+       - no local open orders that cannot be verified
+    2. Zero inventory for the symbol (inventory_qty == 0)
+    3. Zero exchange open orders for the symbol
+    4. Global kill switch is INACTIVE
+    5. Symbol's current risk_status is exactly "stopped" (not "error", not "ok")
+    6. Symbol is NOT in COOLDOWN (cooldown_until must be None or in the past)
+    7. Symbol is NOT in ERROR state (risk_status != "error")
+
+    If ANY verification fails for ANY symbol, the operation aborts without
+    changing ANY symbol state. The operation is deterministic and idempotent.
+
+    After successful recovery, symbols transition to strategy_state="WAITING"
+    with risk_status="ok" — a neutral state where the normal cycle will
+    evaluate the strategy again. The adaptive-grid configuration and persisted
+    adaptive fields are PRESERVED.
+
+    Exit code: 0 on success (all targeted symbols recovered), 1 on any failure
+    (no state changes made). PAPER short-circuits with a message.
+    """
+    import sys
+    import time
+
+    if out is None:
+        out = sys.stdout
+
+    if cfg.execution_mode == "paper":
+        print("RESUME-STOPPED: PAPER mode — no exchange reconciliation (offline/deterministic).", file=out)
+        print("OVERALL: OK (no symbols to verify in paper mode)", file=out)
+        return 0
+    if cfg.execution_mode != "testnet":
+        print("RESUME-STOPPED: only available in EXECUTION_MODE=testnet.", file=out)
+        print("OVERALL: FAIL-CLOSED (mode not supported)", file=out)
+        return 1
+
+    from exchange import LiveExecutor, OrderUnknownState
+
+    # 1. Global kill switch must be INACTIVE
+    kill_active, kill_reason = store.global_kill()
+    if kill_active:
+        print("GLOBAL KILL ACTIVE:", kill_reason, file=out)
+        print("OVERALL: FAIL-CLOSED (global kill active)", file=out)
+        return 1
+
+    # 2. Find symbols with risk_status == "stopped"
+    stopped_symbols = []
+    for symbol in cfg.pair_list:
+        st = store.get_symbol(symbol)
+        if st is not None and st.risk_status == "stopped":
+            stopped_symbols.append(symbol)
+
+    if not stopped_symbols:
+        print("RESUME-STOPPED: no symbols with risk_status='stopped' found.", file=out)
+        print("OVERALL: OK (nothing to recover)", file=out)
+        return 0
+
+    print(f"RESUME-STOPPED: verifying {len(stopped_symbols)} stopped symbol(s): {', '.join(stopped_symbols)}", file=out)
+    print("", file=out)
+
+    executor = LiveExecutor(cfg, spot, store)
+    all_clean = True
+    verification_results = []
+
+    for symbol in stopped_symbols:
+        print(f"SYMBOL: {symbol}", file=out)
+        symbol_clean = True
+        st = store.get_symbol(symbol)
+
+        # Check 2a: Symbol must NOT be in ERROR state
+        if st is not None and st.risk_status == "error":
+            print(f"  BLOCKED: symbol is in ERROR state (risk_status='error')", file=out)
+            symbol_clean = False
+            all_clean = False
+
+        # Check 2b: Symbol must NOT be in COOLDOWN
+        if st is not None and st.cooldown_until is not None and st.cooldown_until > time.time():
+            print(f"  BLOCKED: symbol is in COOLDOWN (until {st.cooldown_until})", file=out)
+            symbol_clean = False
+            all_clean = False
+
+        # Check 2c: Symbol must have risk_status == "stopped" (already filtered, but double-check)
+        if st is None or st.risk_status != "stopped":
+            print(f"  BLOCKED: symbol risk_status is not 'stopped' (current: {st.risk_status if st else 'None'})", file=out)
+            symbol_clean = False
+            all_clean = False
+
+        # Check 3: Reconcile exchange/local state
+        try:
+            report = executor.restart_reconcile(symbol)
+        except OrderUnknownState as exc:
+            print(f"  BLOCKED: reconciliation detected unknown order(s): {exc}", file=out)
+            symbol_clean = False
+            all_clean = False
+        except ExchangeError as exc:
+            print(f"  BLOCKED: reconciliation failed (exchange error): {exc}", file=out)
+            symbol_clean = False
+            all_clean = False
+        else:
+            print(f"  open orders checked: {report['checked']}", file=out)
+            print(f"  statuses updated:    {report['updated']}", file=out)
+            print(f"  fills recorded:      {report['fills_recorded']}", file=out)
+            print(f"  unknown orders:      {report['unknown']}", file=out)
+
+            # Check: reconciliation must be completely clean (unknown == 0)
+            if report["unknown"] > 0:
+                print(f"  BLOCKED: reconciliation found {report['unknown']} unknown order(s)", file=out)
+                symbol_clean = False
+                all_clean = False
+
+        # Check 4: Zero inventory
+        inventory = float(st.inventory_qty or 0.0) if st else 0.0
+        buy_qty, sell_qty = store.fill_quantities(symbol)
+        expected = buy_qty - sell_qty
+        ledger_ok = abs(inventory - expected) <= QTY_TOLERANCE
+        print(
+            f"  ledger: inventory={inventory:.8f} buys={buy_qty:.8f} "
+            f"sells={sell_qty:.8f} "
+            f"{'OK' if ledger_ok else 'MISMATCH'}",
+            file=out,
+        )
+        if not ledger_ok:
+            print(f"  BLOCKED: ledger mismatch (inventory={inventory} vs expected={expected})", file=out)
+            symbol_clean = False
+            all_clean = False
+        if abs(inventory) > QTY_TOLERANCE:
+            print(f"  BLOCKED: non-zero inventory ({inventory})", file=out)
+            symbol_clean = False
+            all_clean = False
+
+        # Check 5: Zero exchange open orders
+        try:
+            exchange_open = spot.get_open_orders(symbol)
+        except ExchangeError as exc:
+            print(f"  BLOCKED: cannot verify exchange open orders: {exc}", file=out)
+            symbol_clean = False
+            all_clean = False
+            exchange_open = []
+        else:
+            print(f"  exchange open orders: {len(exchange_open)}", file=out)
+            if len(exchange_open) > 0:
+                print(f"  BLOCKED: {len(exchange_open)} open order(s) on exchange", file=out)
+                for o in exchange_open:
+                    print(f"    - {o.get('clientOrderId')}: {o.get('side')} {o.get('type')} @ {o.get('price')} qty={o.get('origQty')}", file=out)
+                symbol_clean = False
+                all_clean = False
+
+        # Check 6: Zero local open orders
+        local_open = store.open_orders(symbol)
+        print(f"  local open orders: {len(local_open)}", file=out)
+        if len(local_open) > 0:
+            print(f"  BLOCKED: {len(local_open)} local open order(s) exist", file=out)
+            for o in local_open:
+                print(f"    - {o['client_order_id']}: {o['side']} {o['type']} @ {o['price']} qty={o['qty']}", file=out)
+            symbol_clean = False
+            all_clean = False
+
+        verification_results.append({
+            "symbol": symbol,
+            "clean": symbol_clean,
+            "st": st,
+        })
+
+        if symbol_clean:
+            print(f"  VERIFICATION: PASSED", file=out)
+        else:
+            print(f"  VERIFICATION: FAILED", file=out)
+        print("", file=out)
+
+    # Summary
+    print("VERIFICATION SUMMARY", file=out)
+    for vr in verification_results:
+        status = "PASS" if vr["clean"] else "FAIL"
+        print(f"  {vr['symbol']:<12} {status}", file=out)
+    print(f"OVERALL: {'OK' if all_clean else 'FAIL-CLOSED'}", file=out)
+
+    if not all_clean:
+        return 1
+
+    # All verifications passed — apply the state transition
+    print("", file=out)
+    print("APPLYING RECOVERY", file=out)
+    for vr in verification_results:
+        symbol = vr["symbol"]
+        st = vr["st"]
+        # Preserve adaptive parameters and all historical data.
+        # Only change: risk_status="ok", strategy_state="WAITING", clear exit_reason and exit_status
+        store.update_symbol(
+            symbol,
+            risk_status="ok",
+            strategy_state="WAITING",
+            exit_reason=None,
+            exit_status=0,
+            # Do NOT change: cooldown_until, inventory_qty, avg_cost, fills, risk_events, etc.
+            # Do NOT change: adaptive_* fields, grid_mode, grid_step, grid_lower, gross_pct, net_pct
+        )
+        print(f"  {symbol}: risk_status=ok strategy_state=WAITING (adaptive params preserved)", file=out)
+
+    print("", file=out)
+    print("RECOVERY COMPLETE: symbols returned to neutral WAITING state.", file=out)
+    print("Next cycle will evaluate entry signals normally.", file=out)
+    return 0
+
+
 def reset_execution_session(cfg: Config, store: StateStore) -> None:
     """Explicit operator reset of the execution session. This is the
     deterministic escape hatch for mode switches: it wipes session-scoped
@@ -1182,6 +1394,12 @@ def main(argv=None) -> int:
         help="reconcile local state against the exchange before resuming (read-only; "
              "reports open-order statuses and unreconciled fills, never places orders) and exit",
     )
+    parser.add_argument(
+        "--resume-stopped", action="store_true",
+        help="safely clear symbol-level STOPPED state after strict verification: "
+             "reconciles exchange/local state, requires zero inventory, zero open orders, "
+             "no unknown orders, no global kill, and only affects risk_status='stopped' symbols",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -1230,6 +1448,15 @@ def main(argv=None) -> int:
             return _reconcile_state(cfg, spot, store)
         except Exception as exc:  # fail closed: report, do not resume
             log.error("reconcile failed (fail-closed): %s", exc)
+            return 1
+
+    # --resume-stopped: explicit operator recovery for STOPPED symbols.
+    # Strict verification before any state change; no orders placed.
+    if args.resume_stopped:
+        try:
+            return _resume_stopped_symbols(cfg, spot, store)
+        except Exception as exc:  # fail closed: report, no state changes
+            log.error("resume-stopped failed (fail-closed): %s", exc)
             return 1
 
     try:
