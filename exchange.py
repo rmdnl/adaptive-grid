@@ -864,7 +864,7 @@ class LiveExecutor(BaseExecutor):
         # Always account trades (idempotent by trade id) for inventory tracking.
         # The order's filled_qty is set from executedQty above; trades drive
         # inventory and are only recorded once per trade id.
-        trades = self._trades_from_exchange(symbol, remote.get("orderId"))
+        trades = self._trades_from_exchange(symbol, remote.get("orderId"), order["side"])
         new_qty = self._account_trades(order, trades)
         if not reconcile_only:
             if order["side"] == "BUY":
@@ -957,16 +957,35 @@ class LiveExecutor(BaseExecutor):
         local = self.store.get_order_by_client_id(remote_order.get("clientOrderId", ""))
         if local is None:
             return
-        trades = self._trades_from_exchange(symbol, remote_order.get("orderId"))
+        trades = self._trades_from_exchange(symbol, remote_order.get("orderId"), local["side"])
         self._account_trades(local, trades)
 
-    def _trades_from_exchange(self, symbol: str, order_id: Optional[int]) -> List[Dict]:
+    def _trades_from_exchange(self, symbol: str, order_id: Optional[int], side: str) -> List[Dict]:
         """Normalize exchange trades into accounting dicts, carrying full
-        provenance (quote quantity, commission asset, exchange order id)."""
+        provenance (quote quantity, commission asset, exchange order id).
+
+        For BUY orders with base-asset commission, the net base quantity
+        received is qty - commission. The accounting layer must use the net
+        quantity for inventory, while the fee remains the full commission
+        converted to quote.
+        """
         trades = []
+        base, quote = symbol.split("/")
         for t in self.spot.get_my_trades(symbol, order_id):
             price = float(t["price"])
             qty = float(t["qty"])
+            commission = float(t.get("commission") or 0)
+            commission_asset = str(t.get("commissionAsset") or "")
+
+            # Adjust quantity for base-asset commission on BUY orders.
+            # Binance reports gross qty; net received = qty - commission when
+            # commission is paid in the base asset (the asset being received).
+            if side == "BUY" and commission_asset == base and commission > 0:
+                net_qty = qty - commission
+                if net_qty < 0:
+                    net_qty = 0.0
+                qty = net_qty
+
             trades.append(
                 {
                     "id": str(t.get("id")),
@@ -974,7 +993,7 @@ class LiveExecutor(BaseExecutor):
                     "qty": qty,
                     "fee": self._fee_in_quote(symbol, t),
                     "quote_qty": float(t.get("quoteQty") or 0) or price * qty,
-                    "commission_asset": str(t.get("commissionAsset") or ""),
+                    "commission_asset": commission_asset,
                     "exchange_order_id": int(t.get("orderId") or 0) or None,
                 }
             )

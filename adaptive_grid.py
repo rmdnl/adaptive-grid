@@ -208,7 +208,7 @@ class AdaptiveGridPlanner:
             total_grids=best_count,
             quote_budget=per_symbol_budget,
             step=best_plan.step,
-            reference_price=current_price,
+            reference_price=reference_price,
             levels=best_plan.levels,
             gross_pct=best_plan.gross_pct,
             net_pct=best_plan.net_pct,
