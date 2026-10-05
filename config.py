@@ -349,7 +349,7 @@ def load_config(env_file: str = ".env") -> Config:
 
     total_grids = _get_int(env, "TOTAL_GRIDS", minimum=1, errors=errors)
     if total_grids is None:
-        total_grids = 5  # compatibility fallback; production must set explicitly
+        errors.append("TOTAL_GRIDS must be explicitly configured (no fallback)")
 
     total_quote_budget_raw = _get_str(env, "TOTAL_QUOTE_BUDGET", default=None, errors=errors)
     total_quote_budget: Dict[str, float] = {}
@@ -408,18 +408,9 @@ def load_config(env_file: str = ".env") -> Config:
                 )
 
     # 3. Validate TOTAL_QUOTE_BUDGET is sufficient for minimum notional
-    #    (at least min_notional * TOTAL_GRIDS per symbol)
-    #    We'll use a default min_notional of 10 USDT for validation
-    MIN_NOTIONAL_ESTIMATE = 10.0
-    for symbol in pair_list:
-        if symbol in total_quote_budget:
-            min_required = MIN_NOTIONAL_ESTIMATE * total_grids
-            if total_quote_budget[symbol] < min_required:
-                errors.append(
-                    f"TOTAL_QUOTE_BUDGET for {symbol} ({total_quote_budget[symbol]}) "
-                    f"may be insufficient for {total_grids} grids "
-                    f"(estimated minimum: {min_required} USDT)"
-                )
+    #    (at least min_notional * TOTAL_GRIDS per symbol).
+    #    We cannot validate this here without exchange filters; actual
+    #    enforcement happens in grid building with real min_notional values.
 
     # 4. Validate grid step ATR multiplier is reasonable
     if grid_step_atr_multiplier is not None:

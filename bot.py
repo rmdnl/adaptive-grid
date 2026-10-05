@@ -307,6 +307,7 @@ class Bot:
                 self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="stale_market_data")
                 return
         # 15m boundary data must independently be CLOSED and fresh.
+        close_15m_for_boundary = view.close_15m
         if view.close_15m is not None and view.candle_15m_time is not None:
             candle_15m_age = (now_ms - view.candle_15m_time) / 1000.0
             if candle_15m_age > max_age:
@@ -314,8 +315,10 @@ class Bot:
                     "stale 15m data for %s: candle age %.0fs > max %.0fs — boundary UNKNOWN (fail-closed)",
                     symbol, candle_15m_age, max_age
                 )
-                # boundary_status will return UNKNOWN because we don't have fresh 15m data
-                # The cycle will handle this below
+                close_15m_for_boundary = None
+        else:
+            # Missing 15m data -> boundary UNKNOWN
+            close_15m_for_boundary = None
 
         # Refresh the market/indicator view; a STOPPED symbol keeps its
         # recorded exit reason (the state must stay authoritative).
@@ -347,7 +350,7 @@ class Bot:
             # based on the latest CLOSED 15m candle close against the
             # configured LOWER_PRICE (not the dynamic grid_lower).
             configured_lower = self.cfg.lower_price.get(symbol) if hasattr(self.cfg, "lower_price") else None
-            boundary = self.risk.boundary_status(view.close_15m, configured_lower)
+            boundary = self.risk.boundary_status(close_15m_for_boundary, configured_lower)
             if boundary == BREACH:
                 self.store.update_symbol(symbol, exit_status=1, exit_reason="lower_boundary_breach")
                 self._exit_symbol(symbol, "lower_boundary_breach", now, cooldown=False)
@@ -382,7 +385,7 @@ class Bot:
         # No active grid: entry path (exit conditions take priority).
         # 15m lower-boundary protection applies even without an active grid (Phase 3).
         configured_lower = self.cfg.lower_price.get(symbol) if hasattr(self.cfg, "lower_price") else None
-        boundary = self.risk.boundary_status(view.close_15m, configured_lower)
+        boundary = self.risk.boundary_status(close_15m_for_boundary, configured_lower)
         if boundary == BREACH:
             self.store.update_symbol(symbol, exit_status=1, exit_reason="lower_boundary_breach")
             self.risk.stop_symbol(symbol, "lower_boundary_breach")

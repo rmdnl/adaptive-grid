@@ -177,7 +177,8 @@ class BinanceSpot:
         max_price: Optional[float] = None
         max_qty: Optional[float] = None
         max_notional: Optional[float] = None
-        apply_to_market: Optional[bool] = None
+        apply_min_to_market: Optional[bool] = None
+        apply_max_to_market: Optional[bool] = None
         bid_up = bid_down = ask_up = ask_down = None
         avg_price_mins: Optional[int] = None
         for f in symbols[0].get("filters", []):
@@ -195,7 +196,12 @@ class BinanceSpot:
                 min_notional = float(f.get("minNotional", f.get("notional", 0)) or 0)
                 if "maxNotional" in f and f["maxNotional"]:
                     max_notional = float(f["maxNotional"])
-                apply_to_market = bool(f.get("applyToMarket", False))
+                # applyMinToMarket / applyMaxToMarket indicate whether the
+                # filter applies to MARKET orders. For LIMIT_MAKER we enforce
+                # min and max regardless of these flags, but we parse them
+                # for fidelity with exchangeInfo.
+                apply_min_to_market = bool(f.get("applyMinToMarket", False))
+                apply_max_to_market = bool(f.get("applyMaxToMarket", False))
             elif ftype == "PERCENT_PRICE_BY_SIDE":
                 bid_up = float(f["bidMultiplierUp"])
                 bid_down = float(f["bidMultiplierDown"])
@@ -210,7 +216,8 @@ class BinanceSpot:
         return ExchangeFilters(
             tick, step, min_notional, min_qty or 0.0,
             max_price=max_price, max_qty=max_qty, max_notional=max_notional,
-            apply_to_market=apply_to_market,
+            apply_min_to_market=apply_min_to_market,
+            apply_max_to_market=apply_max_to_market,
             bid_multiplier_up=bid_up, bid_multiplier_down=bid_down,
             ask_multiplier_up=ask_up, ask_multiplier_down=ask_down,
             avg_price_mins=avg_price_mins,

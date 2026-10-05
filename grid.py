@@ -24,8 +24,15 @@ class ExchangeFilters:
     # Additional filters from Binance (Phase 4 hardening)
     max_price: Optional[float] = None
     max_qty: Optional[float] = None
+    # NOTIONAL filter (Binance exchangeInfo NOTIONAL / MIN_NOTIONAL):
+    # min_notional is required and always enforced.
+    # max_notional is enforced for LIMIT_MAKER orders when present.
+    # apply_min_to_market / apply_max_to_market flags from exchangeInfo
+    # indicate whether the filter applies to MARKET orders only —
+    # for LIMIT_MAKER we enforce both min and max regardless of these flags.
     max_notional: Optional[float] = None
-    apply_to_market: Optional[bool] = None
+    apply_min_to_market: Optional[bool] = None
+    apply_max_to_market: Optional[bool] = None
     # PERCENT_PRICE_BY_SIDE (parsed and enforced when the exchange provides
     # the filter; None = no percent-price constraint for this symbol).
     # BUY prices must stay within [ref*bid_multiplier_down, ref*bid_multiplier_up],
@@ -270,8 +277,11 @@ def build_grid(
         if filters.max_qty is not None and qty > filters.max_qty:
             dropped_levels += 1
             continue
-        # maxNotional: notional must not exceed maxNotional (when applyToMarket applies).
-        if filters.max_notional is not None and filters.apply_to_market:
+        # NOTIONAL filter: enforce min and max for LIMIT_MAKER orders.
+        # min_notional is always enforced (above during qty selection).
+        # max_notional: enforce for LIMIT_MAKER when present, regardless of
+        # apply_max_to_market flag (which indicates MARKET-only applicability).
+        if filters.max_notional is not None:
             buy_notional = buy_price * qty
             sell_notional = sell_price * qty
             if buy_notional > filters.max_notional or sell_notional > filters.max_notional:
