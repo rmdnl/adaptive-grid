@@ -122,20 +122,30 @@ def test_tick_size_boundary_interaction():
 
 # ----- grid generation protection -----
 
-def test_grid_drops_levels_below_buy_band(cfg):
+def test_grid_drops_levels_below_buy_band():
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
     # BTC at 50000, ATR step 350 -> levels at 49650..48250; band floor
     # 50000*0.95 = 47500 -> all five levels valid, none dropped.
-    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, BTC_FILTERS, cfg,
+    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, BTC_FILTERS, test_cfg,
                       reference_price=50000.0)
     assert plan.executable is True
     assert plan.dropped_levels == 0
-    assert len(plan.levels) == 5
+    assert len(plan.levels) == test_cfg.total_grids
 
 
-def test_grid_drops_only_out_of_band_levels(cfg):
+def test_grid_drops_only_out_of_band_levels():
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 46000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
     # Huge ATR: levels at 49650, 48950, 48250, 47550, 46850 — the last two
     # fall below the 47500 band floor and must be dropped, not submitted.
-    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 700.0, BTC_FILTERS, cfg,
+    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 700.0, BTC_FILTERS, test_cfg,
                       reference_price=50000.0)
     assert plan.executable is True
     assert plan.dropped_levels == 2
@@ -143,36 +153,56 @@ def test_grid_drops_only_out_of_band_levels(cfg):
     assert all(l.buy_price >= 47500.0 - 1e-9 for l in plan.levels)
 
 
-def test_grid_blocked_when_all_levels_out_of_band(cfg):
+def test_grid_blocked_when_all_levels_out_of_band():
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 40000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
     # ATR so deep that even the first level is below the band floor.
-    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 3000.0, BTC_FILTERS, cfg,
+    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 3000.0, BTC_FILTERS, test_cfg,
                       reference_price=50000.0)
     assert plan.executable is False
     assert plan.block_reason == "percent_price_band"
     assert plan.levels == []
 
 
-def test_grid_requires_reference_price_when_filter_present(cfg):
-    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, BTC_FILTERS, cfg,
+def test_grid_requires_reference_price_when_filter_present():
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, BTC_FILTERS, test_cfg,
                       reference_price=None)
     assert plan.executable is False
     assert plan.block_reason == "reference_price_unavailable"
 
 
-def test_grid_without_filter_needs_no_reference(cfg):
+def test_grid_without_filter_needs_no_reference():
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
     plain = ExchangeFilters(tick_size=0.01, step_size=0.00001, min_notional=10.0)
-    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, plain, cfg,
+    plan = build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, plain, test_cfg,
                       reference_price=None)
     assert plan.executable is True
 
 
-def test_geometric_grid_band_protection(cfg):
+def test_geometric_grid_band_protection():
+    test_cfg = make_config(
+        lower_price={"SOL/USDT": 90.0},
+        upper_price={"SOL/USDT": 120.0},
+        total_quote_budget={"SOL/USDT": 500.0},
+    )
     sol_filters = ExchangeFilters(
         tick_size=0.001, step_size=0.01, min_notional=10.0, min_qty=0.01,
         bid_multiplier_up=1.05, bid_multiplier_down=0.95,
         ask_multiplier_up=1.05, ask_multiplier_down=0.95,
     )
-    plan = build_grid("SOL/USDT", "geometric", 100.0, 3.0, sol_filters, cfg,
+    plan = build_grid("SOL/USDT", "geometric", 100.0, 3.0, sol_filters, test_cfg,
                       reference_price=100.0)
     # 3% steps: levels 97, 94.09, 91.26, 88.53, 85.88 — all >= 95 band floor?
     # floor = 95 -> levels below 95 dropped

@@ -174,17 +174,28 @@ class BinanceSpot:
             raise ExchangeError(f"unknown symbol on exchange: {symbol}")
         tick = step = min_qty = None
         min_notional: Optional[float] = None
+        max_price: Optional[float] = None
+        max_qty: Optional[float] = None
+        max_notional: Optional[float] = None
+        apply_to_market: Optional[bool] = None
         bid_up = bid_down = ask_up = ask_down = None
         avg_price_mins: Optional[int] = None
         for f in symbols[0].get("filters", []):
             ftype = f.get("filterType")
             if ftype == "PRICE_FILTER":
                 tick = float(f["tickSize"])
+                if "maxPrice" in f and f["maxPrice"]:
+                    max_price = float(f["maxPrice"])
             elif ftype == "LOT_SIZE":
                 step = float(f["stepSize"])
                 min_qty = float(f["minQty"])
+                if "maxQty" in f and f["maxQty"]:
+                    max_qty = float(f["maxQty"])
             elif ftype in ("NOTIONAL", "MIN_NOTIONAL"):
                 min_notional = float(f.get("minNotional", f.get("notional", 0)) or 0)
+                if "maxNotional" in f and f["maxNotional"]:
+                    max_notional = float(f["maxNotional"])
+                apply_to_market = bool(f.get("applyToMarket", False))
             elif ftype == "PERCENT_PRICE_BY_SIDE":
                 bid_up = float(f["bidMultiplierUp"])
                 bid_down = float(f["bidMultiplierDown"])
@@ -198,6 +209,8 @@ class BinanceSpot:
             raise ExchangeError(f"{symbol} is not tradable (status={status!r})")
         return ExchangeFilters(
             tick, step, min_notional, min_qty or 0.0,
+            max_price=max_price, max_qty=max_qty, max_notional=max_notional,
+            apply_to_market=apply_to_market,
             bid_multiplier_up=bid_up, bid_multiplier_down=bid_down,
             ask_multiplier_up=ask_up, ask_multiplier_down=ask_down,
             avg_price_mins=avg_price_mins,
@@ -968,5 +981,16 @@ class LiveExecutor(BaseExecutor):
             return commission
         if asset == base:
             return commission * float(trade.get("price") or 0)
-        log.warning("unhandled commission asset %s on %s (recorded as 0)", asset, symbol)
-        return 0.0
+        if asset == "BNB":
+            # Convert BNB commission to quote using an authoritative market price.
+            # Fail closed if conversion price is unavailable.
+            try:
+                bnb_quote_price = float(self.spot.get_avg_price(f"BNB/{quote}").get("price") or 0)
+            except ExchangeError as exc:
+                log.error("cannot convert BNB commission for %s: %s", symbol, exc)
+                raise ExchangeError(f"BNB fee conversion failed for {symbol}: {exc}") from None
+            if bnb_quote_price <= 0:
+                raise ExchangeError(f"invalid BNB/{quote} price for fee conversion: {bnb_quote_price}")
+            return commission * bnb_quote_price
+        # Unknown commission asset: fail closed — never silently record as zero.
+        raise ExchangeError(f"unhandled commission asset '{asset}' on {symbol} — cannot convert to quote")

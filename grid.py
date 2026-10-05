@@ -14,8 +14,6 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import List, Optional
 
-GRID_LEVELS = 5  # buy levels placed below price; each filled buy spawns one sell
-
 
 @dataclass(frozen=True)
 class ExchangeFilters:
@@ -23,6 +21,11 @@ class ExchangeFilters:
     step_size: float
     min_notional: float
     min_qty: float = 0.0
+    # Additional filters from Binance (Phase 4 hardening)
+    max_price: Optional[float] = None
+    max_qty: Optional[float] = None
+    max_notional: Optional[float] = None
+    apply_to_market: Optional[bool] = None
     # PERCENT_PRICE_BY_SIDE (parsed and enforced when the exchange provides
     # the filter; None = no percent-price constraint for this symbol).
     # BUY prices must stay within [ref*bid_multiplier_down, ref*bid_multiplier_up],
@@ -154,7 +157,10 @@ def build_grid(
     """Build the grid plan. `reference_price` is the exchange's weighted-
     average price (PERCENT_PRICE_BY_SIDE reference); when the symbol
     carries the filter it is REQUIRED and levels outside the BUY band are
-    dropped (or the grid is blocked when no level can be placed)."""
+    dropped (or the grid is blocked when no level can be placed).
+
+    Enforces configured LOWER_PRICE / UPPER_PRICE bounds and TOTAL_GRIDS limit.
+    """
     if mode not in ("arithmetic", "geometric"):
         return _blocked(symbol, mode, 0.0, "invalid_mode")
     if price is None or price <= 0 or atr_value is None or atr_value <= 0:
@@ -166,6 +172,16 @@ def build_grid(
         # weighted-average price; refusing to place unvalidated orders.
         return _blocked(symbol, mode, 0.0, "reference_price_unavailable")
 
+    # Hard configured range bounds (Phase 3).
+    lower_bound = cfg.lower_price.get(symbol) if hasattr(cfg, "lower_price") else None
+    upper_bound = cfg.upper_price.get(symbol) if hasattr(cfg, "upper_price") else None
+
+    # Current market price must be inside the configured range.
+    if lower_bound is not None and price < lower_bound:
+        return _blocked(symbol, mode, 0.0, "current_price_below_lower_bound")
+    if upper_bound is not None and price > upper_bound:
+        return _blocked(symbol, mode, 0.0, "current_price_above_upper_bound")
+
     step = atr_value * cfg.grid_step_atr_multiplier
     ratio: Optional[Decimal] = None
     if mode == "geometric":
@@ -173,9 +189,12 @@ def build_grid(
         if ratio <= 0:
             return _blocked(symbol, mode, step, "no_valid_levels")
 
+    # TOTAL_GRIDS is the authoritative production limit (Phase 1).
+    total_grids = getattr(cfg, "total_grids", 5)
+
     levels: List[GridLevel] = []
     dropped_levels = 0
-    for k in range(1, GRID_LEVELS + 1):
+    for k in range(1, total_grids + 1):
         # Raw levels are computed in Decimal to avoid float drift before
         # tick quantization.
         if mode == "geometric":
@@ -188,6 +207,16 @@ def build_grid(
         buy_price = quantize_price_floor(raw_buy, filters.tick_size)
         if buy_price <= 0:
             break
+
+        # Enforce configured LOWER_PRICE: buy_price >= LOWER_PRICE.
+        if lower_bound is not None and buy_price < lower_bound:
+            # Deeper levels only get lower, so we can stop.
+            break
+        # Enforce configured UPPER_PRICE: buy_price < UPPER_PRICE.
+        if upper_bound is not None and buy_price >= upper_bound:
+            dropped_levels += 1
+            continue
+
         if mode == "geometric":
             raw_sell = buy_price * (1.0 + float(ratio))
         else:
@@ -195,10 +224,25 @@ def build_grid(
         sell_price = quantize_price_ceil(raw_sell, filters.tick_size)
         if sell_price <= buy_price:
             break
+
+        # Enforce configured UPPER_PRICE: sell_price <= UPPER_PRICE.
+        if upper_bound is not None and sell_price > upper_bound:
+            dropped_levels += 1
+            continue
+        # Enforce configured LOWER_PRICE: sell_price > LOWER_PRICE.
+        if lower_bound is not None and sell_price <= lower_bound:
+            dropped_levels += 1
+            continue
+
         # PERCENT_PRICE_BY_SIDE: a buy level outside the exchange's allowed
         # band would be rejected outright — deeper levels only get lower, so
         # drop it (and never place an order Binance will refuse).
         violation = validate_price(filters, "BUY", buy_price, reference_price)
+        if violation is not None:
+            dropped_levels += 1
+            continue
+        # SELL side PERCENT_PRICE_BY_SIDE validation.
+        violation = validate_price(filters, "SELL", sell_price, reference_price)
         if violation is not None:
             dropped_levels += 1
             continue
@@ -212,6 +256,27 @@ def build_grid(
         # Guard against float drift: notional must really satisfy the filter.
         while qty * buy_price < filters.min_notional:
             qty = quantize_qty_ceil(qty + filters.step_size, filters.step_size)
+
+        # Phase 4: Complete Binance filter validation after quantization.
+        # maxPrice: both buy and sell must not exceed maxPrice.
+        if filters.max_price is not None:
+            if buy_price > filters.max_price:
+                dropped_levels += 1
+                continue
+            if sell_price > filters.max_price:
+                dropped_levels += 1
+                continue
+        # maxQty: quantity must not exceed maxQty.
+        if filters.max_qty is not None and qty > filters.max_qty:
+            dropped_levels += 1
+            continue
+        # maxNotional: notional must not exceed maxNotional (when applyToMarket applies).
+        if filters.max_notional is not None and filters.apply_to_market:
+            buy_notional = buy_price * qty
+            sell_notional = sell_price * qty
+            if buy_notional > filters.max_notional or sell_notional > filters.max_notional:
+                dropped_levels += 1
+                continue
 
         exec_gross = (sell_price - buy_price) / buy_price
         exec_net = net_profit_pct(exec_gross, cfg.maker_fee, cfg.taker_fee, cfg.slippage_estimate)

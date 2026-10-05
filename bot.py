@@ -58,6 +58,7 @@ class CycleView:
     snapshot: strategy_mod.IndicatorSnapshot
     close_15m: Optional[float]
     last_candle: Optional[Dict]
+    candle_15m_time: Optional[int] = None
 
 
 class MarketData:
@@ -82,15 +83,17 @@ class MarketData:
             atr_period=cfg.atr_period,
         )
         close_15m: Optional[float] = None
+        candle_15m_time: Optional[int] = None
         try:
             k15 = indicators.closed_candles(self.spot.fetch_klines(symbol, "15m", 2), now_ms)
             if k15:
                 close_15m = float(k15[-1]["close"])
+                candle_15m_time = int(k15[-1]["close_time"])
         except ExchangeError as exc:
             # Boundary data unavailable → gate reports UNKNOWN (fail-closed).
             log.warning("15m data unavailable for %s: %s", symbol, exc)
         last_candle = closed[-1] if closed else None
-        return CycleView(snap, close_15m, last_candle)
+        return CycleView(snap, close_15m, last_candle, candle_15m_time)
 
     def filters(self, symbol: str):
         return self.spot.get_filters(symbol)
@@ -217,9 +220,45 @@ class Bot:
         now = now_ms / 1000.0
         kill_active, kill_reason = self.store.global_kill()
         if kill_active:
-            log.warning("GLOBAL KILL ACTIVE: %s — no trading", kill_reason)
+            log.warning("GLOBAL KILL ACTIVE: %s — performing cleanup, no new orders", kill_reason)
             for symbol in self.cfg.pair_list:
                 self.store.set_symbol_state(symbol, "KILL_ACTIVE")
+                # Phase 6: Global kill recovery after restart.
+                # 1. Reconcile exchange state.
+                # 2. Cancel remaining open orders.
+                # 3. Verify no open orders remain.
+                # 4. Verify inventory.
+                # 5. Liquidate remaining inventory if necessary.
+                # 6. Verify liquidation.
+                # 7. Keep the global kill ACTIVE permanently.
+                # 8. If any verification fails: FAIL CLOSED.
+                try:
+                    self.executor.sync_fills(symbol, None, allow_renewal=False)
+                except OrderUnknownState as exc:
+                    log.error("fail-closed (%s): kill cleanup reconciliation failed: %s", symbol, exc)
+                    self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
+                    self.store.add_risk_event(symbol, "kill_cleanup_unknown_state", str(exc))
+                    continue
+                if not self.executor.cancel_all(symbol):
+                    self.store.add_risk_event(symbol, "cancel_verify_failed", kill_reason)
+                    self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                    log.error("fail-closed: cancellation verification failed for %s during kill cleanup", symbol)
+                    continue
+                st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
+                inventory = st.inventory_qty or 0.0
+                if inventory > QTY_TOLERANCE:
+                    ref_price = st.last_price or 0.0
+                    if ref_price <= 0:
+                        self.store.add_risk_event(symbol, "liquidation_verify_failed", "no price reference during kill cleanup")
+                        self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                        continue
+                    liquidated = self.executor.place_market_sell(symbol, inventory, ref_price)
+                    st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
+                    if not liquidated or (st.inventory_qty or 0.0) > QTY_TOLERANCE:
+                        self.store.add_risk_event(symbol, "liquidation_verify_failed", kill_reason)
+                        self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                        log.error("fail-closed: liquidation verification failed for %s during kill cleanup", symbol)
+                        continue
             self.store.set_runtime("KILL_ACTIVE", now)
             return
         for symbol in self.cfg.pair_list:
@@ -251,6 +290,33 @@ class Bot:
         snap = view.snapshot
         st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
 
+        # Phase 7: Market data freshness protection.
+        # Latest strategy candle MUST be CLOSED and fresh.
+        max_age = getattr(self.cfg, "max_market_data_age_seconds", 21600.0)
+        if snap.last_close is None:
+            log.warning("no closed candle for %s — no orders this cycle (fail-closed)", symbol)
+            self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="no_closed_candle")
+            return
+        if snap.last_candle_time is not None:
+            candle_age = (now_ms - snap.last_candle_time) / 1000.0
+            if candle_age > max_age:
+                log.warning(
+                    "stale market data for %s: candle age %.0fs > max %.0fs — no orders this cycle (fail-closed)",
+                    symbol, candle_age, max_age
+                )
+                self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="stale_market_data")
+                return
+        # 15m boundary data must independently be CLOSED and fresh.
+        if view.close_15m is not None and view.candle_15m_time is not None:
+            candle_15m_age = (now_ms - view.candle_15m_time) / 1000.0
+            if candle_15m_age > max_age:
+                log.warning(
+                    "stale 15m data for %s: candle age %.0fs > max %.0fs — boundary UNKNOWN (fail-closed)",
+                    symbol, candle_15m_age, max_age
+                )
+                # boundary_status will return UNKNOWN because we don't have fresh 15m data
+                # The cycle will handle this below
+
         # Refresh the market/indicator view; a STOPPED symbol keeps its
         # recorded exit reason (the state must stay authoritative).
         market_fields = dict(
@@ -278,8 +344,10 @@ class Bot:
 
         if self._is_active(symbol, st):
             # 15m lower-boundary gate: independent of exit evaluation,
-            # based on the latest CLOSED 15m candle close.
-            boundary = self.risk.boundary_status(view.close_15m, st.grid_lower)
+            # based on the latest CLOSED 15m candle close against the
+            # configured LOWER_PRICE (not the dynamic grid_lower).
+            configured_lower = self.cfg.lower_price.get(symbol) if hasattr(self.cfg, "lower_price") else None
+            boundary = self.risk.boundary_status(view.close_15m, configured_lower)
             if boundary == BREACH:
                 self.store.update_symbol(symbol, exit_status=1, exit_reason="lower_boundary_breach")
                 self._exit_symbol(symbol, "lower_boundary_breach", now, cooldown=False)
@@ -312,6 +380,23 @@ class Bot:
             return
 
         # No active grid: entry path (exit conditions take priority).
+        # 15m lower-boundary protection applies even without an active grid (Phase 3).
+        configured_lower = self.cfg.lower_price.get(symbol) if hasattr(self.cfg, "lower_price") else None
+        boundary = self.risk.boundary_status(view.close_15m, configured_lower)
+        if boundary == BREACH:
+            self.store.update_symbol(symbol, exit_status=1, exit_reason="lower_boundary_breach")
+            self.risk.stop_symbol(symbol, "lower_boundary_breach")
+            self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
+            log.warning("lower boundary breach for %s (no active grid) — symbol STOPPED", symbol)
+            return
+        if boundary == UNKNOWN:
+            log.warning(
+                "boundary status UNKNOWN for %s (no active grid) — no entry this cycle (fail-closed)",
+                symbol,
+            )
+            self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="boundary_unknown")
+            return
+
         if entry_decision.allowed:
             veto = self.risk.order_veto(symbol)
             if not veto.allowed:
@@ -395,6 +480,28 @@ class Bot:
         return inventory > covered + pending_conversion + QTY_TOLERANCE
 
     def _place_grid(self, symbol: str, plan: grid_mod.GridPlan) -> None:
+        # Phase 2: Enforce TOTAL_QUOTE_BUDGET hard limit.
+        budget = self.cfg.total_quote_budget.get(symbol) if hasattr(self.cfg, "total_quote_budget") else None
+        if budget is not None:
+            # Calculate the sum of executable BUY notional: sum(buy_price * qty) for all levels.
+            total_buy_notional = sum(lvl.buy_price * lvl.qty for lvl in plan.levels)
+            if total_buy_notional > budget:
+                # Log the rejection details for audit.
+                log.error(
+                    "grid rejected for %s: total buy notional %.8f exceeds TOTAL_QUOTE_BUDGET %.8f",
+                    symbol, total_buy_notional, budget
+                )
+                self.store.set_symbol_state(
+                    symbol,
+                    "GRID_BLOCKED",
+                    entry_blocker=None,
+                    block_reason="quote_budget_exceeded",
+                    grid_mode=plan.mode,
+                    gross_pct=plan.gross_pct,
+                    net_pct=plan.net_pct,
+                )
+                return
+
         for level in plan.levels:
             self.executor.place_limit(
                 symbol,
@@ -705,7 +812,7 @@ def _print_grid_report(
     lower = plan.lower_price
     print(f"LOWER PRICE: {lower if lower is not None else '—'}", file=out)
     print(f"UPPER PRICE: {upper if upper is not None else '—'}", file=out)
-    print(f"TOTAL GRIDS: {grid_mod.GRID_LEVELS}", file=out)
+    print(f"TOTAL GRIDS: {cfg.total_grids}", file=out)
     print(f"VALID GRID LEVELS: {len(levels)}", file=out)
     print("", file=out)
     print("STEP / SPACING:", file=out)

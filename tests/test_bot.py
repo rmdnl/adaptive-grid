@@ -41,7 +41,12 @@ class StubMarket:
         self.filters_obj = FILTERS
 
     def set(self, symbol, snapshot, close_15m=None, candle=None):
-        self.views[symbol] = CycleView(snapshot, close_15m, candle)
+        # Use current time for fresh candles
+        now_ms = int(time.time() * 1000)
+        # Add close_time to candle if not present
+        if candle is not None and "close_time" not in candle:
+            candle = {**candle, "close_time": now_ms}
+        self.views[symbol] = CycleView(snapshot, close_15m, candle, candle_15m_time=now_ms if close_15m is not None else None)
 
     def snapshot(self, symbol, cfg, now_ms):
         if symbol in self.views:
@@ -55,7 +60,9 @@ class StubMarket:
         return self.filters_obj
 
 
-NO_FILL_CANDLE = {"high": 49990.0, "low": 49900.0, "close": 49950.0}
+import time
+
+NO_FILL_CANDLE = {"high": 49990.0, "low": 49900.0, "close": 49950.0, "close_time": int(time.time() * 1000)}
 
 
 @pytest.fixture
@@ -69,7 +76,9 @@ def env(tmp_path):
 
 def test_entry_places_grid_and_sets_active(env):
     bot, store, market = env
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    # LOWER_PRICE=50000, stop_if_below_lower=0.02 => threshold=49000
+    # close_15m must be > 49000 to pass boundary check
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state == "ACTIVE"
@@ -87,7 +96,9 @@ def test_insufficient_data_means_waiting(env):
     market.set("BTC/USDT", snap_insufficient())
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
-    assert st.strategy_state == "WAITING"
+    # With insufficient data, the symbol goes to ENTRY_BLOCKED (no closed candle)
+    assert st.strategy_state == "ENTRY_BLOCKED"
+    assert st.entry_blocker == "no_closed_candle"
     assert store.count_open_orders("BTC/USDT") == 0
 
 
@@ -95,7 +106,8 @@ def test_entry_blocked_state_records_blocker(env):
     bot, store, market = env
     # volume oscillator below the entry minimum: blocks entry without
     # touching any exit condition (so exit priority does not mask it)
-    market.set("BTC/USDT", snap_entry(volume_osc=-0.5))
+    # Provide close_15m to pass boundary check
+    market.set("BTC/USDT", snap_entry(volume_osc=-0.5), close_15m=49500.0)
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state == "ENTRY_BLOCKED"
@@ -106,7 +118,7 @@ def test_adx_exit_condition_blocks_entry_with_exit_priority(env):
     # ADX 30 is simultaneously an entry blocker AND an exit condition:
     # exit has priority, and a fresh symbol must not enter either.
     bot, store, market = env
-    market.set("BTC/USDT", snap_entry(adx=30.0))
+    market.set("BTC/USDT", snap_entry(adx=30.0), close_15m=49500.0)
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state == "ENTRY_BLOCKED"
@@ -115,7 +127,7 @@ def test_adx_exit_condition_blocks_entry_with_exit_priority(env):
 
 def test_grid_blocked_state_records_reason(env):
     bot, store, market = env
-    market.set("BTC/USDT", snap_entry(atr=1.0))  # 0.002% step < 0.5% gross
+    market.set("BTC/USDT", snap_entry(atr=1.0), close_15m=49500.0)  # 0.002% step < 0.5% gross
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state == "GRID_BLOCKED"
@@ -125,11 +137,12 @@ def test_grid_blocked_state_records_reason(env):
 
 def test_buy_fill_spawns_sell_then_completed_grid_renews_buy(env):
     bot, store, market = env
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    # close_15m > 49000 (threshold) to pass boundary check
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
     bot.run_once()
     # candle dips to the first buy level -> buy fills, sell spawns
     fill_candle = {"high": 49990.0, "low": 49600.0, "close": 49900.0}
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=fill_candle)
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=fill_candle)
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state == "ACTIVE"
@@ -140,7 +153,7 @@ def test_buy_fill_spawns_sell_then_completed_grid_renews_buy(env):
 
     # candle rises to the sell target -> sell fills, grid renews the buy
     rise_candle = {"high": 50050.0, "low": 49700.0, "close": 50010.0}
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=rise_candle)
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=rise_candle)
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
     assert st.inventory_qty == pytest.approx(0.0)
@@ -153,9 +166,9 @@ def test_buy_fill_spawns_sell_then_completed_grid_renews_buy(env):
 
 def test_exit_liquidates_verifies_and_enters_cooldown(env):
     bot, store, market = env
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
     bot.run_once()
-    market.set("BTC/USDT", snap_entry(rsi=75.0), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    market.set("BTC/USDT", snap_entry(rsi=75.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state == "COOLDOWN"
@@ -168,13 +181,13 @@ def test_exit_liquidates_verifies_and_enters_cooldown(env):
 
 def test_cooldown_blocks_reentry_and_survives_restart(env, tmp_path):
     bot, store, market = env
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
     bot.run_once()
-    market.set("BTC/USDT", snap_entry(rsi=75.0), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    market.set("BTC/USDT", snap_entry(rsi=75.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
     bot.run_once()
 
     restarted = Bot(bot.cfg, store, market, DryRunExecutor(bot.cfg, store))
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
     restarted.run_once()
     assert store.get_symbol("BTC/USDT").strategy_state == "COOLDOWN"
     assert store.count_open_orders("BTC/USDT") == 0
@@ -182,14 +195,14 @@ def test_cooldown_blocks_reentry_and_survives_restart(env, tmp_path):
 
 def test_exit_with_inventory_liquidates(env):
     bot, store, market = env
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
     bot.run_once()
     fill_candle = {"high": 49990.0, "low": 49600.0, "close": 49900.0}
-    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=fill_candle)
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=fill_candle)
     bot.run_once()
     assert store.get_symbol("BTC/USDT").inventory_qty > 0
 
-    market.set("BTC/USDT", snap_entry(rsi=80.0), close_15m=49000.0, candle=fill_candle)
+    market.set("BTC/USDT", snap_entry(rsi=80.0), close_15m=49500.0, candle=fill_candle)
     bot.run_once()
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state == "COOLDOWN"

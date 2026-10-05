@@ -24,6 +24,7 @@ import indicators
 class IndicatorSnapshot:
     symbol: str = ""
     last_close: Optional[float] = None
+    last_candle_time: Optional[int] = None
     adx: Optional[float] = None
     rsi: Optional[float] = None
     percent_b: Optional[float] = None
@@ -67,6 +68,7 @@ def build_snapshot(
     return IndicatorSnapshot(
         symbol=symbol,
         last_close=closes[-1],
+        last_candle_time=int(closed_candles[-1]["close_time"]),
         adx=indicators.adx(highs, lows, closes, adx_period),
         rsi=indicators.rsi(closes, rsi_period),
         percent_b=indicators.bollinger_percent_b(closes, bb_period, bb_std),

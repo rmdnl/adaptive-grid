@@ -102,6 +102,15 @@ class Config:
     # drawdown limit is a percentage of a real capital base.
     start_equity: float
 
+    # Market data freshness (Phase 7 hardening)
+    max_market_data_age_seconds: float
+
+    # Grid range and budget (per-symbol, JSON maps symbol -> value)
+    lower_price: Dict[str, float]
+    upper_price: Dict[str, float]
+    total_grids: int
+    total_quote_budget: Dict[str, float]
+
     testnet_api_key: str
     testnet_api_secret: str
     live_api_key: str
@@ -228,6 +237,31 @@ def _parse_pair_list(raw: str, errors: list) -> Tuple[str, ...]:
     return tuple(pairs)
 
 
+def _parse_json_map(raw: str, key: str, errors: list) -> Dict[str, float]:
+    """Parse a JSON object mapping symbol -> float value."""
+    import json
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        errors.append(f"{key} must be valid JSON object: {exc}")
+        return {}
+    if not isinstance(parsed, dict):
+        errors.append(f"{key} must be a JSON object, got {type(parsed).__name__}")
+        return {}
+    out = {}
+    for k, v in parsed.items():
+        if not isinstance(k, str) or not _PAIR_RE.match(k):
+            errors.append(f"{key} key {k!r} is not a valid symbol (expected BASE/QUOTE)")
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            errors.append(f"{key} value for {k!r} must be a number, got {v!r}")
+            continue
+        out[k] = fv
+    return out
+
+
 def load_config(env_file: str = ".env") -> Config:
     """Load, parse and validate configuration from a single `.env` file."""
     if not os.path.isfile(env_file):
@@ -294,8 +328,119 @@ def load_config(env_file: str = ".env") -> Config:
 
     cooldown_hours = _get_float(env, "COOLDOWN_HOURS", minimum=0.0, maximum=None, errors=errors)
 
+    # Phase 7: Market data freshness (conservative default for 4h strategy + 15m risk)
+    max_market_data_age_seconds = _get_float(
+        env, "MAX_MARKET_DATA_AGE_SECONDS", minimum=1.0, maximum=None, errors=errors, default=21600.0
+    )
+
     # 0 (or absent) = derive the session capital from the testnet USDT balance.
     start_equity = _get_float(env, "START_EQUITY", default=0.0, minimum=0.0, maximum=None, errors=errors)
+
+    # Grid range and budget configuration (Phase 1 hardening)
+    lower_price_raw = _get_str(env, "LOWER_PRICE", default=None, errors=errors)
+    lower_price: Dict[str, float] = {}
+    if lower_price_raw is not None:
+        lower_price = _parse_json_map(lower_price_raw, "LOWER_PRICE", errors)
+
+    upper_price_raw = _get_str(env, "UPPER_PRICE", default=None, errors=errors)
+    upper_price: Dict[str, float] = {}
+    if upper_price_raw is not None:
+        upper_price = _parse_json_map(upper_price_raw, "UPPER_PRICE", errors)
+
+    total_grids = _get_int(env, "TOTAL_GRIDS", minimum=1, errors=errors)
+    if total_grids is None:
+        total_grids = 5  # compatibility fallback; production must set explicitly
+
+    total_quote_budget_raw = _get_str(env, "TOTAL_QUOTE_BUDGET", default=None, errors=errors)
+    total_quote_budget: Dict[str, float] = {}
+    if total_quote_budget_raw is not None:
+        total_quote_budget = _parse_json_map(total_quote_budget_raw, "TOTAL_QUOTE_BUDGET", errors)
+
+    # Validate per-symbol grid range and budget configuration
+    for symbol in pair_list:
+        if symbol not in lower_price:
+            errors.append(f"LOWER_PRICE must be configured for all symbols in PAIR_LIST: missing {symbol}")
+        elif lower_price[symbol] <= 0:
+            errors.append(f"LOWER_PRICE for {symbol} must be > 0, got {lower_price[symbol]}")
+        if symbol not in upper_price:
+            errors.append(f"UPPER_PRICE must be configured for all symbols in PAIR_LIST: missing {symbol}")
+        elif upper_price[symbol] <= 0:
+            errors.append(f"UPPER_PRICE for {symbol} must be > 0, got {upper_price[symbol]}")
+        if symbol in lower_price and symbol in upper_price:
+            if lower_price[symbol] >= upper_price[symbol]:
+                errors.append(f"LOWER_PRICE for {symbol} ({lower_price[symbol]}) must be < UPPER_PRICE ({upper_price[symbol]})")
+        if symbol not in total_quote_budget:
+            errors.append(f"TOTAL_QUOTE_BUDGET must be configured for all symbols in PAIR_LIST: missing {symbol}")
+        elif total_quote_budget[symbol] <= 0:
+            errors.append(f"TOTAL_QUOTE_BUDGET for {symbol} must be > 0, got {total_quote_budget[symbol]}")
+
+    # Phase 9: Additional validation for invalid combinations
+    # 1. Validate that max_market_data_age_seconds is not too small for the indicator timeframe
+    #    (minimum the timeframe interval to get at least one closed candle)
+    timeframe_to_seconds = {
+        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+        "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400,
+    }
+    if indicator_timeframe in timeframe_to_seconds:
+        min_age = timeframe_to_seconds[indicator_timeframe]
+        if max_market_data_age_seconds < min_age:
+            errors.append(
+                f"MAX_MARKET_DATA_AGE_SECONDS ({max_market_data_age_seconds}) must be >= "
+                f"the indicator timeframe ({min_age}s for {indicator_timeframe})"
+            )
+
+    # 2. Validate that grid range can accommodate TOTAL_GRIDS levels
+    #    Using a conservative minimum step of 0.1% of price
+    for symbol in pair_list:
+        if symbol in lower_price and symbol in upper_price:
+            price_range = upper_price[symbol] - lower_price[symbol]
+            if price_range <= 0:
+                continue
+            # Minimum step needed for total_grids levels
+            min_step = price_range / total_grids
+            # The grid step is derived from ATR, but we can at least validate
+            # that the range is not absurdly small
+            if price_range / upper_price[symbol] < 0.001:  # less than 0.1% range
+                errors.append(
+                    f"Grid range for {symbol} too small: "
+                    f"UPPER_PRICE ({upper_price[symbol]}) - LOWER_PRICE ({lower_price[symbol]}) "
+                    f"= {price_range} ({price_range/upper_price[symbol]*100:.3f}% of price)"
+                )
+
+    # 3. Validate TOTAL_QUOTE_BUDGET is sufficient for minimum notional
+    #    (at least min_notional * TOTAL_GRIDS per symbol)
+    #    We'll use a default min_notional of 10 USDT for validation
+    MIN_NOTIONAL_ESTIMATE = 10.0
+    for symbol in pair_list:
+        if symbol in total_quote_budget:
+            min_required = MIN_NOTIONAL_ESTIMATE * total_grids
+            if total_quote_budget[symbol] < min_required:
+                errors.append(
+                    f"TOTAL_QUOTE_BUDGET for {symbol} ({total_quote_budget[symbol]}) "
+                    f"may be insufficient for {total_grids} grids "
+                    f"(estimated minimum: {min_required} USDT)"
+                )
+
+    # 4. Validate grid step ATR multiplier is reasonable
+    if grid_step_atr_multiplier is not None:
+        if grid_step_atr_multiplier < 0.1:
+            errors.append("GRID_STEP_ATR_MULTIPLIER must be >= 0.1")
+        if grid_step_atr_multiplier > 10.0:
+            errors.append("GRID_STEP_ATR_MULTIPLIER should not exceed 10.0 (excessive step)")
+
+    # 5. Validate that the budget is not excessive relative to the grid range
+    #    (prevents accidental misconfiguration like 100000 USDT budget for 100 USDT range)
+    for symbol in pair_list:
+        if symbol in total_quote_budget and symbol in lower_price and symbol in upper_price:
+            budget = total_quote_budget[symbol]
+            price_range = upper_price[symbol] - lower_price[symbol]
+            if price_range > 0:
+                budget_pct_of_range = budget / (upper_price[symbol] * total_grids)
+                if budget_pct_of_range > 10.0:  # budget > 10x notional per grid
+                    errors.append(
+                        f"TOTAL_QUOTE_BUDGET for {symbol} ({budget}) appears excessive "
+                        f"relative to grid range ({price_range}) and {total_grids} grids"
+                    )
 
     execution_mode = _get_str(env, "EXECUTION_MODE", default="paper", errors=errors)
     if execution_mode is not None and execution_mode not in ALLOWED_EXECUTION_MODES:
@@ -382,6 +527,11 @@ def load_config(env_file: str = ".env") -> Config:
         stop_if_below_lower_percent=stop_if_below_lower_percent,
         cooldown_hours=cooldown_hours,
         start_equity=start_equity,
+        max_market_data_age_seconds=max_market_data_age_seconds,
+        lower_price=lower_price,
+        upper_price=upper_price,
+        total_grids=total_grids,
+        total_quote_budget=total_quote_budget,
         testnet_api_key=testnet_api_key,
         testnet_api_secret=testnet_api_secret,
         live_api_key=live_api_key,

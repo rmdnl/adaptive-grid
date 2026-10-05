@@ -87,7 +87,17 @@ def _filters(**kw):
 
 
 def _run(symbols, cfg_overrides=None, out=None):
-    cfg = make_config(**(cfg_overrides or {}))
+    # Override grid range config to match test prices
+    default_lower = {sym: s["base"] * 0.9 for sym, s in symbols.items()}
+    default_upper = {sym: s["base"] * 1.2 for sym, s in symbols.items()}
+    default_budget = {sym: 500.0 for sym in symbols}
+    overrides = {
+        "lower_price": default_lower,
+        "upper_price": default_upper,
+        "total_quote_budget": default_budget,
+        **(cfg_overrides or {})
+    }
+    cfg = make_config(**overrides)
     spot = FakeSpot(symbols)
     code = _check_grid(cfg, spot, out=out if out is not None else io.StringIO())
     return code, spot, cfg
@@ -120,7 +130,7 @@ def test_quantized_executable_prices_reported(tmp_path):
     sym = "BTC/USDT"
     f = _filters(tick_size=0.05, step_size=0.00001)  # coarse tick
     specs = {sym: {"base": 100.0, "rng": 0.5, "filters": f, "avg": 100.0}}
-    cfg = make_config(pair_list=(sym,))
+    cfg = make_config(pair_list=(sym,), lower_price={sym: 90.0}, upper_price={sym: 120.0}, total_quote_budget={sym: 500.0})
     spot = FakeSpot(specs)
     out = io.StringIO()
     _check_grid(cfg, spot, out)
@@ -142,7 +152,7 @@ def test_net_below_minimum_rejected(tmp_path):
     # the 0.20% minimum -> rejected specifically for the net gate.
     sym = "BTC/USDT"
     specs = {sym: {"base": 100.0, "rng": 0.5, "filters": _filters(), "avg": 100.0}}
-    cfg = make_config(pair_list=(sym,), slippage_estimate=0.004)
+    cfg = make_config(pair_list=(sym,), slippage_estimate=0.004, lower_price={sym: 90.0}, upper_price={sym: 120.0}, total_quote_budget={sym: 500.0})
     spot = FakeSpot(specs)
     out = io.StringIO()
     code = _check_grid(cfg, spot, out)
@@ -158,7 +168,7 @@ def test_gross_below_minimum_rejected(tmp_path):
     sym = "BTC/USDT"
     specs = {sym: {"base": 100.0, "rng": 0.2, "filters": _filters(), "avg": 100.0}}
     out = io.StringIO()
-    code = _check_grid(make_config(pair_list=(sym,)), FakeSpot(specs), out)
+    code = _check_grid(make_config(pair_list=(sym,), lower_price={sym: 90.0}, upper_price={sym: 120.0}, total_quote_budget={sym: 500.0}), FakeSpot(specs), out)
     text = out.getvalue()
     assert code == 1
     assert "REASON: gross profit below minimum" in text
@@ -287,6 +297,9 @@ def test_cli_check_grid_is_read_only_and_offline(tmp_path, monkeypatch):
         PAIR_LIST="AAA/USDT",
         BINANCE_TESTNET_API_KEY="tk",
         BINANCE_TESTNET_API_SECRET="ts",
+        LOWER_PRICE='{"AAA/USDT": 90.0}',
+        UPPER_PRICE='{"AAA/USDT": 120.0}',
+        TOTAL_QUOTE_BUDGET='{"AAA/USDT": 500.0}',
     )
     db = str(tmp_path / "state.db")
     specs = {"AAA/USDT": {"base": 100.0, "rng": 0.5, "filters": _filters(), "avg": 100.0}}

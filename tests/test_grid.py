@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 import grid
+from conftest import make_config
 from grid import ExchangeFilters, net_profit_pct, quantize_price_ceil, quantize_price_floor, quantize_qty_ceil
 
 
@@ -48,12 +49,18 @@ def test_net_profit_uses_worst_fee_rate():
 # ----- arithmetic grid -----
 
 def test_arithmetic_grid_levels_and_economics(cfg):
-    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, filters(), cfg)
+    # Use a cfg with appropriate lower/upper bounds for the test price (50000)
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, filters(), test_cfg)
     assert plan.executable is True
     assert plan.block_reason is None
     assert plan.mode == "arithmetic"
     assert plan.step == pytest.approx(350.0)
-    assert len(plan.levels) == grid.GRID_LEVELS
+    assert len(plan.levels) == test_cfg.total_grids
     first = plan.levels[0]
     assert first.buy_price == pytest.approx(49650.0)
     assert first.sell_price == pytest.approx(50000.0)
@@ -68,15 +75,25 @@ def test_arithmetic_grid_levels_and_economics(cfg):
 
 def test_arithmetic_grid_step_is_atr_times_multiplier():
     from conftest import make_config
-    cfg2 = make_config(grid_step_atr_multiplier=2.0)
-    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, filters(), cfg2)
+    test_cfg = make_config(
+        grid_step_atr_multiplier=2.0,
+        lower_price={"BTC/USDT": 46000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, filters(), test_cfg)
     assert plan.levels[0].buy_price == pytest.approx(50000.0 - 700.0)
 
 
 # ----- geometric grid -----
 
 def test_geometric_grid_levels(cfg):
-    plan = grid.build_grid("SOL/USDT", "geometric", 100.0, 1.0, filters(), cfg)
+    test_cfg = make_config(
+        lower_price={"SOL/USDT": 90.0},
+        upper_price={"SOL/USDT": 120.0},
+        total_quote_budget={"SOL/USDT": 500.0},
+    )
+    plan = grid.build_grid("SOL/USDT", "geometric", 100.0, 1.0, filters(), test_cfg)
     assert plan.executable is True
     assert plan.mode == "geometric"
     first = plan.levels[0]
@@ -90,43 +107,73 @@ def test_geometric_grid_levels(cfg):
 # ----- fees/slippage/min-notional handling -----
 
 def test_qty_meets_min_notional(cfg):
-    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, filters(), cfg)
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, filters(), test_cfg)
     for level in plan.levels:
         assert level.qty * level.buy_price >= 10.0
 
 
 def test_min_qty_is_respected(cfg):
     f = filters(min_qty=0.05)
-    plan = grid.build_grid("ETH/USDT", "arithmetic", 200.0, 2.0, f, cfg)
+    test_cfg = make_config(
+        lower_price={"ETH/USDT": 180.0},
+        upper_price={"ETH/USDT": 300.0},
+        total_quote_budget={"ETH/USDT": 500.0},
+    )
+    plan = grid.build_grid("ETH/USDT", "arithmetic", 200.0, 2.0, f, test_cfg)
     for level in plan.levels:
         assert level.qty >= 0.05
 
 
 # ----- rejected grids -----
 
-def test_grid_blocked_when_gross_below_minimum(cfg):
+def test_grid_blocked_when_gross_below_minimum():
     # step/price ~ 0.49% < 0.5% gross gate
-    plan = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, 49.0, filters(), cfg)
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 9000.0},
+        upper_price={"BTC/USDT": 15000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, 49.0, filters(), test_cfg)
     assert plan.executable is False
     assert plan.block_reason == "gross_below_minimum"
 
 
-def test_grid_blocked_when_executable_net_below_minimum(cfg):
+def test_grid_blocked_when_executable_net_below_minimum():
     # gross just above 0.5% (0.005005) but quantized executable net
     # = 0.9985*gross - 0.003 ~= 0.0019974 < 0.002
-    plan = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, 49.7998, filters(), cfg)
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 9000.0},
+        upper_price={"BTC/USDT": 15000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, 49.7998, filters(), test_cfg)
     assert plan.executable is False
     assert plan.block_reason == "net_below_minimum"
 
 
-def test_grid_blocked_on_missing_atr(cfg):
-    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, None, filters(), cfg)
+def test_grid_blocked_on_missing_atr():
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, None, filters(), test_cfg)
     assert plan.executable is False
     assert plan.block_reason == "insufficient_data"
 
 
-def test_grid_blocked_on_invalid_mode(cfg):
-    plan = grid.build_grid("BTC/USDT", "diagonal", 50000.0, 350.0, filters(), cfg)
+def test_grid_blocked_on_invalid_mode():
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "diagonal", 50000.0, 350.0, filters(), test_cfg)
     assert plan.executable is False
     assert plan.block_reason == "invalid_mode"
 

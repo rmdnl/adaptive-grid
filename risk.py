@@ -46,15 +46,16 @@ class RiskEngine:
         drawdown = (reference - equity) / reference
         return drawdown >= self.cfg.max_drawdown
 
-    def boundary_status(self, close_15m: Optional[float], lower_price: Optional[float]) -> str:
+    def boundary_status(self, close_15m: Optional[float], configured_lower_price: Optional[float]) -> str:
         """Evaluate the 15m lower-boundary gate against the latest CLOSED
-        15m candle close. Returns OK, BREACH or UNKNOWN (fail-closed on
+        15m candle close using the configured LOWER_PRICE (not the dynamic
+        grid_lower). Returns OK, BREACH or UNKNOWN (fail-closed on
         missing/invalid data — never guesses)."""
-        if close_15m is None or lower_price is None:
+        if close_15m is None or configured_lower_price is None:
             return UNKNOWN
-        if close_15m <= 0 or lower_price <= 0:
+        if close_15m <= 0 or configured_lower_price <= 0:
             return UNKNOWN
-        if close_15m <= lower_price * (1.0 - self.cfg.stop_if_below_lower):
+        if close_15m <= configured_lower_price * (1.0 - self.cfg.stop_if_below_lower):
             return BREACH
         return OK
 
