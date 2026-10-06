@@ -502,7 +502,7 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
   <div class="panel kpi risk" id="k-dd-box"><div class="cap">DRAWDOWN</div><div class="val" id="k-dd">&#8212;</div><div class="unit">FROM REFERENCE</div></div>
   <div class="panel kpi"><div class="cap">MAX DRAWDOWN</div><div class="val" id="k-maxdd">&#8212;</div><div class="unit">HARD LIMIT</div></div>
   <div class="panel kpi"><div class="cap">OPEN ORDERS</div><div class="val" id="k-open">&#8212;</div><div class="unit">ACROSS ALL SYMBOLS</div></div>
-  <div class="panel kpi"><div class="cap">REALIZED PNL</div><div class="val" id="k-pnl">&#8212;</div><div class="unit">USDT &middot; NET LEDGER</div></div>
+  <div class="panel kpi"><div class="cap">REALIZED PNL</div><div class="val" id="k-pnl">&#8212;</div><div class="unit">USDT &middot; GROSS OF FEES</div></div>
   <div class="panel kpi"><div class="cap">FEES</div><div class="val" id="k-fees">&#8212;</div><div class="unit">USDT &middot; CUMULATIVE</div></div>
   <div class="panel kpi kill" id="k-kill-box"><div class="cap">KILL SWITCH</div><div class="val" id="k-kill">&#8212;</div><div class="unit" id="k-killsub">GLOBAL DRAWDOWN GUARD</div></div>
 </div>
