@@ -584,6 +584,103 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
   }
   function hr() { var h = document.createElement("div"); h.className = "hr"; return h; }
 
+  // ----- entry telemetry (read-only display of symbols[].entry_telemetry) -----
+
+  var BLOCKER_LABELS = {
+    exit_priority: "EXIT SIGNAL TAKES PRIORITY",
+    rsi_not_low: "RSI ABOVE ENTRY THRESHOLD",
+    adx_not_low: "ADX ABOVE ENTRY LIMIT",
+    adx_trending: "ADX INDICATES TRENDING MARKET",
+    volume_osc_not_positive: "VOLUME OSCILLATOR BELOW MINIMUM",
+    volume_osc_insufficient: "VOLUME OSCILLATOR TOO LOW",
+    percent_b_not_low: "PRICE NOT AT LOWER BOLLINGER BAND",
+    bb_not_low: "PRICE NOT AT LOWER BOLLINGER BAND",
+    zscore_too_high: "Z-SCORE EXCEEDS ENTRY LIMIT",
+    boundary_breach: "15M CANDLE BREACHED LOWER BOUNDARY",
+    boundary_unknown: "15M BOUNDARY DATA UNAVAILABLE",
+    risk_veto: "RISK ENGINE VETOED ENTRY",
+    symbol_stopped: "SYMBOL RISK-STOPPED",
+    symbol_error: "SYMBOL IN ERROR STATE",
+    grid_placement_failed: "GRID GENERATION FAILED",
+    insufficient_balance: "INSUFFICIENT USDT BALANCE",
+    balance_unavailable: "USDT BALANCE UNAVAILABLE",
+    no_closed_candle: "NO CLOSED CANDLE",
+    stale_market_data: "MARKET DATA STALE",
+    stale_data: "MARKET DATA STALE",
+    insufficient_data: "INSUFFICIENT INDICATOR DATA",
+    cooldown: "COOLDOWN AFTER EXIT",
+    no_active_symbol_config: "NO ACTIVE SYMBOL CONFIGURATION"
+  };
+  function humanBlocker(code) {
+    // Known codes map to their existing labels; anything else falls back to
+    // a readable form of the raw code — never a fabricated interpretation.
+    if (code === null || code === undefined || code === "") return DASH;
+    var c = String(code);
+    if (c.indexOf("global_kill:") === 0) {
+      return "GLOBAL KILL: " + c.slice("global_kill:".length).toUpperCase();
+    }
+    if (BLOCKER_LABELS[c]) return BLOCKER_LABELS[c];
+    return c.replace(/_/g, " ").toUpperCase();
+  }
+
+  var GRID_REJECT_LABELS = {
+    invalid_mode: "INVALID GRID MODE",
+    insufficient_data: "INSUFFICIENT DATA (NO CLOSED CANDLES / NO ATR)",
+    invalid_filters: "INVALID EXCHANGE FILTERS",
+    reference_price_unavailable: "REFERENCE PRICE UNAVAILABLE",
+    percent_price_band: "OUTSIDE PERCENT PRICE BAND",
+    no_valid_levels: "INSUFFICIENT VALID LEVELS",
+    gross_below_minimum: "GROSS PROFIT BELOW MINIMUM",
+    net_below_minimum: "NET PROFIT BELOW MINIMUM",
+    quote_budget_exceeded: "TOTAL QUOTE BUDGET EXCEEDED",
+    current_price_below_lower_bound: "CURRENT PRICE BELOW LOWER BOUND",
+    current_price_above_upper_bound: "CURRENT PRICE ABOVE UPPER BOUND"
+  };
+  function humanGridReject(reason) {
+    if (reason === null || reason === undefined || reason === "") return DASH;
+    var r = String(reason);
+    if (GRID_REJECT_LABELS[r]) return GRID_REJECT_LABELS[r];
+    if (r.indexOf("adaptive_grid_failed:") === 0) {
+      var detail = r.slice("adaptive_grid_failed:".length).trim();
+      return "ADAPTIVE PLANNER: " + (GRID_REJECT_LABELS[detail] || detail.toUpperCase());
+    }
+    return r.replace(/_/g, " ").toUpperCase();
+  }
+
+  function telemetryCounter(t, field) {
+    // Explicit zero must display "0"; null/undefined/missing displays the
+    // unavailable dash. Never fabricate a zero from missing data.
+    if (!t || typeof t !== "object") return DASH;
+    return fmtNum(t[field], 0);
+  }
+  function telemetryText(t, field, humanize) {
+    if (!t || typeof t !== "object") return DASH;
+    var v = t[field];
+    if (v === null || v === undefined || v === "") return DASH;
+    return humanize ? humanize(v) : String(v);
+  }
+
+  function renderEntryTelemetry(m, s) {
+    var t = (s && s.entry_telemetry && typeof s.entry_telemetry === "object")
+      ? s.entry_telemetry : {};
+    m.appendChild(hr());
+    m.appendChild(sec("ENTRY TELEMETRY"));
+    m.appendChild(kv("EVALUATIONS", telemetryCounter(t, "entry_evaluations")));
+    m.appendChild(kv("ADX BLOCKED", telemetryCounter(t, "blocked_adx")));
+    m.appendChild(kv("RSI BLOCKED", telemetryCounter(t, "blocked_rsi")));
+    m.appendChild(kv("VO BLOCKED", telemetryCounter(t, "blocked_vo")));
+    m.appendChild(kv("BB BLOCKED", telemetryCounter(t, "blocked_bb")));
+    m.appendChild(kv("GRID BLOCKED", telemetryCounter(t, "blocked_grid")));
+    m.appendChild(kv("BUDGET BLOCKED", telemetryCounter(t, "blocked_budget")));
+    m.appendChild(kv("RISK BLOCKED", telemetryCounter(t, "blocked_risk")));
+    m.appendChild(kv("COOLDOWN BLOCKED", telemetryCounter(t, "blocked_cooldown")));
+    m.appendChild(kv("TOTAL ENTRIES", telemetryCounter(t, "entries_total")));
+    m.appendChild(hr());
+    m.appendChild(kv("LAST ENTRY", telemetryText(t, "last_entry_ts", fmtTs)));
+    m.appendChild(kv("LAST BLOCKER", telemetryText(t, "last_entry_blocker", humanBlocker)));
+    m.appendChild(kv("LAST GRID REJECT", telemetryText(t, "last_grid_reject_reason", humanGridReject)));
+  }
+
 function renderGlobal(g) {
     set("k-equity", fmtNum(g.equity, 2));
     set("k-ref", fmtNum(g.reference_equity, 2));
@@ -706,6 +803,7 @@ function renderGlobal(g) {
                        typeof s.realized_pnl === "number"
                        ? (s.realized_pnl >= 0 ? "ok" : "danger") : ""));
       m.appendChild(kv("FEES", fmtNum(s.fees, 4)));
+      renderEntryTelemetry(m, s);
       grid.appendChild(m);
     });
   }
