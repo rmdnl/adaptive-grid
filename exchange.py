@@ -116,6 +116,12 @@ class BinanceSpot:
             if params:
                 url += "?" + urllib.parse.urlencode(params)
 
+        # Transient server-side conditions: retrying a read-only GET is
+        # idempotent and safe. Order-submission POSTs and DELETEs are NEVER
+        # retried here (duplicate-order prevention — unknown outcomes are
+        # reconciled by client order id instead).
+        transient_http = {429, 500, 502, 503, 504} if method == "GET" else set()
+
         last_error: Optional[Exception] = None
         for attempt in range(retries + 1):
             try:
@@ -124,6 +130,12 @@ class BinanceSpot:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode(errors="replace")
+                if exc.code in transient_http and attempt < retries:
+                    last_error = ExchangeError(
+                        f"{method} {path} -> HTTP {exc.code} (transient)"
+                    )
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
                 raise ExchangeError(f"{method} {path} -> HTTP {exc.code}: {body}") from None
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = exc
@@ -593,13 +605,16 @@ class DryRunExecutor(BaseExecutor):
                  parent["symbol"], qty, parent["target_sell_price"])
 
     def place_market_sell(self, symbol: str, qty: float, ref_price: float) -> bool:
-        # Quantize quantity down to step size for consistency with live executor
+        # Quantize quantity down to step size for consistency with the live
+        # executor. Dry-run has no guaranteed filters provider: when none is
+        # available the original quantity is used (simulated fills accept
+        # any size), but the failure is logged, never silently swallowed.
         try:
             filters = self._filters_for(symbol)
             if filters and filters.step_size > 0:
                 qty = quantize_qty_floor(qty, filters.step_size)
-        except Exception:
-            pass  # In dry-run, filters may not be available; proceed with original qty
+        except ExchangeError as exc:
+            log.debug("dry-run liquidation %s: filters unavailable (%s); using original qty", symbol, exc)
         
         price = ref_price * (1.0 - self.cfg.slippage_estimate)
         fee = price * qty * max(self.cfg.maker_fee, self.cfg.taker_fee)

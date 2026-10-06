@@ -534,6 +534,21 @@ def test_cycle_error_marks_symbol_error_not_crash(env):
     assert any(e["event"] == "cycle_error" for e in store.recent_risk_events())
 
 
+def test_error_symbol_cannot_reenter(tmp_path):
+    """An ERROR symbol (risk_status='error') requires operator attention:
+    the risk veto must block any new grid entry. Active-grid cleanup paths
+    (exit conditions, reconciliation) must remain possible."""
+    bot, store, market = _env(tmp_path)
+    # Simulate a prior verification failure for this symbol
+    store.update_symbol("BTC/USDT", risk_status="error", strategy_state="ERROR")
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ENTRY_BLOCKED"
+    assert st.entry_blocker == "symbol_error"
+    assert store.count_open_orders("BTC/USDT") == 0
+
+
 def test_restart_during_active_grid_does_not_duplicate_orders(tmp_path):
     """A restart with an open grid resumes management: no accidental grid
     recreation, no duplicate orders, no duplicate fills."""

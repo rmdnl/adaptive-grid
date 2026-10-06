@@ -169,9 +169,11 @@ class TestAdaptiveGridPlanner:
         assert 3 <= plan.total_grids <= 12
         assert len(plan.levels) == plan.total_grids
 
-    def test_net_exactly_020_percent_accepted(self):
-        """Candidate with net == 0.20% should be accepted."""
-        # Use parameters that give exactly 0.20% net
+    def test_net_strictly_above_020_percent_required(self):
+        """Invariant: the executable NET of every accepted candidate is
+        STRICTLY greater than 0.20% — net == 0.20% exactly is REJECTED
+        (tick quantization may land slightly above; the gate enforces it)."""
+        # Use parameters that give approximately 0.20% net
         # gross = 0.50% -> net = 0.50% - (0.1%+0.05%)*2 = 0.50% - 0.30% = 0.20%
         # At price=50000, gross=0.5% needs step=250. With ATR=350, multiplier=250/350≈0.7143
         cfg = self.make_cfg(grid_step_atr_multiplier=250.0/350.0)
@@ -185,7 +187,7 @@ class TestAdaptiveGridPlanner:
             reference_price=50000.0,
             available_usdt=10000.0,
         )
-        assert plan.net_pct >= 0.002  # >= 0.20%
+        assert plan.net_pct > 0.002  # strictly greater than 0.20%
 
     def test_net_below_020_percent_rejected(self):
         """Candidate with net < 0.20% should be rejected (fail-closed)."""

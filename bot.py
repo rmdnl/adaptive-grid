@@ -235,7 +235,6 @@ class Bot:
         if kill_active:
             log.warning("GLOBAL KILL ACTIVE: %s — performing cleanup, no new orders", kill_reason)
             for symbol in self.cfg.pair_list:
-                self.store.set_symbol_state(symbol, "KILL_ACTIVE")
                 # Phase 6: Global kill recovery after restart.
                 # 1. Reconcile exchange state.
                 # 2. Cancel remaining open orders.
@@ -245,34 +244,48 @@ class Bot:
                 # 6. Verify liquidation.
                 # 7. Keep the global kill ACTIVE permanently.
                 # 8. If any verification fails: FAIL CLOSED.
+                # Per-symbol containment: an order-state exception from any
+                # step stops THAT symbol fail-closed and never skips the
+                # cleanup of the remaining symbols (the kill stays latched,
+                # so cleanup retries next cycle).
                 try:
-                    self.executor.sync_fills(symbol, None, allow_renewal=False)
-                except OrderUnknownState as exc:
-                    log.error("fail-closed (%s): kill cleanup reconciliation failed: %s", symbol, exc)
-                    self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
-                    self.store.add_risk_event(symbol, "kill_cleanup_unknown_state", str(exc))
-                    continue
-                if not self.executor.cancel_all(symbol):
-                    self.store.add_risk_event(symbol, "cancel_verify_failed", kill_reason)
-                    self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
-                    log.error("fail-closed: cancellation verification failed for %s during kill cleanup", symbol)
-                    continue
-                st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
-                inventory = st.inventory_qty or 0.0
-                if inventory > QTY_TOLERANCE:
-                    # Use live market price for liquidation, NOT the stale indicator close.
-                    live_price = self.market.live_price(symbol)
-                    if live_price is None:
-                        self.store.add_risk_event(symbol, "liquidation_verify_failed", "no live price reference during kill cleanup (fail-closed)")
-                        self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                    self.store.set_symbol_state(symbol, "KILL_ACTIVE")
+                    try:
+                        self.executor.sync_fills(symbol, None, allow_renewal=False)
+                    except OrderUnknownState as exc:
+                        log.error("fail-closed (%s): kill cleanup reconciliation failed: %s", symbol, exc)
+                        self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
+                        self.store.add_risk_event(symbol, "kill_cleanup_unknown_state", str(exc))
                         continue
-                    liquidated = self.executor.place_market_sell(symbol, inventory, live_price)
+                    if not self.executor.cancel_all(symbol):
+                        self.store.add_risk_event(symbol, "cancel_verify_failed", kill_reason)
+                        self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                        log.error("fail-closed: cancellation verification failed for %s during kill cleanup", symbol)
+                        continue
                     st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
-                    if not liquidated or (st.inventory_qty or 0.0) > QTY_TOLERANCE:
-                        self.store.add_risk_event(symbol, "liquidation_verify_failed", kill_reason)
-                        self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
-                        log.error("fail-closed: liquidation verification failed for %s during kill cleanup", symbol)
-                        continue
+                    inventory = st.inventory_qty or 0.0
+                    if inventory > QTY_TOLERANCE:
+                        # Use live market price for liquidation, NOT the stale indicator close.
+                        live_price = self.market.live_price(symbol)
+                        if live_price is None:
+                            self.store.add_risk_event(symbol, "liquidation_verify_failed", "no live price reference during kill cleanup (fail-closed)")
+                            self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                            continue
+                        liquidated = self.executor.place_market_sell(symbol, inventory, live_price)
+                        st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
+                        if not liquidated or (st.inventory_qty or 0.0) > QTY_TOLERANCE:
+                            self.store.add_risk_event(symbol, "liquidation_verify_failed", kill_reason)
+                            self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                            log.error("fail-closed: liquidation verification failed for %s during kill cleanup", symbol)
+                            continue
+                except OrderUnknownState as exc:
+                    self.store.add_risk_event(symbol, "kill_cleanup_unknown_state", str(exc))
+                    self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
+                    log.error("fail-closed (%s): unknown order state during kill cleanup: %s", symbol, exc)
+                except OrderRejected as exc:
+                    self.store.add_risk_event(symbol, "order_rejected", str(exc))
+                    self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                    log.error("order rejected (%s) during kill cleanup: %s", symbol, exc)
             self.store.set_runtime("KILL_ACTIVE", now)
             return
         for symbol in self.cfg.pair_list:
@@ -952,8 +965,71 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
         out = sys.stdout
 
     if cfg.execution_mode == "paper":
-        print("RESUME-STOPPED: PAPER mode — no exchange reconciliation (offline/deterministic).", file=out)
-        print("OVERALL: OK (no symbols to verify in paper mode)", file=out)
+        # PAPER: there is no exchange state to reconcile — every order and
+        # fill is local and deterministic. Recovery is still strictly
+        # verified locally (kill inactive, zero inventory, ledger consistent,
+        # zero open orders) before any state is cleared; any failure aborts
+        # with NO state changes.
+        kill_active, kill_reason = store.global_kill()
+        if kill_active:
+            print("GLOBAL KILL ACTIVE:", kill_reason, file=out)
+            print("OVERALL: FAIL-CLOSED (global kill active)", file=out)
+            return 1
+
+        targets = []
+        for symbol in cfg.pair_list:
+            st = store.get_symbol(symbol)
+            if st is not None and st.risk_status in ("stopped", "error"):
+                targets.append(symbol)
+        if not targets:
+            print("RESUME-STOPPED: PAPER mode — no stopped/error symbols found.", file=out)
+            print("OVERALL: OK (nothing to recover)", file=out)
+            return 0
+
+        print(f"RESUME-STOPPED: PAPER mode — verifying {len(targets)} symbol(s): {', '.join(targets)}", file=out)
+        print("", file=out)
+        all_clean = True
+        for symbol in targets:
+            st = store.get_symbol(symbol)
+            symbol_clean = True
+            inventory = float(st.inventory_qty or 0.0) if st else 0.0
+            buy_qty, sell_qty = store.fill_quantities(symbol)
+            ledger_ok = abs(inventory - (buy_qty - sell_qty)) <= QTY_TOLERANCE
+            local_open = store.open_orders(symbol)
+            print(f"SYMBOL: {symbol}")
+            print(f"  ledger: inventory={inventory:.8f} buys={buy_qty:.8f} sells={sell_qty:.8f} "
+                  f"{'OK' if ledger_ok else 'MISMATCH'}")
+            print(f"  local open orders: {len(local_open)}")
+            if not ledger_ok:
+                print("  BLOCKED: ledger mismatch")
+                symbol_clean = False
+            if abs(inventory) > QTY_TOLERANCE:
+                print(f"  BLOCKED: non-zero inventory ({inventory})")
+                symbol_clean = False
+            if len(local_open) > 0:
+                print(f"  BLOCKED: {len(local_open)} local open order(s) exist")
+                symbol_clean = False
+            if symbol_clean:
+                print("  VERIFICATION: PASSED")
+            else:
+                print("  VERIFICATION: FAILED")
+            print("", file=out)
+            all_clean = all_clean and symbol_clean
+
+        if not all_clean:
+            print("OVERALL: FAIL-CLOSED", file=out)
+            return 1
+
+        for symbol in targets:
+            store.update_symbol(
+                symbol,
+                risk_status="ok",
+                strategy_state="WAITING",
+                exit_reason=None,
+                exit_status=0,
+            )
+            print(f"  {symbol}: risk_status=ok strategy_state=WAITING (adaptive params preserved)", file=out)
+        print("OVERALL: OK (recovery applied)", file=out)
         return 0
     if cfg.execution_mode != "testnet":
         print("RESUME-STOPPED: only available in EXECUTION_MODE=testnet.", file=out)
@@ -1174,6 +1250,7 @@ def _print_grid_report(
     reference: Optional[float],
     plan,
     out,
+    total_grids: Optional[int] = None,
 ) -> None:
     """Render one symbol's grid economics report. All values come from the
     production grid build (plan) and the production market view - no
@@ -1191,7 +1268,7 @@ def _print_grid_report(
     lower = plan.lower_price
     print(f"LOWER PRICE: {lower if lower is not None else '—'}", file=out)
     print(f"UPPER PRICE: {upper if upper is not None else '—'}", file=out)
-    print(f"TOTAL GRIDS: {cfg.total_grids}", file=out)
+    print(f"TOTAL GRIDS: {total_grids if total_grids is not None else '—'}", file=out)
     print(f"VALID GRID LEVELS: {len(levels)}", file=out)
     print("", file=out)
     print("STEP / SPACING:", file=out)
@@ -1270,16 +1347,62 @@ def _check_grid(cfg: Config, spot: "BinanceSpot", out=None) -> int:
             print("", file=out)
             results.append((symbol, "REJECTED", None))
             continue
-        plan = grid_mod.build_grid(
-            symbol,
-            cfg.grid_mode(symbol),
-            view.snapshot.last_close,
-            view.snapshot.atr,
-            filters,
-            cfg,
-            reference_price=reference,
-        )
-        _print_grid_report(cfg, symbol, spot, view, filters, reference, plan, out)
+        total_grids: Optional[int] = None
+        if cfg.adaptive_grid:
+            # Adaptive mode: validate through the same production planner the
+            # runtime entry path uses (build_grid with cfg.total_grids is not
+            # the production path here — TOTAL_GRIDS is unset by design).
+            try:
+                available_usdt = spot.get_balance("USDT")
+            except ExchangeError as exc:
+                print(f"SYMBOL: {symbol}", file=out)
+                print(f"GRID STATUS: REJECTED", file=out)
+                print(f"REASON: USDT balance unavailable ({exc})", file=out)
+                print("", file=out)
+                results.append((symbol, "REJECTED", None))
+                continue
+            try:
+                adaptive_plan = adaptive_grid.AdaptiveGridPlanner.plan(
+                    symbol=symbol,
+                    current_price=view.snapshot.last_close,
+                    atr=view.snapshot.atr,
+                    cfg=cfg,
+                    filters=filters,
+                    reference_price=reference,
+                    available_usdt=available_usdt,
+                )
+            except ValueError as exc:
+                print(f"SYMBOL: {symbol}", file=out)
+                print(f"GRID STATUS: REJECTED", file=out)
+                print(f"REASON: {exc}", file=out)
+                print("", file=out)
+                results.append((symbol, "REJECTED", None))
+                continue
+            plan = grid_mod.GridPlan(
+                symbol=symbol,
+                mode=adaptive_plan.mode,
+                step=adaptive_plan.step,
+                levels=adaptive_plan.levels,
+                lower_price=adaptive_plan.lower_price,
+                upper_price=adaptive_plan.upper_price,
+                gross_pct=adaptive_plan.gross_pct,
+                net_pct=adaptive_plan.net_pct,
+                executable=True,
+                block_reason=None,
+            )
+            total_grids = adaptive_plan.total_grids
+        else:
+            plan = grid_mod.build_grid(
+                symbol,
+                cfg.grid_mode(symbol),
+                view.snapshot.last_close,
+                view.snapshot.atr,
+                filters,
+                cfg,
+                reference_price=reference,
+            )
+            total_grids = cfg.total_grids
+        _print_grid_report(cfg, symbol, spot, view, filters, reference, plan, out, total_grids)
         worst_net = min((lvl.net_pct for lvl in plan.levels), default=None)
         results.append((symbol, "ACCEPTED" if plan.executable else "REJECTED", worst_net))
 

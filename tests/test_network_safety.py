@@ -93,6 +93,66 @@ def test_get_exhausts_retries_then_fails(monkeypatch):
     assert calls["n"] == 3  # initial attempt + 2 bounded retries
 
 
+def test_transient_http_5xx_get_is_retried_and_recovers(monkeypatch):
+    """A transient 503 on a read-only GET is retried and recovers — one
+    Binance blip must not flip a symbol into permanent ERROR state."""
+    spot = _spot()
+    calls = {"n": 0}
+    payload = json.dumps([[0, "1", "2", "0.5", "1.5", "10", 999]]).encode()
+
+    def fake_urlopen(req, timeout=10):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.HTTPError(
+                req.full_url, 503, "Service Unavailable", {}, io.BytesIO(b"boom")
+            )
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(exchange.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(exchange.time, "sleep", lambda s: None)
+    klines = spot.fetch_klines("BTC/USDT", "4h", 2)
+    assert calls["n"] == 2
+    assert klines[0]["close"] == 1.5
+
+
+def test_persistent_http_5xx_get_still_fails_closed(monkeypatch):
+    """Exhausted transient retries still surface ExchangeError — persistent
+    exchange failure remains fail-closed, never a silent success."""
+    spot = _spot()
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=10):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(
+            req.full_url, 503, "Service Unavailable", {}, io.BytesIO(b"boom")
+        )
+
+    monkeypatch.setattr(exchange.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(exchange.time, "sleep", lambda s: None)
+    with pytest.raises(ExchangeError, match="503"):
+        spot.fetch_klines("BTC/USDT", "4h", 2)
+    assert calls["n"] == 3  # bounded retries, then fail-closed
+
+
+def test_order_post_http_5xx_is_never_retried(monkeypatch):
+    """Even on a transient 503, an order POST is attempted exactly once —
+    duplicate-order prevention outranks availability."""
+    spot = _spot()
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=10):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(
+            req.full_url, 503, "Service Unavailable", {}, io.BytesIO(b"boom")
+        )
+
+    monkeypatch.setattr(exchange.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(exchange.time, "sleep", lambda s: None)
+    with pytest.raises(ExchangeError, match="503"):
+        spot.create_market_order("BTC/USDT", "SELL", 1.0, "cid-y")
+    assert calls["n"] == 1
+
+
 def test_signed_order_post_is_never_blindly_retried(monkeypatch):
     """A network failure on order submission must fail the request once —
     the executor reconciles by client id instead of resubmitting."""

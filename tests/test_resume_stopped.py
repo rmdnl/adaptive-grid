@@ -588,8 +588,10 @@ def test_resume_stopped_no_orders_created(tmp_path):
     assert len(spot.submit_calls) == initial_submit_calls
 
 
-def test_resume_stopped_paper_mode_short_circuits(tmp_path):
-    """In PAPER mode, --resume-stopped short-circuits with a message."""
+def test_resume_stopped_paper_mode_recovers_verified_symbols(tmp_path):
+    """In PAPER mode, --resume-stopped performs strictly verified LOCAL
+    recovery (no exchange to reconcile): stopped symbols with zero
+    inventory, consistent ledger and zero open orders return to WAITING."""
     store, cfg, spot = _env(tmp_path)
     cfg = make_config(
         pair_list=("AAA/USDT",),
@@ -604,7 +606,54 @@ def test_resume_stopped_paper_mode_short_circuits(tmp_path):
 
     assert code == 0
     assert "PAPER mode" in output
-    assert "OVERALL: OK" in output
+    assert "OVERALL: OK (recovery applied)" in output
+    st = store.get_symbol("AAA/USDT")
+    assert st.risk_status == "ok"
+    assert st.strategy_state == "WAITING"
+
+
+def test_resume_stopped_paper_mode_recovers_error_symbol(tmp_path):
+    """PAPER recovery also covers risk_status='error' symbols (the ERROR
+    entry veto would otherwise make a paper ERROR an unrecoverable dead
+    end that only --reset-session could clear)."""
+    store, cfg, spot = _env(tmp_path)
+    cfg = make_config(
+        pair_list=("AAA/USDT",),
+        dry_run=True,
+        execution_mode="paper",
+    )
+    store.update_symbol("AAA/USDT", risk_status="error", strategy_state="ERROR")
+
+    out = io.StringIO()
+    code = bot._resume_stopped_symbols(cfg, spot, store, out)
+    assert code == 0
+    st = store.get_symbol("AAA/USDT")
+    assert st.risk_status == "ok"
+    assert st.strategy_state == "WAITING"
+
+
+def test_resume_stopped_paper_mode_fail_closed_on_inventory(tmp_path):
+    """PAPER recovery refuses symbols holding inventory or open orders —
+    no state is changed for ANY symbol when one fails verification."""
+    store, cfg, spot = _env(tmp_path, pair=("AAA/USDT", "BBB/USDT"))
+    cfg = make_config(
+        pair_list=("AAA/USDT", "BBB/USDT"),
+        dry_run=True,
+        execution_mode="paper",
+    )
+    _stop_symbol(store, "AAA/USDT", "lower_boundary_breach")
+    _stop_symbol(store, "BBB/USDT", "other")
+    # BBB holds inventory without open orders -> must block recovery
+    buy = store.create_order("cid-b", "BBB/USDT", "BUY", "LIMIT_MAKER", 100.0, 1.0, "dry_run")
+    store.record_fill(buy, "BBB/USDT", "BUY", 100.0, 1.0, 0.0, trade_id="t-b")
+
+    out = io.StringIO()
+    code = bot._resume_stopped_symbols(cfg, spot, store, out)
+    assert code == 1
+    assert "OVERALL: FAIL-CLOSED" in out.getvalue()
+    # no symbol was modified
+    assert store.get_symbol("AAA/USDT").risk_status == "stopped"
+    assert store.get_symbol("BBB/USDT").risk_status == "stopped"
 
 
 def test_resume_stopped_live_mode_not_supported(tmp_path):

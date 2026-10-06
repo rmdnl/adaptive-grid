@@ -30,13 +30,21 @@ class RiskEngine:
 
     def order_veto(self, symbol: str) -> RiskDecision:
         """Veto any order placement while the global kill is active or the
-        symbol is risk-stopped."""
+        symbol is risk-stopped or in error.
+
+        ERROR means a prior verification failed (cancel/liquidation check,
+        order rejection, cycle error): the symbol requires operator
+        attention and must never silently re-enter trading. Active-grid
+        management (fill reconciliation, exit conditions) continues so the
+        position can still be cleaned up — only NEW entry is vetoed."""
         kill_active, kill_reason = self.store.global_kill()
         if kill_active:
             return RiskDecision(False, f"global_kill:{kill_reason}")
         sym = self.store.get_symbol(symbol)
         if sym is not None and sym.risk_status == "stopped":
             return RiskDecision(False, "symbol_stopped")
+        if sym is not None and sym.risk_status == "error":
+            return RiskDecision(False, "symbol_error")
         return RiskDecision(True, None)
 
     def drawdown_breach(self, equity: float, reference: float) -> bool:

@@ -156,6 +156,41 @@ def test_grid_blocked_when_executable_net_below_minimum():
     assert plan.block_reason == "net_below_minimum"
 
 
+def test_net_exactly_at_minimum_is_rejected():
+    """Invariant: executable NET must be STRICTLY greater than the minimum.
+    A grid whose worst level nets exactly the configured floor is REJECTED;
+    only net > floor passes. Sweep ATR finely, and for every grid the gate
+    accepts, verify that raising the floor to exactly that net blocks it."""
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 9000.0},
+        upper_price={"BTC/USDT": 15000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+        min_net_profit_per_grid=0.002,
+    )
+    checked = 0
+    for i in range(4000):
+        atr = 50.0 + i * 0.0001
+        plan = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, atr, filters(), test_cfg)
+        if not plan.executable:
+            continue
+        assert plan.net_pct > test_cfg.min_net_profit_per_grid, (
+            f"grid with net <= floor was accepted (atr={atr}, net={plan.net_pct})"
+        )
+        stricter = make_config(
+            lower_price={"BTC/USDT": 9000.0},
+            upper_price={"BTC/USDT": 15000.0},
+            total_quote_budget={"BTC/USDT": 500.0},
+            min_net_profit_per_grid=plan.net_pct,
+        )
+        recheck = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, atr, filters(), stricter)
+        assert recheck.executable is False
+        assert recheck.block_reason == "net_below_minimum"
+        checked += 1
+        if checked >= 25:
+            break
+    assert checked >= 25, "sweep never produced enough executable grids to check the strict gate"
+
+
 def test_grid_blocked_on_missing_atr():
     test_cfg = make_config(
         lower_price={"BTC/USDT": 47000.0},

@@ -9,6 +9,7 @@ order or mutates state.
 from __future__ import annotations
 
 import io
+import re
 import time
 
 import pytest
@@ -320,3 +321,67 @@ def test_cli_check_grid_exit_code_on_rejection(tmp_path):
     cfg = make_config(pair_list=("BBB/USDT",))
     code = _check_grid(cfg, FakeSpot(specs), io.StringIO())
     assert code == 1  # gross below minimum -> overall rejected
+
+
+# ----- adaptive mode: --check-grid must use the adaptive production path -----
+
+class AdaptiveFakeSpot(FakeSpot):
+    """FakeSpot with a read-only USDT balance for the adaptive planner."""
+
+    def __init__(self, specs, usdt=10000.0):
+        super().__init__(specs)
+        self._usdt = usdt
+
+    def get_balance(self, asset):
+        if asset == "USDT":
+            return self._usdt
+        raise AssertionError(f"unexpected balance read: {asset}")
+
+
+def test_check_grid_adaptive_mode_uses_planner_and_accepts():
+    """In adaptive mode, --check-grid must validate through
+    AdaptiveGridPlanner.plan (the production entry path) instead of the
+    static build_grid (which would crash: TOTAL_GRIDS is unset by design)."""
+    sym = "ADA/USDT"
+    specs = {sym: {"base": 100.0, "rng": 2.0, "filters": _filters(), "avg": 100.0}}
+    spot = AdaptiveFakeSpot(specs)
+    out = io.StringIO()
+    cfg = make_config(
+        pair_list=(sym,),
+        adaptive_grid=True,
+        total_grids=None,          # unset by design in adaptive mode
+        lower_price={},
+        upper_price={},
+        total_quote_budget={},
+    )
+    code = _check_grid(cfg, spot, out)
+    text = out.getvalue()
+    assert code == 0
+    assert "GRID STATUS: ACCEPTED" in text
+    assert spot.submissions == []          # still strictly read-only
+    m = re.search(r"TOTAL GRIDS: (\d+)", text)
+    assert m, "planner-selected grid count not displayed"
+    assert m.group(1) != "0"
+
+
+def test_check_grid_adaptive_mode_balance_unavailable_fails_closed():
+    """Adaptive check-grid without a readable USDT balance reports REJECTED
+    for the symbol instead of crashing or guessing a budget."""
+    sym = "ADA/USDT"
+    specs = {sym: {"base": 100.0, "rng": 2.0, "filters": _filters(), "avg": 100.0}}
+    spot = AdaptiveFakeSpot(specs)
+    spot._usdt = None
+    out = io.StringIO()
+    cfg = make_config(
+        pair_list=(sym,),
+        adaptive_grid=True,
+        total_grids=None,
+        lower_price={},
+        upper_price={},
+        total_quote_budget={},
+    )
+    code = _check_grid(cfg, spot, out)
+    text = out.getvalue()
+    assert code == 1
+    assert "GRID STATUS: REJECTED" in text
+    assert "invalid available USDT balance" in text

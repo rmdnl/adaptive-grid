@@ -8,6 +8,7 @@ Pure function - no exchange I/O, no side effects. Easy to unit test.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import List, Optional
@@ -15,6 +16,8 @@ from typing import List, Optional
 import grid as grid_mod
 from config import Config
 from grid import ExchangeFilters, GridLevel
+
+log = logging.getLogger("adaptive_grid")
 
 
 @dataclass(frozen=True)
@@ -90,31 +93,6 @@ class AdaptiveGridPlanner:
         grid_step = atr * cfg.grid_step_atr_multiplier
         if grid_step <= 0:
             raise ValueError("computed grid_step <= 0")
-
-        # Build symmetric range: ±N * step around current_price
-        # N = max_grids / 2 (rounded up) to ensure enough room for max grids
-        max_half_grids = (cfg.max_grids + 1) // 2
-        raw_lower = current_price - max_half_grids * grid_step
-        raw_upper = current_price + max_half_grids * grid_step
-
-        # Ensure lower < current < upper
-        if raw_lower <= 0:
-            raw_lower = current_price * 0.001  # minimum positive
-        if raw_upper <= current_price:
-            raw_upper = current_price * 1.001
-
-        # Quantize bounds to tick_size (conservative: floor lower, ceil upper)
-        tick = filters.tick_size
-        lower_price = AdaptiveGridPlanner._quantize_price_floor(raw_lower, tick)
-        upper_price = AdaptiveGridPlanner._quantize_price_ceil(raw_upper, tick)
-
-        # Validate quantized bounds
-        if lower_price >= upper_price:
-            raise ValueError("quantized lower_price >= upper_price")
-        if lower_price >= current_price:
-            raise ValueError("quantized lower_price >= current_price")
-        if upper_price <= current_price:
-            raise ValueError("quantized upper_price <= current_price")
 
         # Compute quote budget with reserve and allocation cap
         # Available after reserve: available_usdt * (1 - reserve/100)
@@ -192,7 +170,11 @@ class AdaptiveGridPlanner:
                         best_upper = max(lvl.sell_price for lvl in plan.levels)
                         break  # highest passing count found
             except Exception:
-                # Any error in grid building -> try next candidate
+                # Any error in grid building -> try the next (smaller)
+                # candidate; the error is logged so a genuine bug in the
+                # grid builder is never silently swallowed.
+                log.exception("adaptive planner: candidate %s grid failed for %s",
+                              candidate_count, symbol)
                 continue
 
         if best_plan is None:
