@@ -379,12 +379,14 @@ def build_grid(
 
     # The worst (least profitable) executable level decides the gate.
     # Gross minimum is inclusive (>= 0.50% passes); the NET minimum is
-    # inclusive too: net exactly at the configured floor passes, anything
-    # below it is REJECTED.
+    # STRICTLY greater than 0.20%: 0.200% REJECT, 0.199% REJECT,
+    # 0.201% PASS. The executable/quantized value (after buy fee, sell
+    # fee, slippage, tick-size and quantity rounding, and Binance filter
+    # constraints) is authoritative.
     worst = min(levels, key=lambda lvl: lvl.net_pct)
     if worst.gross_pct < cfg.grid_gross_min:
         return _blocked(symbol, mode, step, "gross_below_minimum")
-    if worst.net_pct < cfg.min_net_profit_per_grid:
+    if not worst.net_pct > cfg.min_net_profit_per_grid:
         return _blocked(symbol, mode, step, "net_below_minimum")
 
     return GridPlan(
