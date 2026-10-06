@@ -1002,3 +1002,119 @@ def test_dashboard_payload_exposes_entry_telemetry(env):
     assert t["blocked_adx"] == 0
     assert t["entries_total"] == 0
     assert t["last_entry_blocker"] == "rsi_not_low"
+
+
+# ----- exit-priority entry telemetry (condition failures recorded independently) -----
+
+def test_exit_priority_records_all_failed_entry_conditions(tmp_path):
+    """Exit priority vetoes entry, but the independently-evaluated entry
+    conditions that also failed are still counted (telemetry only)."""
+    bot, store, market = _env(tmp_path)
+    # exit: RSI >= 70. entry failures: ADX 22 (>=20, not >25 so no ADX exit),
+    # RSI 75 (>=40), VO -1 (<0), %B 0.5 (>0.20)
+    market.set("BTC/USDT", snap_entry(rsi=75.0, adx=22.0, volume_osc=-1.0, percent_b=0.5),
+               close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.entry_evaluations == 1
+    assert st.blocked_exit_priority == 1
+    assert st.blocked_adx == 1
+    assert st.blocked_rsi == 1
+    assert st.blocked_vo == 1
+    assert st.blocked_bb == 1
+    assert st.last_entry_blocker == "exit_priority"
+
+
+def test_exit_priority_records_only_failing_conditions(tmp_path):
+    bot, store, market = _env(tmp_path)
+    # exit: RSI >= 70; entry conditions otherwise all pass
+    market.set("BTC/USDT", snap_entry(rsi=75.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.blocked_exit_priority == 1
+    assert st.blocked_rsi == 1
+    assert st.blocked_adx == 0
+    assert st.blocked_vo == 0
+    assert st.blocked_bb == 0
+
+
+def test_exit_priority_with_all_entry_conditions_passing(tmp_path):
+    """Exit priority alone must not fabricate condition failures."""
+    bot, store, market = _env(tmp_path)
+    # exit via z-score only; every entry condition holds
+    market.set("BTC/USDT", snap_entry(zscore=3.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.blocked_exit_priority == 1
+    assert st.blocked_adx == 0
+    assert st.blocked_rsi == 0
+    assert st.blocked_vo == 0
+    assert st.blocked_bb == 0
+    assert st.last_entry_blocker == "exit_priority"
+
+
+def test_exit_priority_counter_accumulates_across_cycles(tmp_path):
+    bot, store, market = _env(tmp_path)
+    market.set("BTC/USDT", snap_entry(zscore=3.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    bot.run_once()
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.entry_evaluations == 3
+    assert st.blocked_exit_priority == 3
+
+
+def test_insufficient_data_invents_no_condition_blockers(tmp_path):
+    """Fail-closed: missing indicators must not count as ADX/RSI/VO/BB
+    failures, and no exit-priority veto is implied."""
+    bot, store, market = _env(tmp_path)
+    market.set("BTC/USDT", IndicatorSnapshot(symbol="BTC/USDT", last_close=50000.0),
+               close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "WAITING"  # insufficient data keeps WAITING
+    assert st.entry_evaluations == 1
+    assert st.blocked_exit_priority == 0
+    assert st.blocked_adx == 0
+    assert st.blocked_rsi == 0
+    assert st.blocked_vo == 0
+    assert st.blocked_bb == 0
+    assert st.last_entry_blocker is None
+
+
+def test_exit_priority_telemetry_isolated_per_symbol(tmp_path):
+    bot, store, market = _env(tmp_path)
+    market.set("BTC/USDT", snap_entry(rsi=75.0, adx=22.0, volume_osc=-1.0, percent_b=0.5),
+               close_15m=49500.0, candle=NO_FILL_CANDLE)
+    market.set("ETH/USDT", snap_entry(symbol="ETH/USDT", last_close=3000.0, atr=20.0, rsi=50.0),
+               close_15m=2950.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    btc = store.get_symbol("BTC/USDT")
+    eth = store.get_symbol("ETH/USDT")
+    assert btc.blocked_exit_priority == 1 and eth.blocked_exit_priority == 0
+    assert btc.blocked_adx == 1 and eth.blocked_adx == 0
+    assert eth.blocked_rsi == 1 and btc.blocked_rsi == 1  # both failed RSI, independently
+    assert btc.last_entry_blocker == "exit_priority"
+    assert eth.last_entry_blocker == "rsi_not_low"
+
+
+def test_exit_priority_counter_survives_restart(tmp_path):
+    bot, store, market = _env(tmp_path)
+    market.set("BTC/USDT", snap_entry(zscore=3.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    assert store.get_symbol("BTC/USDT").blocked_exit_priority == 1
+
+    reopened = StateStore(str(store.path))
+    st = reopened.get_symbol("BTC/USDT")
+    assert st.blocked_exit_priority == 1  # persisted, not in-memory
+
+
+def test_successful_entry_does_not_touch_exit_priority_counter(env):
+    bot, store, market = env
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ACTIVE"
+    assert st.entries_total == 1
+    assert st.blocked_exit_priority == 0
+    assert st.blocked_adx == 0 and st.blocked_rsi == 0

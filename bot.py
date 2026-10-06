@@ -592,10 +592,23 @@ class Bot:
         self.store.set_symbol_state(
             symbol, state, entry_blocker=entry_decision.blocker, block_reason=None
         )
-        # Entry telemetry: per-condition blocker counters. exit_priority is
-        # recorded as the last blocker but is not a strategy-condition block.
+        # Entry telemetry: per-condition blocker counters. Exit priority does
+        # not stop the per-condition accounting: the failed entry conditions
+        # are evaluated independently (single source of truth:
+        # strategy_mod.entry_blockers) so the counters describe why an entry
+        # would not have been made even when an EXIT condition vetoed it.
+        # blocked_exit_priority counts the veto itself. Telemetry only —
+        # none of this feeds back into any trading decision.
         if entry_decision.blocker == "exit_priority":
-            self.store.update_symbol(symbol, last_entry_blocker="exit_priority")
+            self.store.increment_symbol_counters(symbol, {"blocked_exit_priority": 1})
+            self._tally_entry_blockers(
+                symbol,
+                # keep real condition failures only: a data-availability
+                # placeholder must never mask the actual blocker
+                [b for b in strategy_mod.entry_blockers(snap, self.cfg)
+                 if b in self._BLOCKER_COUNTERS],
+                "exit_priority",
+            )
         elif entry_decision.blocker != "insufficient_data":
             self._tally_entry_blockers(
                 symbol,

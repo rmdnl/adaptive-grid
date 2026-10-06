@@ -36,6 +36,7 @@ TELEMETRY_ROWS = [
     ("BUDGET BLOCKED", "blocked_budget"),
     ("RISK BLOCKED", "blocked_risk"),
     ("COOLDOWN BLOCKED", "blocked_cooldown"),
+    ("EXIT PRIORITY", "blocked_exit_priority"),
     ("TOTAL ENTRIES", "entries_total"),
 ]
 
@@ -48,7 +49,7 @@ def _seed_telemetry(store: StateStore, symbol: str, **values) -> None:
     full = dict(
         entry_evaluations=0, blocked_adx=0, blocked_rsi=0, blocked_vo=0,
         blocked_bb=0, blocked_grid=0, blocked_budget=0, blocked_risk=0,
-        blocked_cooldown=0, entries_total=0,
+        blocked_cooldown=0, blocked_exit_priority=0, entries_total=0,
         last_entry_ts=None, last_entry_blocker=None, last_grid_reject_reason=None,
     )
     full.update(values)
@@ -65,7 +66,7 @@ def _store_with_telemetry(tmp_path: Path) -> str:
         store, "BTC/USDT",
         entry_evaluations=128, blocked_adx=91, blocked_rsi=14, blocked_vo=8,
         blocked_bb=7, blocked_grid=5, blocked_budget=0, blocked_risk=0,
-        blocked_cooldown=3, entries_total=2,
+        blocked_cooldown=3, blocked_exit_priority=4, entries_total=2,
         last_entry_ts=1791300075.0,
         last_entry_blocker="adx_not_low",
         last_grid_reject_reason="net_below_minimum",
@@ -96,6 +97,7 @@ def test_api_state_includes_entry_telemetry(tmp_path):
     assert t["blocked_budget"] == 0
     assert t["blocked_risk"] == 0
     assert t["blocked_cooldown"] == 3
+    assert t["blocked_exit_priority"] == 4
     assert t["entries_total"] == 2
     assert t["last_entry_ts"] == 1791300075.0
     assert t["last_entry_blocker"] == "adx_not_low"
@@ -257,6 +259,7 @@ def test_js_renders_entry_telemetry_section(tmp_path):
     assert rows["BUDGET BLOCKED"] == "0"
     assert rows["RISK BLOCKED"] == "0"
     assert rows["COOLDOWN BLOCKED"] == "3"
+    assert rows["EXIT PRIORITY"] == "4"
     assert rows["TOTAL ENTRIES"] == "2"
 
 
@@ -347,10 +350,12 @@ def test_js_multi_symbol_telemetry_independent(tmp_path):
     evals = [v for label, v in pairs if label == "EVALUATIONS"]
     adx = [v for label, v in pairs if label == "ADX BLOCKED"]
     entries = [v for label, v in pairs if label == "TOTAL ENTRIES"]
+    exit_prio = [v for label, v in pairs if label == "EXIT PRIORITY"]
     blockers = [v for label, v in pairs if label == "LAST BLOCKER"]
     assert evals == ["128", "0"]
     assert adx == ["91", "0"]
     assert entries == ["2", "0"]
+    assert exit_prio == ["4", "0"]
     # BTC has a recorded blocker; ETH's is genuinely unavailable -> dash
     assert blockers == ["ADX ABOVE ENTRY LIMIT", DASH]
 

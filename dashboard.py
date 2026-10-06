@@ -239,6 +239,7 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "blocked_budget": st.blocked_budget,
         "blocked_risk": st.blocked_risk,
         "blocked_cooldown": st.blocked_cooldown,
+        "blocked_exit_priority": st.blocked_exit_priority,
         "entries_total": st.entries_total,
         "last_entry_ts": st.last_entry_ts,
         "last_entry_blocker": st.last_entry_blocker,
@@ -674,6 +675,7 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     m.appendChild(kv("BUDGET BLOCKED", telemetryCounter(t, "blocked_budget")));
     m.appendChild(kv("RISK BLOCKED", telemetryCounter(t, "blocked_risk")));
     m.appendChild(kv("COOLDOWN BLOCKED", telemetryCounter(t, "blocked_cooldown")));
+    m.appendChild(kv("EXIT PRIORITY", telemetryCounter(t, "blocked_exit_priority")));
     m.appendChild(kv("TOTAL ENTRIES", telemetryCounter(t, "entries_total")));
     m.appendChild(hr());
     m.appendChild(kv("LAST ENTRY", telemetryText(t, "last_entry_ts", fmtTs)));

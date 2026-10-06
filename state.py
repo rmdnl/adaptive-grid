@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     blocked_vo INTEGER DEFAULT 0, blocked_bb INTEGER DEFAULT 0,
     blocked_grid INTEGER DEFAULT 0, blocked_budget INTEGER DEFAULT 0,
     blocked_risk INTEGER DEFAULT 0, blocked_cooldown INTEGER DEFAULT 0,
+    blocked_exit_priority INTEGER DEFAULT 0,
     entries_total INTEGER DEFAULT 0,
     last_entry_ts REAL, last_entry_blocker TEXT, last_grid_reject_reason TEXT,
     updated_at REAL DEFAULT 0
@@ -96,7 +97,7 @@ _SYMBOL_COLUMNS = {
     # Entry blocker telemetry (v5): read-only tuning statistics
     "entry_evaluations", "blocked_adx", "blocked_rsi", "blocked_vo",
     "blocked_bb", "blocked_grid", "blocked_budget", "blocked_risk",
-    "blocked_cooldown", "entries_total", "last_entry_ts",
+    "blocked_cooldown", "blocked_exit_priority", "entries_total", "last_entry_ts",
     "last_entry_blocker", "last_grid_reject_reason",
 }
 
@@ -106,7 +107,8 @@ OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
 # been converted into child SELL orders (prevents duplicate child sells).
 # Schema v4 adds adaptive grid parameters for automatic grid range/count/budget.
 # Schema v5 adds per-symbol entry blocker telemetry (read-only tuning stats).
-SCHEMA_VERSION = 5
+# Schema v6 adds blocked_exit_priority to the telemetry set.
+SCHEMA_VERSION = 6
 
 # Inventory dust below this absolute quantity is zeroed after a SELL.
 _INVENTORY_DUST = 1e-12
@@ -154,6 +156,7 @@ class SymbolState:
     blocked_budget: int = 0
     blocked_risk: int = 0
     blocked_cooldown: int = 0
+    blocked_exit_priority: int = 0
     entries_total: int = 0
     last_entry_ts: Optional[float] = None
     last_entry_blocker: Optional[str] = None
@@ -255,6 +258,16 @@ class StateStore:
                 ):
                     if column not in cols:
                         conn.execute(f"ALTER TABLE symbols ADD COLUMN {column} {decl}")
+            if version < 6:
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(symbols)").fetchall()
+                }
+                if "blocked_exit_priority" not in cols:
+                    conn.execute(
+                        "ALTER TABLE symbols ADD COLUMN blocked_exit_priority "
+                        "INTEGER DEFAULT 0"
+                    )
             if version < SCHEMA_VERSION:
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
