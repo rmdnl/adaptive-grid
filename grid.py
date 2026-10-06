@@ -330,14 +330,28 @@ def build_grid(
             continue
         # NOTIONAL filter: enforce min and max for LIMIT_MAKER orders.
         # min_notional is always enforced (above during qty selection).
-        # max_notional: enforce for LIMIT_MAKER when present, regardless of
-        # apply_max_to_market flag (which indicates MARKET-only applicability).
+        # max_notional: when present, try to reduce qty to fit within the
+        # limit before dropping the level entirely. This handles pairs with
+        # large spread/step_size where the min_notional qty would exceed
+        # max_notional — the level is still tradeable at a smaller qty.
         if filters.max_notional is not None:
             buy_notional = buy_price * qty
             sell_notional = sell_price * qty
             if buy_notional > filters.max_notional or sell_notional > filters.max_notional:
-                dropped_levels += 1
-                continue
+                # Calculate maximum allowed quantity that fits max_notional
+                max_price = max(buy_price, sell_price)
+                max_allowed_qty = quantize_qty_floor(
+                    filters.max_notional / max_price, filters.step_size
+                )
+                # Feasibility check: reduced qty must still satisfy min_notional
+                # and min_qty filters
+                if max_allowed_qty > 0 and \
+                   max_allowed_qty * buy_price >= filters.min_notional and \
+                   (filters.min_qty <= 0 or max_allowed_qty >= filters.min_qty):
+                    qty = max_allowed_qty
+                else:
+                    dropped_levels += 1
+                    continue
 
         exec_gross = (sell_price - buy_price) / buy_price
         exec_net = net_profit_pct(exec_gross, cfg.maker_fee, cfg.taker_fee, cfg.slippage_estimate)
