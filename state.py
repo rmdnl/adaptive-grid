@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS symbols (
     adaptive_timeframe TEXT,
     inventory_qty REAL DEFAULT 0, avg_cost REAL DEFAULT 0,
     risk_status TEXT DEFAULT 'ok',
+    -- Entry blocker telemetry (read-only tuning statistics)
+    entry_evaluations INTEGER DEFAULT 0,
+    blocked_adx INTEGER DEFAULT 0, blocked_rsi INTEGER DEFAULT 0,
+    blocked_vo INTEGER DEFAULT 0, blocked_bb INTEGER DEFAULT 0,
+    blocked_grid INTEGER DEFAULT 0, blocked_budget INTEGER DEFAULT 0,
+    blocked_risk INTEGER DEFAULT 0, blocked_cooldown INTEGER DEFAULT 0,
+    entries_total INTEGER DEFAULT 0,
+    last_entry_ts REAL, last_entry_blocker TEXT, last_grid_reject_reason TEXT,
     updated_at REAL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS orders (
@@ -85,6 +93,11 @@ _SYMBOL_COLUMNS = {
     "adaptive_quote_budget", "adaptive_grid_step", "adaptive_reference_price",
     "adaptive_timeframe",
     "inventory_qty", "avg_cost", "risk_status",
+    # Entry blocker telemetry (v5): read-only tuning statistics
+    "entry_evaluations", "blocked_adx", "blocked_rsi", "blocked_vo",
+    "blocked_bb", "blocked_grid", "blocked_budget", "blocked_risk",
+    "blocked_cooldown", "entries_total", "last_entry_ts",
+    "last_entry_blocker", "last_grid_reject_reason",
 }
 
 OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
@@ -92,7 +105,8 @@ OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
 # orders.child_sell_qty tracks how much executed BUY quantity has already
 # been converted into child SELL orders (prevents duplicate child sells).
 # Schema v4 adds adaptive grid parameters for automatic grid range/count/budget.
-SCHEMA_VERSION = 4
+# Schema v5 adds per-symbol entry blocker telemetry (read-only tuning stats).
+SCHEMA_VERSION = 5
 
 # Inventory dust below this absolute quantity is zeroed after a SELL.
 _INVENTORY_DUST = 1e-12
@@ -130,6 +144,20 @@ class SymbolState:
     adaptive_timeframe: Optional[str] = None
     inventory_qty: float = 0.0
     avg_cost: float = 0.0
+    # Entry blocker telemetry (v5): read-only tuning statistics
+    entry_evaluations: int = 0
+    blocked_adx: int = 0
+    blocked_rsi: int = 0
+    blocked_vo: int = 0
+    blocked_bb: int = 0
+    blocked_grid: int = 0
+    blocked_budget: int = 0
+    blocked_risk: int = 0
+    blocked_cooldown: int = 0
+    entries_total: int = 0
+    last_entry_ts: Optional[float] = None
+    last_entry_blocker: Optional[str] = None
+    last_grid_reject_reason: Optional[str] = None
     risk_status: str = "ok"
     updated_at: float = 0.0
 
@@ -202,6 +230,28 @@ class StateStore:
                     ("adaptive_grid_step", "REAL"),
                     ("adaptive_reference_price", "REAL"),
                     ("adaptive_timeframe", "TEXT"),
+                ):
+                    if column not in cols:
+                        conn.execute(f"ALTER TABLE symbols ADD COLUMN {column} {decl}")
+            if version < 5:
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(symbols)").fetchall()
+                }
+                for column, decl in (
+                    ("entry_evaluations", "INTEGER DEFAULT 0"),
+                    ("blocked_adx", "INTEGER DEFAULT 0"),
+                    ("blocked_rsi", "INTEGER DEFAULT 0"),
+                    ("blocked_vo", "INTEGER DEFAULT 0"),
+                    ("blocked_bb", "INTEGER DEFAULT 0"),
+                    ("blocked_grid", "INTEGER DEFAULT 0"),
+                    ("blocked_budget", "INTEGER DEFAULT 0"),
+                    ("blocked_risk", "INTEGER DEFAULT 0"),
+                    ("blocked_cooldown", "INTEGER DEFAULT 0"),
+                    ("entries_total", "INTEGER DEFAULT 0"),
+                    ("last_entry_ts", "REAL"),
+                    ("last_entry_blocker", "TEXT"),
+                    ("last_grid_reject_reason", "TEXT"),
                 ):
                     if column not in cols:
                         conn.execute(f"ALTER TABLE symbols ADD COLUMN {column} {decl}")
@@ -329,6 +379,23 @@ class StateStore:
     def set_symbol_state(self, symbol: str, state: str, **values) -> None:
         values["strategy_state"] = state
         self.update_symbol(symbol, **values)
+
+    def increment_symbol_counters(self, symbol: str, fields: Dict[str, int]) -> None:
+        """Atomically bump integer telemetry counters (SQL-side x = x + delta).
+
+        Used only for read-only tuning telemetry; never affects a trading
+        decision. Unknown fields are ignored (deterministic no-op)."""
+        cols = [c for c in fields if c in _SYMBOL_COLUMNS]
+        if not cols:
+            return
+        assignments = ", ".join(f"{c}={c}+?" for c in cols)
+        params = [fields[c] for c in cols] + [time.time(), symbol]
+        conn = self._connect()
+        conn.execute(
+            f"UPDATE symbols SET {assignments}, updated_at=? WHERE symbol=?", params
+        )
+        conn.commit()
+        conn.close()
 
     def set_cooldown(self, symbol: str, until_ts: float) -> None:
         self.update_symbol(symbol, cooldown_until=until_ts)

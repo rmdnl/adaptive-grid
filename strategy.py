@@ -1,8 +1,8 @@
 """Strategy evaluation: indicator snapshot, entry gate, exit gate.
 
-Entry requires ALL conditions (strict thresholds, never loosened):
-    ADX < ENTRY_ADX_MAX AND RSI < ENTRY_RSI_MAX
-    AND VolumeOscillator > ENTRY_VOLUME_OSC_MIN AND %B <= ENTRY_BB_PERCENT_B_MAX
+Entry requires ALL conditions (thresholds configured via .env):
+    ADX < ENTRY_ADX_MAX AND RSI <= ENTRY_RSI_MAX
+    AND VolumeOscillator >= ENTRY_VOLUME_OSC_MIN AND %B <= ENTRY_BB_PERCENT_B_MAX
 
 Exit fires when ANY condition holds:
     RSI >= EXIT_RSI_MIN OR ADX > EXIT_ADX_MIN
@@ -78,23 +78,34 @@ def build_snapshot(
     )
 
 
-def evaluate_entry(snapshot: IndicatorSnapshot, cfg) -> EntryDecision:
+def entry_blockers(snapshot: IndicatorSnapshot, cfg) -> List[str]:
+    """ALL currently-failed entry conditions, in gate order (empty list =
+    every entry condition satisfied). Single source of truth for both the
+    entry decision and the per-condition blocker telemetry."""
     if (
         snapshot.adx is None
         or snapshot.rsi is None
         or snapshot.percent_b is None
         or snapshot.volume_osc is None
     ):
-        return EntryDecision(False, "insufficient_data")
+        return ["insufficient_data"]
+    failed: List[str] = []
     if not (snapshot.adx < cfg.entry_adx_max):
-        return EntryDecision(False, "adx_not_low")
-    if not (snapshot.rsi < cfg.entry_rsi_max):
-        return EntryDecision(False, "rsi_not_low")
-    if not (snapshot.volume_osc > cfg.entry_volume_osc_min):
-        return EntryDecision(False, "volume_osc_not_positive")
+        failed.append("adx_not_low")
+    if not (snapshot.rsi <= cfg.entry_rsi_max):
+        failed.append("rsi_not_low")
+    if not (snapshot.volume_osc >= cfg.entry_volume_osc_min):
+        failed.append("volume_osc_not_positive")
     if not (snapshot.percent_b <= cfg.entry_bb_percent_b_max):
-        return EntryDecision(False, "percent_b_not_low")
-    return EntryDecision(True, None)
+        failed.append("percent_b_not_low")
+    return failed
+
+
+def evaluate_entry(snapshot: IndicatorSnapshot, cfg) -> EntryDecision:
+    failed = entry_blockers(snapshot, cfg)
+    if not failed:
+        return EntryDecision(True, None)
+    return EntryDecision(False, failed[0])
 
 
 def evaluate_exit(snapshot: IndicatorSnapshot, cfg) -> ExitDecision:

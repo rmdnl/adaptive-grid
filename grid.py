@@ -106,6 +106,35 @@ def net_profit_pct(gross_pct: float, maker_fee: float, taker_fee: float, slippag
     return gross_pct - (fee + slippage) * (2.0 + gross_pct)
 
 
+def required_gross_for_economics(cfg) -> float:
+    """Smallest theoretical gross per grid that satisfies BOTH the gross
+    minimum and the net minimum (after fees and slippage), derived by
+    inverting net_profit_pct. Deterministic; no hardcoded step percentages."""
+    cost = max(cfg.maker_fee, cfg.taker_fee) + cfg.slippage_estimate
+    # net(g) = g*(1-cost) - 2*cost >= min_net  =>  g >= (min_net + 2*cost)/(1-cost)
+    g_net = (cfg.min_net_profit_per_grid + 2.0 * cost) / (1.0 - cost)
+    return max(cfg.grid_gross_min, g_net)
+
+
+def economic_min_step(price: float, cfg, mode: str) -> float:
+    """Smallest grid step whose WORST level still clears the configured
+    gross and net economics (fees + slippage included), derived from the
+    required profitability — never from a hardcoded percentage.
+
+    Arithmetic: the worst level is the highest buy (price - step), so
+    step/(price - step) >= g_req  =>  step >= g_req*price/(1+g_req).
+    Geometric: every level's gross equals the ratio, so step >= g_req*price.
+
+    The candidate step is only a floor: the caller MUST rebuild the actual
+    grid and validate the executable (quantized) economics afterwards —
+    quantization and filter drops decide, never the theoretical value.
+    """
+    g_req = required_gross_for_economics(cfg)
+    if mode == "geometric":
+        return price * g_req
+    return price * g_req / (1.0 + g_req)
+
+
 def price_band(
     filters: ExchangeFilters, side: str, reference_price: Optional[float]
 ) -> Optional[tuple]:
@@ -164,6 +193,7 @@ def build_grid(
     lower_override: Optional[float] = None,
     upper_override: Optional[float] = None,
     total_grids_override: Optional[int] = None,
+    step_override: Optional[float] = None,
 ) -> GridPlan:
     """Build the grid plan. `reference_price` is the exchange's weighted-
     average price (PERCENT_PRICE_BY_SIDE reference); when the symbol
@@ -172,9 +202,11 @@ def build_grid(
 
     Enforces configured LOWER_PRICE / UPPER_PRICE bounds and TOTAL_GRIDS limit.
 
-    Override parameters (lower_override, upper_override, total_grids_override)
-    are used by the adaptive planner to test candidate grid configurations.
-    When provided, they take precedence over config values.
+    Override parameters (lower_override, upper_override, total_grids_override,
+    step_override) are used by the adaptive planner to test candidate grid
+    configurations. When provided, they take precedence over config values.
+    `step_override` is the planner's actual step (e.g. the economic minimum
+    when ATR spacing would fall below the profitability floor).
     """
     if mode not in ("arithmetic", "geometric"):
         return _blocked(symbol, mode, 0.0, "invalid_mode")
@@ -202,7 +234,11 @@ def build_grid(
     if upper_bound is not None and price > upper_bound:
         return _blocked(symbol, mode, 0.0, "current_price_above_upper_bound")
 
-    step = atr_value * cfg.grid_step_atr_multiplier
+    step = step_override if step_override is not None else (
+        atr_value * cfg.grid_step_atr_multiplier
+    )
+    if step is None or step <= 0:
+        return _blocked(symbol, mode, 0.0, "insufficient_data")
     ratio: Optional[Decimal] = None
     if mode == "geometric":
         ratio = _dec(step) / _dec(price)
@@ -315,13 +351,12 @@ def build_grid(
 
     # The worst (least profitable) executable level decides the gate.
     # Gross minimum is inclusive (>= 0.50% passes); the NET minimum is
-    # STRICTLY greater than the configured floor: a grid whose worst level
-    # nets exactly the minimum is REJECTED (0.199% and 0.200% both reject,
-    # 0.201% passes).
+    # inclusive too: net exactly at the configured floor passes, anything
+    # below it is REJECTED.
     worst = min(levels, key=lambda lvl: lvl.net_pct)
     if worst.gross_pct < cfg.grid_gross_min:
         return _blocked(symbol, mode, step, "gross_below_minimum")
-    if worst.net_pct <= cfg.min_net_profit_per_grid:
+    if worst.net_pct < cfg.min_net_profit_per_grid:
         return _blocked(symbol, mode, step, "net_below_minimum")
 
     return GridPlan(

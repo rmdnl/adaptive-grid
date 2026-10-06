@@ -227,6 +227,23 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "risk_status_human": human_risk_status(st.risk_status),
         "updated_at": st.updated_at,
     }
+    # Entry blocker telemetry (read-only tuning statistics; the bot is the
+    # sole writer, the dashboard only displays).
+    payload["entry_telemetry"] = {
+        "entry_evaluations": st.entry_evaluations,
+        "blocked_adx": st.blocked_adx,
+        "blocked_rsi": st.blocked_rsi,
+        "blocked_vo": st.blocked_vo,
+        "blocked_bb": st.blocked_bb,
+        "blocked_grid": st.blocked_grid,
+        "blocked_budget": st.blocked_budget,
+        "blocked_risk": st.blocked_risk,
+        "blocked_cooldown": st.blocked_cooldown,
+        "entries_total": st.entries_total,
+        "last_entry_ts": st.last_entry_ts,
+        "last_entry_blocker": st.last_entry_blocker,
+        "last_grid_reject_reason": st.last_grid_reject_reason,
+    }
     # Adaptive grid parameters (Phase 1) - only include when grid is/was active
     if st.adaptive_lower_price is not None:
         payload["adaptive_lower_price"] = st.adaptive_lower_price

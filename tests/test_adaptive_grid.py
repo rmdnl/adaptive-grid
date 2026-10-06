@@ -32,8 +32,10 @@ import pytest
 
 from adaptive_grid import AdaptiveGridPlanner
 from config import Config
-from grid import ExchangeFilters, GridLevel
+from grid import ExchangeFilters, GridLevel, economic_min_step
 from conftest import make_config
+
+import grid as grid_mod
 
 
 class TestAdaptiveGridPlanner:
@@ -187,22 +189,66 @@ class TestAdaptiveGridPlanner:
             reference_price=50000.0,
             available_usdt=10000.0,
         )
-        assert plan.net_pct > 0.002  # strictly greater than 0.20%
+        assert plan.net_pct >= 0.002  # >= 0.20% (inclusive floor)
 
-    def test_net_below_020_percent_rejected(self):
-        """Candidate with net < 0.20% should be rejected (fail-closed)."""
-        # Very small ATR -> very small step -> net below minimum
-        cfg = self.make_cfg(grid_step_atr_multiplier=0.01, min_grids=3, max_grids=5)
+    def test_small_atr_uses_economic_minimum_step(self):
+        """Low volatility: when ATR x multiplier would produce a step whose
+        economics fall below the required minimum, the planner floors the
+        step at the economic minimum derived from fees + slippage +
+        required profitability — the grid stays profitable instead of being
+        rejected, WITHOUT loosening any economics."""
+        cfg = self.make_cfg(grid_step_atr_multiplier=0.01)
+        filters = self.make_filters(tick=0.01, step=0.00001, min_notional=1.0)
+        plan = AdaptiveGridPlanner.plan(
+            symbol="BTC/USDT",
+            current_price=50000.0,
+            atr=1.0,  # ATR step = 0.01: far below the economic minimum
+            cfg=cfg,
+            filters=filters,
+            reference_price=50000.0,
+            available_usdt=10000.0,
+        )
+        econ = economic_min_step(50000.0, cfg, cfg.grid_mode("BTC/USDT"))
+        assert plan.step == pytest.approx(econ)
+        # the rebuilt executable grid clears BOTH economics gates
+        assert plan.gross_pct >= cfg.grid_gross_min
+        assert plan.net_pct >= cfg.min_net_profit_per_grid
+        assert plan.total_grids == len(plan.levels)
+
+    def test_atr_step_kept_when_larger_than_economic_minimum(self):
+        """Normal volatility: the ATR-based step is retained unchanged when
+        it already exceeds the economic minimum."""
+        cfg = self.make_cfg(grid_step_atr_multiplier=1.0)
+        filters = self.make_filters(tick=0.01, step=0.00001, min_notional=1.0)
+        atr = 350.0
+        plan = AdaptiveGridPlanner.plan(
+            symbol="BTC/USDT",
+            current_price=50000.0,
+            atr=atr,
+            cfg=cfg,
+            filters=filters,
+            reference_price=50000.0,
+            available_usdt=10000.0,
+        )
+        econ = economic_min_step(50000.0, cfg, cfg.grid_mode("BTC/USDT"))
+        assert atr * cfg.grid_step_atr_multiplier > econ  # precondition holds
+        assert plan.step == pytest.approx(atr * cfg.grid_step_atr_multiplier)
+
+    def test_no_grid_when_budget_cannot_satisfy_min_notional(self):
+        """Fail-closed: with a budget far too small for even one min-notional
+        level, no candidate passes and the planner REJECTS (never lowers
+        economics to force a grid)."""
+        cfg = self.make_cfg(grid_step_atr_multiplier=1.0)
         filters = self.make_filters(tick=0.01, step=0.00001, min_notional=1.0)
         with pytest.raises(ValueError, match="no valid grid found"):
             AdaptiveGridPlanner.plan(
                 symbol="BTC/USDT",
                 current_price=50000.0,
-                atr=1.0,  # Very small ATR
+                atr=350.0,
                 cfg=cfg,
                 filters=filters,
                 reference_price=50000.0,
-                available_usdt=10000.0,
+                available_usdt=0.001,  # per-symbol budget << min notional
             )
 
     def test_tick_size_quantization(self):

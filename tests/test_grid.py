@@ -156,39 +156,70 @@ def test_grid_blocked_when_executable_net_below_minimum():
     assert plan.block_reason == "net_below_minimum"
 
 
-def test_net_exactly_at_minimum_is_rejected():
-    """Invariant: executable NET must be STRICTLY greater than the minimum.
-    A grid whose worst level nets exactly the configured floor is REJECTED;
-    only net > floor passes. Sweep ATR finely, and for every grid the gate
-    accepts, verify that raising the floor to exactly that net blocks it."""
-    test_cfg = make_config(
+def test_net_exactly_at_minimum_passes_below_fails():
+    """Economics contract: executable NET is measured on the final
+    quantized grid. net == 0.002 (the configured floor) PASSES; anything
+    below 0.002 is REJECTED. Gross minimum stays >= 0.50%."""
+    # Sweep ATR finely: every grid the gate accepts must have
+    # net >= floor, and the first accepted grid must be blockable by
+    # raising the floor strictly above its net (proves the boundary).
+    base_cfg = make_config(
         lower_price={"BTC/USDT": 9000.0},
         upper_price={"BTC/USDT": 15000.0},
         total_quote_budget={"BTC/USDT": 500.0},
         min_net_profit_per_grid=0.002,
     )
-    checked = 0
+    accepted = 0
     for i in range(4000):
         atr = 50.0 + i * 0.0001
-        plan = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, atr, filters(), test_cfg)
+        plan = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, atr, filters(), base_cfg)
         if not plan.executable:
             continue
-        assert plan.net_pct > test_cfg.min_net_profit_per_grid, (
-            f"grid with net <= floor was accepted (atr={atr}, net={plan.net_pct})"
+        assert plan.net_pct >= base_cfg.min_net_profit_per_grid, (
+            f"grid with net < floor was accepted (atr={atr}, net={plan.net_pct})"
         )
         stricter = make_config(
             lower_price={"BTC/USDT": 9000.0},
             upper_price={"BTC/USDT": 15000.0},
             total_quote_budget={"BTC/USDT": 500.0},
-            min_net_profit_per_grid=plan.net_pct,
+            min_net_profit_per_grid=plan.net_pct * (1.0 + 1e-9),
         )
         recheck = grid.build_grid("BTC/USDT", "arithmetic", 10000.0, atr, filters(), stricter)
         assert recheck.executable is False
         assert recheck.block_reason == "net_below_minimum"
-        checked += 1
-        if checked >= 25:
+        accepted += 1
+        if accepted >= 25:
             break
-    assert checked >= 25, "sweep never produced enough executable grids to check the strict gate"
+    assert accepted >= 25, "sweep never produced enough executable grids"
+
+
+def test_required_gross_for_economics_inverts_net_formula():
+    """The economic derivation inverts the net formula exactly: a grid with
+    gross == required_gross_for_economics nets exactly min_net_profit."""
+    cfg = make_config()
+    g_req = grid.required_gross_for_economics(cfg)
+    assert g_req >= cfg.grid_gross_min
+    net_at_req = grid.net_profit_pct(
+        g_req, cfg.maker_fee, cfg.taker_fee, cfg.slippage_estimate
+    )
+    assert net_at_req == pytest.approx(cfg.min_net_profit_per_grid, abs=1e-12)
+
+
+def test_economic_min_step_derived_from_fees_and_profitability():
+    """economic_min_step is a pure function of price, fees, slippage and
+    the required profitability — and clears the economics at the worst
+    (highest-buy) level."""
+    cfg = make_config()
+    price = 10000.0
+    step = grid.economic_min_step(price, cfg, "arithmetic")
+    g_req = grid.required_gross_for_economics(cfg)
+    assert step == pytest.approx(price * g_req / (1.0 + g_req), abs=1e-9)
+    # worst-level theoretical gross at exactly this step meets the requirement
+    worst_gross = step / (price - step)
+    assert worst_gross >= g_req - 1e-12
+    # geometric mode: step = g_req * price
+    step_geo = grid.economic_min_step(price, cfg, "geometric")
+    assert step_geo == pytest.approx(price * g_req, abs=1e-9)
 
 
 def test_grid_blocked_on_missing_atr():

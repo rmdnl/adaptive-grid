@@ -332,7 +332,14 @@ def load_config(env_file: str = ".env") -> Config:
     exit_bb_percent_b_min = _get_float(env, "EXIT_BB_PERCENT_B_MIN", minimum=None, maximum=None, errors=errors)
     exit_zscore_abs_max = _get_float(env, "EXIT_ZSCORE_ABS_MAX", minimum=0.000001, maximum=None, errors=errors)
 
-    grid_step_atr_multiplier = _get_float(env, "GRID_STEP_ATR_MULTIPLIER", minimum=0.000001, maximum=None, errors=errors)
+    # ATR_GRID_MULTIPLIER is the authoritative name; the legacy
+    # GRID_STEP_ATR_MULTIPLIER spelling is still accepted (same .env source,
+    # no second configuration source) so an existing deployment .env keeps
+    # loading deterministically.
+    if "ATR_GRID_MULTIPLIER" in env:
+        grid_step_atr_multiplier = _get_float(env, "ATR_GRID_MULTIPLIER", minimum=0.000001, maximum=None, errors=errors)
+    else:
+        grid_step_atr_multiplier = _get_float(env, "GRID_STEP_ATR_MULTIPLIER", minimum=0.000001, maximum=None, errors=errors)
     grid_gross_min = _get_float(env, "GRID_GROSS_MIN", minimum=MIN_GROSS_FLOOR, maximum=None, errors=errors)
     min_net_profit_per_grid = _get_float(env, "MIN_NET_PROFIT_PER_GRID", minimum=MIN_NET_FLOOR, maximum=None, errors=errors)
 

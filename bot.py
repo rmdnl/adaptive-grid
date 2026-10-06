@@ -381,6 +381,9 @@ class Bot:
             self.store.set_symbol_state(symbol, "STOPPED")
             return
         if strategy_mod.cooldown_active(now, st.cooldown_until):
+            # Entry telemetry: a cooldown cycle is an entry attempt blocked
+            # by the cooldown gate.
+            self._tally_entry_blockers(symbol, ["cooldown"], "cooldown")
             self.store.set_symbol_state(symbol, "COOLDOWN")
             return
 
@@ -427,6 +430,8 @@ class Bot:
             return
 
         # No active grid: entry path (exit conditions take priority).
+        # Entry telemetry: this cycle evaluated an entry.
+        self.store.increment_symbol_counters(symbol, {"entry_evaluations": 1})
         # 15m lower-boundary protection applies when a configured LOWER_PRICE exists
         # (static mode) or when an adaptive grid was previously active (restart recovery).
         # In pure adaptive mode with no prior grid, there's no boundary to check yet.
@@ -454,11 +459,14 @@ class Bot:
                     symbol,
                 )
                 self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="boundary_unknown")
+                self.store.update_symbol(symbol, last_entry_blocker="boundary_unknown")
                 return
 
         if entry_decision.allowed:
             veto = self.risk.order_veto(symbol)
             if not veto.allowed:
+                self._tally_entry_blockers(symbol, [], veto.reason)
+                self.store.increment_symbol_counters(symbol, {"blocked_risk": 1})
                 self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker=veto.reason)
                 return
             filters = self.market.filters(symbol)
@@ -490,6 +498,8 @@ class Bot:
                     )
                 except ValueError as exc:
                     log.info("adaptive grid blocked for %s: %s", symbol, exc)
+                    self.store.increment_symbol_counters(symbol, {"blocked_grid": 1})
+                    self.store.update_symbol(symbol, last_grid_reject_reason=str(exc))
                     self.store.set_symbol_state(
                         symbol,
                         "GRID_BLOCKED",
@@ -514,7 +524,9 @@ class Bot:
                 )
 
                 # Place grid and persist adaptive parameters
-                self._place_grid(symbol, plan)
+                if not self._place_grid(symbol, plan):
+                    return
+                self._tally_entry_success(symbol, now)
                 self.store.update_symbol(
                     symbol,
                     strategy_state="ACTIVE",
@@ -547,6 +559,8 @@ class Bot:
                     reference_price=reference,
                 )
                 if not plan.executable:
+                    self.store.increment_symbol_counters(symbol, {"blocked_grid": 1})
+                    self.store.update_symbol(symbol, last_grid_reject_reason=plan.block_reason or "unknown")
                     self.store.set_symbol_state(
                         symbol,
                         "GRID_BLOCKED",
@@ -558,7 +572,9 @@ class Bot:
                     )
                     log.info("grid blocked for %s: %s", symbol, plan.block_reason)
                     return
-                self._place_grid(symbol, plan)
+                if not self._place_grid(symbol, plan):
+                    return
+                self._tally_entry_success(symbol, now)
                 self.store.set_symbol_state(
                     symbol,
                     "ACTIVE",
@@ -576,8 +592,46 @@ class Bot:
         self.store.set_symbol_state(
             symbol, state, entry_blocker=entry_decision.blocker, block_reason=None
         )
+        # Entry telemetry: per-condition blocker counters. exit_priority is
+        # recorded as the last blocker but is not a strategy-condition block.
+        if entry_decision.blocker == "exit_priority":
+            self.store.update_symbol(symbol, last_entry_blocker="exit_priority")
+        elif entry_decision.blocker != "insufficient_data":
+            self._tally_entry_blockers(
+                symbol,
+                strategy_mod.entry_blockers(snap, self.cfg),
+                entry_decision.blocker,
+            )
 
     # ----- grid lifecycle -----
+
+    # entry blocker -> telemetry counter column (read-only tuning statistics;
+    # never consulted by any trading decision)
+    _BLOCKER_COUNTERS = {
+        "adx_not_low": "blocked_adx",
+        "rsi_not_low": "blocked_rsi",
+        "volume_osc_not_positive": "blocked_vo",
+        "percent_b_not_low": "blocked_bb",
+        "cooldown": "blocked_cooldown",
+    }
+
+    def _tally_entry_blockers(self, symbol: str, blockers, last_blocker: Optional[str]) -> None:
+        """Record entry-blocker telemetry: per-condition counters plus the
+        most recent blocker. Purely observational."""
+        counters: Dict[str, int] = {}
+        for b in blockers:
+            field = self._BLOCKER_COUNTERS.get(b)
+            if field:
+                counters[field] = counters.get(field, 0) + 1
+        if counters:
+            self.store.increment_symbol_counters(symbol, counters)
+        if last_blocker is not None:
+            self.store.update_symbol(symbol, last_entry_blocker=last_blocker)
+
+    def _tally_entry_success(self, symbol: str, now: float) -> None:
+        """Record a successful entry in the telemetry counters."""
+        self.store.increment_symbol_counters(symbol, {"entries_total": 1})
+        self.store.update_symbol(symbol, last_entry_ts=now)
 
     def _is_active(self, symbol: str, st: SymbolState) -> bool:
         if st.strategy_state == "ACTIVE":
@@ -612,7 +666,10 @@ class Bot:
         inventory = float(st.inventory_qty or 0.0) if st else 0.0
         return inventory > covered + pending_conversion + QTY_TOLERANCE
 
-    def _place_grid(self, symbol: str, plan: grid_mod.GridPlan) -> None:
+    def _place_grid(self, symbol: str, plan: grid_mod.GridPlan) -> bool:
+        """Place the executable grid's BUY levels. Returns True when the
+        grid was placed, False when the TOTAL_QUOTE_BUDGET hard limit
+        rejected it (no orders submitted)."""
         # Phase 2: Enforce TOTAL_QUOTE_BUDGET hard limit.
         budget = self.cfg.total_quote_budget.get(symbol) if hasattr(self.cfg, "total_quote_budget") else None
         if budget is not None:
@@ -624,6 +681,8 @@ class Bot:
                     "grid rejected for %s: total buy notional %.8f exceeds TOTAL_QUOTE_BUDGET %.8f",
                     symbol, total_buy_notional, budget
                 )
+                self.store.increment_symbol_counters(symbol, {"blocked_budget": 1})
+                self.store.update_symbol(symbol, last_grid_reject_reason="quote_budget_exceeded")
                 self.store.set_symbol_state(
                     symbol,
                     "GRID_BLOCKED",
@@ -633,7 +692,7 @@ class Bot:
                     gross_pct=plan.gross_pct,
                     net_pct=plan.net_pct,
                 )
-                return
+                return False
 
         for level in plan.levels:
             self.executor.place_limit(
@@ -649,6 +708,7 @@ class Bot:
             symbol, plan.mode, plan.step, plan.gross_pct * 100, plan.net_pct * 100,
             len(plan.levels),
         )
+        return True
 
     def _exit_symbol(self, symbol: str, reason: str, now: float, cooldown: bool) -> None:
         """Automatic exit: cancel → verify → liquidate → verify → record →

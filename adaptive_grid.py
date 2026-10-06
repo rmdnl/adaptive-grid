@@ -108,10 +108,18 @@ class AdaptiveGridPlanner:
         if per_symbol_budget <= 0:
             raise ValueError("computed quote budget <= 0")
 
-        # Base step from ATR (fixed for all candidates)
-        base_step = atr * cfg.grid_step_atr_multiplier
-        if base_step <= 0:
+        # Actual grid step: the larger of the ATR-based spacing and the
+        # economic minimum step (the smallest step whose worst level still
+        # clears the configured gross/net economics after fees and
+        # slippage). When ATR collapses in low volatility, the economic
+        # floor keeps grids profitable instead of getting them rejected;
+        # economics are NEVER loosened — the grid is rebuilt and fully
+        # re-validated below either way.
+        atr_step = atr * cfg.grid_step_atr_multiplier
+        if atr_step <= 0:
             raise ValueError("computed grid_step <= 0")
+        econ_step = grid_mod.economic_min_step(current_price, cfg, cfg.grid_mode(symbol))
+        base_step = max(atr_step, econ_step)
 
         # Try candidate grid counts from MAX_GRIDS down to MIN_GRIDS
         # (prefer highest usable count that passes all constraints)
@@ -154,6 +162,7 @@ class AdaptiveGridPlanner:
                     lower_override=quantized_lower,
                     upper_override=quantized_upper,
                     total_grids_override=candidate_count,
+                    step_override=base_step,
                 )
                 if plan.executable:
                     # Additional check: total buy notional must fit within budget

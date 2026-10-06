@@ -36,25 +36,78 @@ def test_entry_blocked_when_adx_not_below_max(cfg):
     assert d == EntryDecision(False, "adx_not_low")  # 20 < 20 is false: strict
 
 
-def test_entry_blocked_when_rsi_not_below_max(cfg):
-    d = strategy.evaluate_entry(entry_valid_snapshot(rsi=35.0), cfg)
-    assert d == EntryDecision(False, "rsi_not_low")  # strict
+def test_entry_allowed_when_rsi_below_max(cfg):
+    # spec test 1: RSI below 40 passes when all other conditions pass
+    d = strategy.evaluate_entry(entry_valid_snapshot(rsi=39.9), cfg)
+    assert d == EntryDecision(True, None)
 
 
-def test_entry_blocked_when_volume_osc_not_positive(cfg):
+def test_entry_allowed_when_rsi_exactly_max(cfg):
+    # spec test 2: RSI exactly 40 passes (inclusive boundary)
+    d = strategy.evaluate_entry(entry_valid_snapshot(rsi=40.0), cfg)
+    assert d == EntryDecision(True, None)
+
+
+def test_entry_blocked_when_rsi_above_max(cfg):
+    # spec test 3: RSI above 40 is blocked
+    d = strategy.evaluate_entry(entry_valid_snapshot(rsi=40.1), cfg)
+    assert d == EntryDecision(False, "rsi_not_low")
+
+
+def test_entry_allowed_when_adx_below_max(cfg):
+    # spec test 4: ADX below 20 passes
+    d = strategy.evaluate_entry(entry_valid_snapshot(adx=19.9), cfg)
+    assert d == EntryDecision(True, None)
+
+
+def test_entry_allowed_when_volume_osc_exactly_zero(cfg):
+    # spec test 6: VO exactly 0 passes (inclusive boundary)
     d = strategy.evaluate_entry(entry_valid_snapshot(volume_osc=0.0), cfg)
-    assert d == EntryDecision(False, "volume_osc_not_positive")  # > 0 strict
+    assert d == EntryDecision(True, None)
+
+
+def test_entry_blocked_when_volume_osc_negative(cfg):
+    # spec test 7: VO below 0 is blocked
+    d = strategy.evaluate_entry(entry_valid_snapshot(volume_osc=-0.001), cfg)
+    assert d == EntryDecision(False, "volume_osc_not_positive")
 
 
 def test_entry_allowed_when_percent_b_equals_zero(cfg):
-    # %B <= 0 includes the boundary
+    # spec test 8: BB %B exactly 0 passes
     d = strategy.evaluate_entry(entry_valid_snapshot(percent_b=0.0), cfg)
     assert d.allowed is True
 
 
-def test_entry_blocked_when_percent_b_above_zero(cfg):
+def test_entry_allowed_when_percent_b_between_zero_and_max(cfg):
+    # spec test 9: BB %B between 0 and 0.20 passes
     d = strategy.evaluate_entry(entry_valid_snapshot(percent_b=0.1), cfg)
+    assert d.allowed is True
+
+
+def test_entry_allowed_when_percent_b_exactly_max(cfg):
+    # spec test 10: BB %B exactly 0.20 passes (inclusive boundary)
+    d = strategy.evaluate_entry(entry_valid_snapshot(percent_b=0.20), cfg)
+    assert d.allowed is True
+
+
+def test_entry_blocked_when_percent_b_above_max(cfg):
+    # spec test 11: BB %B above 0.20 is blocked
+    d = strategy.evaluate_entry(entry_valid_snapshot(percent_b=0.21), cfg)
     assert d == EntryDecision(False, "percent_b_not_low")
+
+
+def test_entry_blockers_report_every_failed_condition(cfg):
+    """The telemetry helper reports ALL failed conditions, not just the first."""
+    snap = entry_valid_snapshot(adx=25.0, rsi=50.0, volume_osc=-1.0, percent_b=0.5)
+    failed = strategy.entry_blockers(snap, cfg)
+    assert failed == [
+        "adx_not_low",
+        "rsi_not_low",
+        "volume_osc_not_positive",
+        "percent_b_not_low",
+    ]
+    # and reports none when all conditions hold
+    assert strategy.entry_blockers(entry_valid_snapshot(), cfg) == []
 
 
 @pytest.mark.parametrize("missing", ["adx", "rsi", "percent_b", "volume_osc"])

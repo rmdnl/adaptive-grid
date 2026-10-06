@@ -898,3 +898,107 @@ def test_multiple_symbols_independent_live_prices(tmp_path):
     assert st_eth.last_price == 3010.0
     # No cross-contamination
     assert st_btc.last_price != st_eth.last_price
+
+
+# ----- entry blocker telemetry (read-only tuning statistics) -----
+
+def test_entry_telemetry_counters_increment(env):
+    """Telemetry 33: per-condition blocker counters increment correctly and
+    the last blocker is recorded; a later successful entry increments the
+    success counter without touching the blocker counts (telemetry 34/35)."""
+    bot, store, market = env
+    # cycle 1: RSI 50 blocks entry (rsi_not_low); no exit fires (exit RSI >= 70)
+    market.set("BTC/USDT", snap_entry(rsi=50.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.entry_evaluations == 1
+    assert st.blocked_rsi == 1
+    assert st.blocked_adx == 0
+    assert st.blocked_vo == 0
+    assert st.blocked_bb == 0
+    assert st.last_entry_blocker == "rsi_not_low"
+    assert st.entries_total == 0
+
+    # cycle 2: ADX 22 blocks entry (adx_not_low; below exit threshold 25)
+    market.set("BTC/USDT", snap_entry(rsi=30.0, adx=22.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.entry_evaluations == 2
+    assert st.blocked_rsi == 1
+    assert st.blocked_adx == 1
+    assert st.last_entry_blocker == "adx_not_low"
+
+    # cycle 3: all conditions pass -> grid placed, success counter increments
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ACTIVE"
+    assert st.entries_total == 1
+    assert st.last_entry_ts is not None
+    # blocker history is preserved, not reset by the entry
+    assert st.blocked_rsi == 1 and st.blocked_adx == 1
+
+
+def test_entry_telemetry_grid_and_budget_blockers(env):
+    """Telemetry 33 (cont.): grid economics and budget blockers are counted
+    with the rejection reason recorded."""
+    bot, store, market = env
+    # ATR 1.0 at 50000 -> static step 1.0 -> gross 0.002% < 0.5% minimum
+    market.set("BTC/USDT", snap_entry(atr=1.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "GRID_BLOCKED"
+    assert st.blocked_grid == 1
+    assert st.last_grid_reject_reason == "gross_below_minimum"
+    assert st.last_entry_blocker is None  # condition gate passed; grid rejected
+
+
+def test_entry_telemetry_cooldown_counter(env):
+    """Telemetry 33 (cont.): cycles inside cooldown count as cooldown blocks."""
+    bot, store, market = env
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    market.set("BTC/USDT", snap_entry(rsi=80.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()  # exit -> cooldown
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()  # cooldown cycle
+    bot.run_once()  # another cooldown cycle
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "COOLDOWN"
+    assert st.blocked_cooldown == 2
+    assert st.last_entry_blocker == "cooldown"
+    assert st.entries_total == 1  # the original entry
+
+
+def test_entry_telemetry_multi_symbol_independent(tmp_path):
+    """Telemetry 36: each symbol's telemetry is independent — one symbol's
+    blockers never leak into another's counters."""
+    bot, store, market = _env(tmp_path)
+    # BTC blocked by RSI; ETH enters cleanly
+    market.set("BTC/USDT", snap_entry(rsi=50.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    market.set("ETH/USDT", snap_entry(symbol="ETH/USDT", last_close=3000.0, atr=20.0),
+               close_15m=2950.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    btc = store.get_symbol("BTC/USDT")
+    eth = store.get_symbol("ETH/USDT")
+    assert btc.blocked_rsi == 1 and eth.blocked_rsi == 0
+    assert btc.entries_total == 0 and eth.entries_total == 1
+    assert btc.last_entry_blocker == "rsi_not_low"
+    assert eth.strategy_state == "ACTIVE"
+    # ETH's success timestamp is set, BTC's stays absent
+    assert eth.last_entry_ts is not None and btc.last_entry_ts is None
+
+
+def test_dashboard_payload_exposes_entry_telemetry(env):
+    """Telemetry is exposed through the read-only dashboard payload."""
+    from dashboard import _symbol_payload
+    bot, store, market = env
+    market.set("BTC/USDT", snap_entry(rsi=50.0), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    payload = _symbol_payload(store, store.get_symbol("BTC/USDT"))
+    t = payload["entry_telemetry"]
+    assert t["entry_evaluations"] == 1
+    assert t["blocked_rsi"] == 1
+    assert t["blocked_adx"] == 0
+    assert t["entries_total"] == 0
+    assert t["last_entry_blocker"] == "rsi_not_low"
