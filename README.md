@@ -1,52 +1,52 @@
-# adaptive-grid
+# adaptive-grid 🤖📉
 
-Bot grid **Binance Spot** konservatif multi-simbol dengan gerbang masuk/keluar berbasis indikator ketat, validasi ekonomi grid executable, kill switch drawdown global 2%, dan dashboard read-only.
+Bot grid **Binance Spot** konservatif multi-simbol yang vibes-nya *"abang nakal tapi sopan santunya keterbaca"*: gerbang masuk/keluar berbasis indikator ketat, validasi ekonomi grid executable, kill switch drawdown global 2%, plus dashboard read-only yang aesthetic™.
 
-Ada dua mode eksekusi non-live: **PAPER** (simulasi internal; modal sesi berasal dari saldo USDT Binance testnet; tidak ada order yang pernah mencapai Binance) dan **TESTNET EXECUTION** (order Spot **Testnet Binance** asli pada dana virtual). LIVE dinonaktifkan oleh setiap default dan memerlukan keempat gerbang: `EXECUTION_MODE=live`, `BINANCE_ENV=live`, `DRY_RUN=false`, `ALLOW_LIVE_EXECUTION=true`.
+Ada dua mode eksekusi non-live: **PAPER** (simulasi internal; modal sesi dari saldo USDT testnet; literally **zero order** yang nyampe Binance — bot cuma mimpi 💭) dan **TESTNET EXECUTION** (order Spot **Testnet Binance** asli pakai dana virtual, jadi sengsaranya juga virtual 😌). Mode LIVE? Terkunci berlapis-lapis. Buka kuncinya butuh **empat gerbang sekaligus**: `EXECUTION_MODE=live`, `BINANCE_ENV=live`, `DRY_RUN=false`, `ALLOW_LIVE_EXECUTION=true`. Salah satu aja ga kebuka — fail-closed vibes only 🔒.
 
 ---
 
-## Tujuan
+## Tujuan 🎯
 
-Bot menunggu kondisi pasar tenang dan oversold, menempatkan grid kecil order limit buy post-only di bawah harga, menjual setiap buy yang terisi satu langkah grid lebih tinggi, dan keluar sepenuhnya saat kondisi berubah menjadi hostil. Proteksi modal mendominasi setiap kepentingan lain:
+Plot twist-nya sederhana: bot ini nunggu pasar lagi **santuy dan oversold**, taruh grid kecil order limit buy post-only di bawah harga, jual tiap buy yang ke-fill satu langkah grid lebih tinggi (skema cuan kecil-kecil yang halal), lalu **kabur sopan** (exit penuh) begitu kondisi pasar mulai red flag. Proteksi modal itu main character di sini, sisanya extras:
 
-- **Trade Binance Spot saja** — tanpa futures, margin, leverage, shorting, martingale, atau averaging agresif.
-- Masuk hanya di bawah kondisi ketat; keluar begitu kondisi memburuk.
-- Tidak pernah menempatkan grid yang keuntungan net executable-nya tidak bisa melampaui minimum.
-- Hentikan semuanya pada drawdown equity global 2%.
+- **Trade Binance Spot doang** — tanpa futures, margin, leverage, shorting, martingale, atau averaging agresif. Bot ini ga kenal istilah "yolo all-in" dan ga mau kenal. 🚫🃏
+- Masuk cuma kalau kondisi ketat terpenuhi semua; begitu kondisi memburuk, langsung keluar. Discipline-nya gigachad. 💪
+- Ga pernah nempatin grid yang keuntungan net executable-nya ga bisa lewat minimum. Grid receh = ditolak. Verbal rejection. 💅
+- Equity turun global 2%? Semua berhenti. Bot panik duluan daripada lo — itu namanya self-aware. 🚨
 
-## Batasan keamanan (baca dulu)
+## Batasan keamanan (baca dulu, jangan skip, ini penting bestie) ⚠️
 
-- **Tidak ada jaminan profitabilitas.** Tidak ada yang di sini yang menjanjikan keuntungan. Gerbang ekonomi hanya mencegah grid yang *diketahui tidak menguntungkan*.
-- **Testnet adalah environment default.** Harga dan likuiditas testnet berbeda dari produksi; sinyal yang dihitung pada data testnet hanya untuk validasi plumbing, bukan bukti performa.
-- **Equity berbasis PnL**, diankor di `START_EQUITY`:
-  `equity = START_EQUITY + realized_pnl - fees + unrealized_pnl`. Ini **bukan** rekonsiliasi saldo akun penuh. Kill drawdown 2% mengukur kerugian basis modal simulasi.
-- **Kill state tidak auto-reset.** Global kill atau simbol `STOPPED` oleh gerbang batas-bawah 15m tetap ada sampai operator intervensi (edit database state atau database baru).
-- Gerbang batas-bawah 15m **fail-closed**: data 15m yang hilang atau tidak valid memblokir order baru untuk simbol terkait, bukan menebak.
-- Rekonsiliasi fill mode live diimplementasikan tapi belum diuji melawan kondisi produksi; anggap mode live sebagai belum terbukti.
+- **Ga ada jaminan profitabilitas.** Nol. Zilch. Ga ada yang di repo ini ngejanjiin cuan. Gerbang ekonomi cuma bikin bot *ga sengaja* beli grid yang udah kelihatan bakal rugi. Bedakan antara "ga rugi pasti" sama "pasti cuan" — yang pertama aja yang bisa dijamin. 🧊
+- **Testnet adalah environment default.** Harga & likuiditas testnet beda dari produksi (kadang beda jauh, skibidi banget). Sinyal dari data testnet cuma buat validasi plumbing, BUKAN bukti performa. Jangan flex screenshot testnet bilang "algoritmaku menghantam". 💀
+- **Equity berbasis PnL**, diankor ke `START_EQUITY`:
+  `equity = START_EQUITY + realized_pnl - fees + unrealized_pnl`. Ini **bukan** rekonsiliasi saldo akun penuh ya gaes. Kill drawdown 2% ngukur kerugian terhadap basis modal simulasi.
+- **Kill state ga pernah auto-reset.** Global kill atau simbol `STOPPED` oleh gerbang batas-bawah 15m itu kayak ex yang ngambek: bertahan sampai operator yang datang baikan manual. 🫠
+- Gerbang batas-bawah 15m **fail-closed**: kalau data 15m-nya ghosting (ilang/invalid), bot ga nebak-nebak — dia blokir order baru buat simbol itu. Mature. Communicative. Green flag. ✅
+- Rekonsiliasi fill mode live udah diimplementasi tapi belum diuji lawan kondisi produksi beneran. Jadi anggep aja mode live itu statusnya "belum prove". Jangan dipake dulu. 🙅
 
-## Arsitektur
+## Arsitektur 🏗️
 
 ```
 adaptive-grid/
-├── .env.example      # template konfigurasi (.env adalah SUMBER KONFIGURASI TUNGGAL)
+├── .env.example      # template konfigurasi (.env adalah SUMBER KONFIGURASI TUNGGAL, no cap)
 ├── config.py         # load + validasi .env -> satu objek Config immutable
-├── indicators.py     # ADX/RSI/BB %B/VO/Z-score/ATR deterministik (hanya candle closed)
-├── strategy.py       # gerbang masuk ketat, gerbang keluar, prioritas keluar, cooldown
+├── indicators.py     # ADX/RSI/BB %B/VO/Z-score/ATR deterministik (candle CLOSED doang)
+├── strategy.py       # gerbang masuk, gerbang keluar, prioritas keluar, cooldown
 ├── grid.py           # konstruksi grid + ekonomi executable (sadar quantization)
 ├── risk.py           # veto order, kill drawdown 2%, gerbang batas-bawah 15m
 ├── exchange.py       # Binance Spot REST (testnet default), dry-run + live executor
 ├── state.py          # database SQLite tunggal (state, order, fill, PnL, kills)
-├── bot.py            # loop runtime mengorkestrasi siklus penuh
+├── bot.py            # loop runtime yang ngorkestrasi siklus penuh
 ├── dashboard.py      # dashboard HTTP read-only di atas database state
-└── tests/            # test suite deterministik fokus (offline)
+└── tests/            # test suite deterministik (offline, ga borno ke internet)
 ```
 
-**Tidak ada konfigurasi YAML, lapisan kompatibilitas, atau duplikasi sumber konfigurasi.** `.env` adalah sumber kebenaran tunggal; modul lain menerima objek `Config` tervalidasi dan tidak pernah membaca environment sendiri.
+**Ga ada YAML, ga ada lapisan kompatibilitas, ga ada duplikasi sumber konfig.** `.env` itu main character, satu-satunya. Modul lain nerima objek `Config` yang udah tervalidasi dan **ga pernah** baca environment sendiri-sendiri. No sneaky links. 🚫🔗
 
-## Konfigurasi
+## Konfigurasi 🛠️
 
-Salin `.env.example` ke `.env` dan isi. Startup gagal dengan error jelas yang mencantumkan setiap kunci yang hilang atau tidak valid — tidak ada fallback diam untuk nilai strategi.
+Copy `.env.example` jadi `.env`, terus isi. Kalau ada yang kurang/aneh, startup langsung **gagal dengan error yang jelas** dan nge-list SEMUA kunci bermasalah sekaligus — bukan gaen-in satu-satu kayak period tracking app. Ga ada fallback diam-diam buat nilai strategi.
 
 Grup kunci:
 
@@ -55,150 +55,152 @@ Grup kunci:
 | Environment & safety | `BINANCE_ENV` (`testnet`/`live`), `EXECUTION_MODE` (`paper`/`testnet`/`live`), `DRY_RUN`, `ALLOW_LIVE_EXECUTION` |
 | Scope pasar | `PAIR_LIST` (cth `BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT`), `INDICATOR_TIMEFRAME` |
 | Indikator | `ADX_PERIOD`, `RSI_PERIOD`, `BB_PERIOD`, `BB_STD`, `VO_FAST`, `VO_SLOW`, `ZSCORE_PERIOD`, `ATR_PERIOD` |
-| Gerbang masuk (SEMUA harus terpenuhi) | `ENTRY_ADX_MAX`, `ENTRY_RSI_MAX`, `ENTRY_VOLUME_OSC_MIN`, `ENTRY_BB_PERCENT_B_MAX` |
-| Gerbang keluar (SALAH SATU memicu) | `EXIT_RSI_MIN`, `EXIT_ADX_MIN`, `EXIT_BB_PERCENT_B_MIN`, `EXIT_ZSCORE_ABS_MAX` |
-| Ekonomi grid | `GRID_STEP_ATR_MULTIPLIER`, `GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`, `MAKER_FEE`, `TAKER_FEE`, `SLIPPAGE_ESTIMATE` |
+| Gerbang masuk (SEMUA harus lolos) | `ENTRY_ADX_MAX`, `ENTRY_RSI_MAX`, `ENTRY_VOLUME_OSC_MIN`, `ENTRY_BB_PERCENT_B_MAX` |
+| Gerbang keluar (SALAH SATU = gas keluar) | `EXIT_RSI_MIN`, `EXIT_ADX_MIN`, `EXIT_BB_PERCENT_B_MIN`, `EXIT_ZSCORE_ABS_MAX` |
+| Ekonomi grid | `ATR_GRID_MULTIPLIER`, `GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`, `MAKER_FEE`, `TAKER_FEE`, `SLIPPAGE_ESTIMATE` |
 | Risiko | `MAX_DRAWDOWN_PERCENT` (hard cap 2), `STOP_IF_BELOW_LOWER_PERCENT` (hard cap 2), `START_EQUITY`, `COOLDOWN_HOURS` |
-| Kredensial | `BINANCE_TESTNET_API_KEY/SECRET` (testnet), `BINANCE_API_KEY/SECRET` (produksi; tidak digunakan kecuali live sepenuhnya digerbang) |
+| Kredensial | `BINANCE_TESTNET_API_KEY/SECRET` (testnet), `BINANCE_API_KEY/SECRET` (produksi; ga kepake kecuali live benar-benar kebuka gerbangnya) |
 
-Hard floor yang divalidasi: `GRID_GROSS_MIN >= 0.005` (0.50%), `MIN_NET_PROFIT_PER_GRID >= 0.002` (0.20%), `MAX_DRAWDOWN_PERCENT <= 2`, `STOP_IF_BELOW_LOWER_PERCENT <= 2`.
+Hard floor yang divalidasi (coba di-nerf, bakal ditolak config — bot ini literally ga bisa di-bullied): `GRID_GROSS_MIN >= 0.005` (0.50%), `MIN_NET_PROFIT_PER_GRID >= 0.002` (0.20%), `MAX_DRAWDOWN_PERCENT <= 2`, `STOP_IF_BELOW_LOWER_PERCENT <= 2`.
 
-### Mode eksekusi
+> Catatan: nama lama `GRID_STEP_ATR_MULTIPLIER` masih diterima (legacy friendly, biar `.env` deployment lama ga break), tapi `ATR_GRID_MULTIPLIER` nama resminya sekarang. Nama baru, vibes tetap sama.
+
+### Mode eksekusi 🎮
 
 | `BINANCE_ENV` | `EXECUTION_MODE` | Perilaku |
 |---|---|---|
-| `testnet` | `paper` (default) | Simulasi internal; modal sesi dari saldo USDT testnet saat pembuatan sesi; **tidak ada order Binance yang pernah dikirim**; transaksi paper tidak pernah menyentuh akun exchange. |
-| `testnet` | `testnet` | Order **Spot Testnet Binance** asli dengan kredensial testnet saja; butuh `DRY_RUN=false`; exchange adalah sumber kebenaran untuk fill, fee, dan inventory. |
-| `live` | `live` | Eksekusi produksi — terkunci kecuali `DRY_RUN=false` **dan** `ALLOW_LIVE_EXECUTION=true` **dan** live key ada. |
+| `testnet` | `paper` (default) | Simulasi internal; modal sesi dari saldo USDT testnet pas sesi dibuat; **order Binance ga pernah dikirim — periodt**; transaksi paper ga pernah nyentuh akun exchange. |
+| `testnet` | `testnet` | Order **Spot Testnet Binance** asli pakai kredensial testnet doang; wajib `DRY_RUN=false`; exchange jadi sumber kebenaran buat fill, fee, dan inventory. |
+| `live` | `live` | Eksekusi produksi — **terkunci** kecuali `DRY_RUN=false` **dan** `ALLOW_LIVE_EXECUTION=true` **dan** live key ada. Tiga kunci, satu pintu. 🔐 |
 
-Konsistensi dipaksa saat startup (fail closed): `EXECUTION_MODE=live` butuh `BINANCE_ENV=live` dan sebaliknya; `EXECUTION_MODE=testnet` butuh `DRY_RUN=false` dan kredensial testnet; `EXECUTION_MODE=testnet` tidak pernah menyentuh endpoint produksi (base URL dipilih gerbang, bukan key).
+Konsistensi dipaksa saat startup (fail closed): `EXECUTION_MODE=live` wajib `BINANCE_ENV=live`, dan sebaliknya; `EXECUTION_MODE=testnet` wajib `DRY_RUN=false` + kredensial testnet; mode testnet **ga pernah** nyentuh endpoint produksi (base URL dipilih gerbang konfigurasi, bukan difantasisasi dari key). Bot ga bakal "ke-peleset" ke mainnet. Ga ada slip itu di kamusnya.
 
-### Modal sesi (paper/testnet)
+### Modal sesi (paper/testnet) 💰
 
-Di start pertama bot membuat **sesi eksekusi**: modal sesi berasal dari `START_EQUITY` (jika > 0) atau dari saldo USDT Binance testnet (butuh kredensial testnet; fail-closed jika tidak tersedia atau nol). Equity = `modal sesi + realized PnL - fees + unrealized PnL`; saldo wallet hanyalah telemetry display dan tidak pernah diimpor ulang ke ledger paper. Sesi persist: restart melanjutkan modal yang sama, session id, dan baseline drawdown. Mengganti `EXECUTION_MODE`/`BINANCE_ENV` melawan database sesi yang ada menolak startup; escape hatch deterministiknya adalah reset eksplisit:
+Pas start pertama, bot bikin **sesi eksekusi**: modalnya dari `START_EQUITY` (kalau > 0) atau dari saldo USDT testnet (butuh kredensial testnet; fail-closed kalau ga ada / nol — dia ga bakal ngarang modal). Equity = `modal sesi + realized PnL - fees + unrealized PnL`; saldo wallet cuma telemetry buat dipandang-dipandang, ga pernah diimpor ulang ke ledger paper. Sesi persist: restart = lanjut modal yang sama, session id sama, baseline drawdown sama. Ganti `EXECUTION_MODE`/`BINANCE_ENV` lawan database sesi yang udah ada? Startup ditolak. Escape hatch-nya satu dan deterministik:
 
 ```bash
-python bot.py --reset-session    # menolak saat ada order terbuka; hapus sesi + kill state
+python bot.py --reset-session    # nolak kalau masih ada order terbuka; hapus sesi + kill state
 ```
 
-### Gerbang live-trading
+### Gerbang live-trading 🔐
 
-Endpoint live dan kredensial live digunakan **hanya** saat **ketiganya** terpenuhi:
+Endpoint & kredensial live dipake **cuma kalau** **ketiganya** terpenuhi:
 
 1. `DRY_RUN=false`
 2. `ALLOW_LIVE_EXECUTION=true`
 3. `BINANCE_ENV=live`
 
-Kombinasi lain tetap di testnet (atau menolak start — cth `live` environment dengan `DRY_RUN=false` tapi gerbang tertutup ditolak saat startup). `DRY_RUN=true` (default) tidak pernah mengirim order ke Binance.
+Kombinasi laen? Tetep di testnet, atau ditolak startup (cth: env `live` dengan `DRY_RUN=false` tapi gerbang lain masih ketutup = ditolak). `DRY_RUN=true` (default) = ga pernah nembak order ke Binance. Bot cuma jalan-jalan liat-liat pasar, window shopping aja. 🛍️
 
-## Aturan Strategi
+## Aturan Strategi 🧠
 
-**Masuk** (simbol boleh memulai grid hanya saat SEMUA terpenuhi, pada candle CLOSED `INDICATOR_TIMEFRAME`):
+**Masuk** (simbol boleh mulai grid cuma kalau SEMUA lolos, diukur di candle CLOSED `INDICATOR_TIMEFRAME`):
 
-- ADX(14) < 20
-- RSI(14) < 35
-- Volume Oscillator(5,10) > 0
-- Bollinger %B(20,2) <= 0
+- ADX(14) < 20 — pasar harus lagi *santuy*, lagi ga ada drama trend
+- RSI(14) <= 40 — lagi diskon, minimal diskon tipis-tipis
+- Volume Oscillator(5,10) >= 0 — ada yang nyari, minimal nyari-nyari dikit
+- Bollinger %B(20,2) <= 0.20 — harga lagi mampir di lantai bawah band
 
-Riwayat candle tidak cukup artinya **TIDAK TRADE** — tidak pernah exception, tidak pernah nilai fabricated.
+Riwayat candle kurang? **NO TRADE.** Bukan "ah yaudah kira-kira lah", bukan exception kambuh, bukan nilai karangan. Zero trade. Ini yang bikin ortu nyaman. 🧘
 
-**Keluar** (grid aktif keluar saat SALAH SATU terpenuhi; keluar prioritas atas masuk):
+**Keluar** (grid aktif keluar kalau SALAH SATU kena; keluar SELALU prioritas di atas masuk):
 
 - RSI(14) >= 70
 - ADX(14) > 25
 - Bollinger %B > 1
 - abs(Z-Score(20)) > 2.5
 
-Keluar otomatis: hentikan order baru → batalkan semua order terbuka → **verifikasi** → market-sell inventory yang dipegang → **verifikasi** → catat alasan keluar, realized PnL, dan fee → cooldown (`COOLDOWN_HOURS`, default 3j) → tidak ada re-entry otomatis selama cooldown. Verifikasi gagal apa pun adalah fail-closed: simbol berhenti di `ERROR`.
+Keluar otomatis itu SOP yang rapi: stop order baru → cancel semua order terbuka → **verifikasi** → market-sell inventory yang dipegang → **verifikasi lagi** → catat alasan keluar, realized PnL, fee → cooldown (`COOLDOWN_HOURS`, default 3 jam) → ga ada re-entry otomatis selama cooldown. Verifikasi gagal dikit aja? Fail-closed: simbol berhenti di `ERROR` buat ditengok operator. Bot ga pernah "yaudah anggep aja berhasil". Never delulu. 🙃
 
-Setelah keluar otomatis, simbol tidak bisa memulai grid baru sampai cooldown habis. Cooldown survive restart proses.
+Setelah keluar otomatis, simbol ga bisa mulai grid baru sebelum cooldown selesai — dan cooldown tetap bertahan walau botnya di-restart. Nggak bisa di-tgep. 💅
 
-Perintah `--check-grid` read-only memvalidasi grid dan ekonomi net executable-nya untuk setiap simbol terkonfigurasi sebelum eksekusi:
+Perintah `--check-grid` (read-only) ngevalidasi grid + ekonomi net executable-nya buat semua simbol sebelum eksekusi beneran:
 
 ```bash
 python bot.py --check-grid
 ```
 
-Ia memakai path grid-building produksi persis (`MarketData` + `grid.build_grid`): mengambil filter exchange, harga rata-rata terbobot reference, dan ATR candle closed, membangun plan dengan logika quantization/fee/slippage/PERCENT_PRICE_BY_SIDE yang sama dengan eksekusi live, lalu mencetak hasil ACCEPTED/REJECTED per simbol dengan min/max/average executable net profit dan level di bawah minimum required. Ia submit, cancel, dan modify apapun tidak — tidak pernah buka database state; exit non-zero jika simbol terkonfigurasi apapun gagal gerbang minimum net-profit.
+Ini pake **jalur produksi persis** (`MarketData` + `grid.build_grid`): ambil filter exchange, harga rata-rata terbobot reference, ATR candle closed, bangun plan dengan logika quantization/fee/slippage/PERCENT_PRICE_BY_SIDE yang sama kayak live, terus cetak ACCEPTED/REJECTED per simbol lengkap dengan min/max/average executable net profit dan level yang di bawah minimum. Ga submit apa-apa, ga cancel apa-apa, ga sentuh database state. Exit non-zero kalau ada simbol yang gagal gerbang. Jujur itu mahal, tapi di sini gratis. ✨
 
-## Ekonomi Grid
+## Ekonomi Grid 📐
 
-- Grid step = `GRID_STEP_ATR_MULTIPLIER × ATR(14)` (default 1.0).
-- Grid arithmetic untuk BTC/ETH/BNB, geometric untuk SOL (mapping di `config.py`).
-- Harga buy dibulatkan **ke bawah** dan sell **ke atas** ke tick size exchange; qty menghormati step size dan minimum notional.
-- **Ekonomi executable** (sesudah quantization exchange, dengan fee buy, fee sell, dan estimasi slippage kedua sisi) adalah yang otoritatif.
-- Grid **diblokir** kecuali executable gross >= 0.50% dan executable net >= 0.20% (`GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`). Grid buruk tidak pernah diperlebar atau dipaksa.
-- **PERCENT_PRICE_BY_SIDE di-parse dan di-enforce lokal.** Untuk setiap simbol, harga rata-rata terbobot exchange (`GET /api/v3/avgPrice`, lewat filter `avgPriceMins` — **tidak diasumsikan** sama dengan last price) adalah reference: level BUY harus di dalam `reference × [bidMultiplierDown, bidMultiplierUp]` dan harga SELL di dalam `reference × [askMultiplierDown, askMultiplierUp]`. Level grid yang melanggar band di-drop dari plan (atau grid diblokir saat tidak ada yang tersisa); child sell di luar band di-defer ke siklus berikutnya terhadap reference saat itu, bukan submit order yang akan ditolak Binance. Penolakan definitif (HTTP 400 filter failure, kode -1013/-2010) menghentikan simbol di `ERROR` — tidak pernah di-retry buta.
+- Grid step = yang lebih besar antara `ATR_GRID_MULTIPLIER × ATR(14)` dan **economic minimum step**. Jadi pas volatilitas ngilang (ATR mungil), grid ga tumbang cuma karena langkahnya kegedean buat nutup fee — step-nya di-*floor* ke ukuran minimum yang masih economically viable, dihitung dari fee + slippage + required profitability (deterministik, bukan angka sulap). Setelah itu grid **direbuild ulang** dan divalidasi penuh. Kandidat ga lolos = ditolak. Ekonomi ga pernah diturunin demi "biar kebuka". 💢
+- Grid arithmetic buat BTC/ETH/BNB, geometric buat SOL (mapping ada di `config.py`).
+- Harga buy dibulatkan **ke bawah**, sell **ke atas** ke tick size exchange; qty nge-hormatin step size dan minimum notional. Konservatif itu default aesthetic-nya.
+- **Ekonomi executable** (setelah quantization exchange, plus fee buy, fee sell, dan estimasi slippage dua sisi) itu yang jadi hakim. Bukan angka teoretis yang cakep di spreadsheet. 📊
+- Grid **diblokir** kecuali executable gross >= 0.50% DAN executable net >= 0.20% (`GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`). Grid jelek ga pernah diperlebar, dipaksa, atau dibujuk. Rejection tanpa drama.
+- **PERCENT_PRICE_BY_SIDE di-parse dan di-enforce lokal.** Buat tiap simbol, harga rata-rata terbobot exchange (`GET /api/v3/avgPrice`, via filter `avgPriceMins` — ga dianggap sama dengan last price, karena bot ga suka asumsi) jadi reference: level BUY harus ada di `reference × [bidMultiplierDown, bidMultiplierUp]`, harga SELL di `reference × [askMultiplierDown, askMultiplierUp]`. Level yang bandel di luar band di-drop dari plan (atau grid diblokir kalau ga ada sisa); child sell di luar band di-defer ke siklus berikutnya, bukan dibanting ke Binance biar ditolak. Penolakan definitif (HTTP 400 filter failure, kode -1013/-2010) bikin simbol berhenti di `ERROR` — ga pernah di-retry buta. Ghosted by the exchange? Bot langsung stop, ga nagih-nagih. 🚫👻
 
-## Aturan Risiko
+## Aturan Risiko 🚨
 
-- **Global drawdown kill switch: 2%** (`MAX_DRAWDOWN_PERCENT`, hard cap). Drawdown diukur terhadap high-water mark `equity = START_EQUITY + realized - fees + unrealized`. Saat breach: kill **di-latch dan persist dulu** (tidak ada order baru global), lalu per simbol semua order dibatalkan & diverifikasi, dan semua inventory dilikuidasi & diverifikasi. Kegagalan verifikasi cancel atau liquidasi adalah fail-closed (simbol `ERROR` + risk event) tapi **tidak pernah hapus kill** — kill tetap latch di restart sampai operator intervensi.
-- **Proteksi batas-bawah 15m** (`STOP_IF_BELOW_LOWER_PERCENT`, hard cap 2%): jika **CLOSE 15m candle terakhir** (bukan intrabar wick) paling banyak `lower × (1 - 2%)`, simbol dihentikan (order dibatalkan, inventory dilikuidasi, state `STOPPED`). Data 15m hilang/tidak valid memblokir order baru untuk simbol itu (fail-closed) bukan memicu atau menebak.
-- Risk engine punya **wewenang veto atas setiap order**: global kill atau simbol risk-stopped veto semua placement.
-- Order pakai LIMIT_MAKER (post-only) di mana didukung, bawa client order id unik, dipersist sebelum submit, dan **tidak pernah di-retry buta**: setelah kegagalan network order direkonsiliasi by client id; state final unknown memicu kondisi fail-closed dan hentikan simbol.
-- **Akuntansi fill idempotent per trade exchange**: trade id adalah kunci idempotensi; satu transaksi atomis catat fill dan update inventory, average cost, dan realized PnL. Partial fill dihitung saat terjadi, pakai qty executed aktual — bukan qty planned. Rekonsiliasi berulang atau restart tidak pernah double-count.
-- BUY yang terisi mengkonversi **qty aktual yang diperoleh** jadi child SELL order (dilacak per order di `child_sell_qty`, diupdate atomis dengan pembuatan child) — duplicate child sell strukturnya mustahil.
-- Likuidasi pakai satu client order id per attempt (tracked end-to-end), rekonsiliasi id eksak setelah error network, hitung sisa dari qty executed aktual, lalu verifikasi hasil melawan **saldo akun base asset otoritatif** (testnet/live). Kegagalan verifikasi atau sisa inventory berarti: TIDAK dilikuidasi, simbol fail closed.
+- **Global drawdown kill switch: 2%** (`MAX_DRAWDOWN_PERCENT`, hard cap). Drawdown diukur lawan high-water mark `equity = START_EQUITY + realized - fees + unrealized`. Kalau kena: kill **di-latch dan persist duluan** (ga ada order baru global), terus per simbol semua order dicancel & diverifikasi, semua inventory dilikuidasi & diverifikasi. Cancel/likuidasi gagal verifikasi = fail-closed (simbol `ERROR` + risk event) tapi **kill ga pernah kehapus** — tetep nyala lintas restart sampai operator yang turun tangan. Bot-nya pegang, bot-nya yang bertanggung jawab. 🫡
+- **Proteksi batas-bawah 15m** (`STOP_IF_BELOW_LOWER_PERCENT`, hard cap 2%): kalau **CLOSE candle 15m terakhir** (bukan wick intrabar yang cuma bohong) tutup paling banyak `lower × (1 - 2%)`, simbol dihentikan (order dicancel, inventory dilikuidasi, state `STOPPED`). Data 15m ilang/invalid = blokir order baru buat simbol itu (fail-closed), bukan mikir-mikir "mungkin sih aman". Ga mungkin-mungkin. 🙅
+- Risk engine punya **wewenang veto atas SETIAP order**: global kill, simbol risk-stopped, atau simbol error = semua placement diveto. Risk engine itu HR-nya bot ini. Ga ada yang lewat. 🧑‍💼
+- Order pake LIMIT_MAKER (post-only) kalau didukung, bawa client order id unik, dipersist **sebelum** submit, dan **ga pernah di-retry buta**: gagal network → direkonsiliasi by client id dulu; state final unknown → fail-closed, simbol dihentikan. Kalau ga yakin, jangan ngaku-ngaku berhasil. 🧾
+- **Akuntansi fill idempotent per trade exchange**: trade id = kunci idempotensi; satu transaksi atomis nyatet fill + update inventory, average cost, realized PnL. Partial fill dihitung pas terjadi pakai qty executed aktual — bukan qty planned yang on paper doang. Rekonsiliasi berkali-kali atau restart seribu kali ga akan double-count. Ledger-nya bucin sama akurasi. 📓💚
+- BUY yang ke-fill dikonversi jadi child SELL order pakai **qty aktual yang diterima** (net komisi base asset; dilacak per order di `child_sell_qty`, diupdate atomis bareng pembuatan child) — duplicate child sell secara struktural mustahil. Kayak OTP yang udah dipake. ♻️
+- Likuidasi pake satu client order id per attempt (dilacak end-to-end), rekonsiliasi id eksak setelah error network, sisa dihitung dari qty executed aktual, terus hasilnya diverifikasi lawan **saldo base asset di akun** (otoritatif, testnet/live). Verifikasi gagal atau masih ada sisa = TIDAK dilikuidasi, simbol fail-closed. Ga ada setengah-setengah. 🎯
 
-## State
+## State 🗃️
 
-Satu database SQLite (`state.db` default, path via `--db`) menampung state global bot, per-simbol state, cooldown, nilai plan grid, order, fill, fee, realized PnL, risk event, dan kill state. Schema bawa version stamp (`schema_version` di `meta`), diterapkan migrasi deterministik minimal saat startup. Tidak ada tabel kompatibilitas untuk arsitektur sebelumnya.
+Satu database SQLite (`state.db` default, path via `--db`) nampung semua: state global bot, per-simbol state, cooldown, nilai plan grid, order, fill, fee, realized PnL, risk event, kill state, plus **telemetry entry blocker** (statistik read-only: berapa kali dicblock ADX/RSI/VO/BB, grid economics, budget, risk veto, cooldown, jumlah entry sukses, entry blocker terakhir, alasan grid rejection terakhir). Schema bawa version stamp (`schema_version` di `meta`), dimigrasi deterministik minimal saat startup. Ga ada tabel kompatibilitas buat arsitektur lama — move on, heal, glow up. ✨
 
-## Dashboard
+## Dashboard 📡
 
 ```bash
 python dashboard.py --db state.db --host 127.0.0.1 --port 8080
 ```
 
-Konsol operator retrofuturistik read-only ("sistem kontrol trading crypto serius dari 1987 alternatif"): display CRT near-black dengan grid teknis halus dan scanlines, warna aksen fosfor, tipografi telemetry monospace, panel KPI bergaya instrument, modul telemetry per-simbol untuk setiap pair terkonfigurasi, dan chart net-PnL bergaya oscilloscope. Auto-refresh dari API tiap 5 detik tanpa reload halaman; saat gagal feed tampil `DATA STALE` dan pertahankan nilai baik terakhir — tidak ada yang difabrikasi; `DATA LIVE` kembali saat API pulih. Environment (`TESTNET`/`LIVE`) dan execution mode (`PAPER`/`TESTNET`/`LIVE`) di header adalah record persist runtime sendiri — tidak bisa di-set/ubah dari dashboard.
+Konsol operator retrofuturistik read-only (*"sistem kontrol trading crypto serius dari 1987 alternatif"*): display CRT near-black dengan grid teknis halus + scanlines, warna aksen fosfor, tipografi monospace, panel KPI bergaya instrumen, modul telemetry per-simbol buat tiap pair terkonfigurasi, dan chart net-PnL bergaya oscilloscope. Auto-refresh tiap 5 detik tanpa reload; kalau feed gagal, tampil `DATA STALE` dan nilai baik terakhir dipertahankan — **ga ada yang difabrikasi**, `DATA LIVE` balik sendiri begitu API sehat. Environment (`TESTNET`/`LIVE`) dan execution mode di header itu record runtime sendiri — ga bisa di-set/ubah dari dashboard. Read-only beneran, bukan read-only *katanya*.
 
-Routes (GET only): `GET /` (shell console — static HTML/CSS/JS, no external assets), `GET /api/state` (JSON snapshot), `GET /api/history` (telemetry net PnL kumulatif dari fill ledger; kosong saat tidak ada fill — history tidak pernah diinvent). Semua method write return `405`. Console tidak implement logic strategi, place/cancel apapun, expose kredensial, tidak pernah baca `.env` atau environment variable, dan render setiap nilai dynamic lewat safe DOM API (`textContent`).
+Routes (GET only): `GET /` (shell console — static HTML/CSS/JS, no external assets), `GET /api/state` (JSON snapshot, termasuk `entry_telemetry` per simbol), `GET /api/history` (telemetry net PnL kumulatif dari fill ledger; kosong kalau emang ga ada fill — history ga pernah dikarang). Semua method write = `405`. Console ga punya logic strategi, ga place/cancel apa pun, ga expose kredensial, ga pernah baca `.env` atau environment variable, dan render nilai dynamic murni lewat DOM API aman (`textContent`). Skema keamanannya tertib. 🧷
 
-Data tampil: equity global, reference equity, drawdown, max drawdown, open orders, realized PnL, fees, kill switch state/reason, runtime dan database status; per simbol: state, risk status, price, timeframe, entry status/blocker, exit status/reason, cooldown, grid mode/step/count, gross & net per grid, inventory, average cost, open orders, realized PnL, fees.
+Data yang tampil: equity global, reference equity, drawdown, open orders, realized PnL, fees, kill switch state/reason, runtime & database status; per simbol: state, risk status, price (harga ticker live), timeframe, entry status/blocker, exit status/reason, cooldown, grid mode/step/count, gross & net per grid, inventory, average cost, open orders, realized PnL, fees, dan entry telemetry.
 
-State simbol ditampilkan verbatim dari database — tidak pernah di-infer: `WAITING`, `ENTRY_BLOCKED`, `GRID_BLOCKED`, `ACTIVE`, `COOLDOWN`, `EXITING`, `STOPPED`, `KILL_ACTIVE`, `ERROR`. Jika database tidak tersedia console tetap up dan laporkan `DATABASE UNAVAILABLE` bukan crash.
+State simbol ditampilkan **verbatim** dari database — ga pernah di-infer: `WAITING`, `ENTRY_BLOCKED`, `GRID_BLOCKED`, `ACTIVE`, `COOLDOWN`, `EXITING`, `STOPPED`, `KILL_ACTIVE`, `ERROR`. Database-nya down? Console tetep hidup dan nampilin `DATABASE UNAVAILABLE`, bukan crash. Stabil di masa sulit. 💪
 
-## Instalasi
+## Instalasi 🧰
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env             # lalu edit .env
+cp .env.example .env             # terus edit .env, jangan males
 ```
 
-Python 3.10+ direkomendasikan. Dependency runtime minimal: `python-dotenv` (plus `pytest` untuk test suite).
+Python 3.10+ recommended. Dependency runtime minimal: `python-dotenv` (plus `pytest` buat test suite). Ringan, ga drama, ga node_modules sepanjang sungai. 🪶
 
-## Menjalankan (dry-run)
+## Menjalankan (dry-run) 🏃
 
 ```bash
-python bot.py --once          # satu siklus
-python bot.py                 # loop (30s siklus); mode PAPER default
+python bot.py --once          # satu siklus, cobain dulu vibes-nya
+python bot.py                 # loop (siklus 30s); mode PAPER default
 ```
 
-Startup log environment sebagai `TESTNET` atau `LIVE` (bukan kredensial) dan menolak start pada masalah konfigurasi apapun.
+Startup log nampilin environment sebagai `TESTNET` atau `LIVE` (bukan kredensial, tenang) dan nolak start kalau ada masalah konfigurasi apa pun.
 
-### Setup Testnet
+### Setup Testnet 🧪
 
-1. Buat API key di <https://testnet.binance.vision/> — **hanya izin Spot trading; withdrawal dinonaktifkan.**
-2. Masukkan ke `.env` di `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET`.
-3. Mode PAPER (default) pakai key ini read-only untuk dapatkan modal sesi; tidak ada yang pernah di-submit.
-4. Untuk eksekusi order testnet asli, set `EXECUTION_MODE=testnet` dan `DRY_RUN=false`. Validasi path dulu:
+1. Bikin API key di <https://testnet.binance.vision/> — **izin Spot trading aja; withdrawal mati.** Selalu mati. Non-negotiable.
+2. Masukin ke `.env` di `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET`. Ga pernah di-commit, ga pernah di-share, ga pernah di-screenshot buat story. 🤐
+3. Mode PAPER (default) pake key ini cuma buat baca saldo (modal sesi); ga ada yang di-submit.
+4. Buat eksekusi order testnet beneran, set `EXECUTION_MODE=testnet` dan `DRY_RUN=false`. Validasi dulu step-by-step, jangan gas full send:
 
 ```bash
 python bot.py --check-exchange                       # konektivitas/auth/filter (read-only)
-python bot.py --check-grid                           # validasi konstruksi grid + ekonomi net executable (read-only, no order)
+python bot.py --check-grid                           # konstruksi grid + ekonomi net executable (read-only, no order)
 python bot.py --testnet-order-selftest BTC/USDT      # place + verifikasi + cancel satu order jauh dari market
 python bot.py                                        # jalankan eksekusi testnet
 ```
 
-Order self-test adalah flag-gated dan tidak pernah jalan otomatis; ia place LIMIT_MAKER buy 50% di bawah market dan cancel — tidak bisa fill.
+Order self-test itu flag-gated dan ga pernah jalan otomatis; dia nempatin LIMIT_MAKER buy 50% di bawah market terus cancel — secuek apa pun market-nya, order itu ga mungkin ke-fill. It's giving *safety drill*. 🧯
 
-## Deployment (VPS / systemd)
+## Deployment (VPS / systemd) 🐧
 
-Template deploy ada di `deploy/`. Kedua service jalan sebagai user `adaptive-grid` di `/opt/adaptive-grid` dan share **satu database otoritatif**: `/opt/adaptive-grid/state.db`. Runtime trading punya semua write; dashboard buka read-only. Tidak ada database state kedua — unit lama yang nunjuk database legacy di `data/` sudah obsolete dan harus diganti.
+Template deploy ada di `deploy/`. Kedua service jalan sebagai user `adaptive-grid` di `/opt/adaptive-grid` dan share **satu database otoritatif**: `/opt/adaptive-grid/state.db`. Runtime trading yang pegang semua write; dashboard buka read-only. Ga ada database kedua — unit lama yang nunjuk DB legacy di `data/` udah gado-gado dan harus diganti.
 
-Fresh deploy (VPS existing simpan `state.db` dan `.env`):
+Fresh deploy (VPS existing: simpan `state.db` dan `.env`):
 
 ```bash
 # 1. clone atau update repository
@@ -212,7 +214,7 @@ cd /opt/adaptive-grid && sudo -u adaptive-grid python3 -m venv .venv
 sudo -u adaptive-grid /opt/adaptive-grid/.venv/bin/pip install -r requirements.txt
 
 # 4. konfigurasi .env (JANGAN timpa yang ada; mulai dari template)
-#    sudo -u adaptive-grid cp .env.example .env   # hanya jika .env tidak ada
+#    sudo -u adaptive-grid cp .env.example .env   # cuma kalau .env belum ada
 sudo -u adaptive-grid nano /opt/adaptive-grid/.env
 
 # 5. install service trading
@@ -239,7 +241,7 @@ ss -ltnp | grep 8080
 curl -s http://127.0.0.1:8080/api/state | python3 -m json.tool | head -40
 
 # 12. verifikasi mode PAPER (harus print paper / PAPER)
-curl -s http://127.0.0.1:8080/api/state | grep -E '"execution_mode"|"session"')
+curl -s http://127.0.0.1:8080/api/state | grep -E '"execution_mode"|"session"'
 
 # 13. verifikasi Binance TESTNET (harus print testnet)
 curl -s http://127.0.0.1:8080/api/state | grep '"binance_env"'
@@ -248,16 +250,16 @@ curl -s http://127.0.0.1:8080/api/state | grep '"binance_env"'
 grep -E '^DRY_RUN=|^ALLOW_LIVE_EXECUTION=|^BINANCE_ENV=' /opt/adaptive-grid/.env
 ```
 
-Dashboard bind `0.0.0.0:8080` via CLI flags eksplisit — unit tidak pass environment variables atau environment file ke proses dashboard. Expose publik lewat reverse proxy/tunnel sendiri jika mau; konfigurasi itu di luar repository ini.
+Dashboard bind `0.0.0.0:8080` via CLI flags eksplisit — unit ga ngoper environment variables atau environment file ke proses dashboard. Mau expose publik? Lewat reverse proxy/tunnel sendiri; konfigurasi itu di luar repo ini. (Dan ya, dashboard tanpa auth itu gaya hidup berisiko — kasih proxy auth kalau ga mau saldo lo jadi konten publik. 💀)
 
-## Testing
+## Testing 🧪
 
 ```bash
 pytest -q
 ```
 
-Suite (346+ test) deterministik dan offline: validasi konfigurasi dan live gates, matematika indikator vs referensi hand-computed, threshold masuk/keluar ketat dan prioritas keluar, quantization grid dan ekonomi executable, risk veto dan kill persistence, state restart recovery, perilaku dashboard read-only, dan integrasi bot-cycle (fill, keluar, cooldown, boundary stop, drawdown kill) melawan stub market.
+Suite (**391 test**) deterministik dan offline: validasi konfigurasi & live gates, matematika indikator lawan referensi hand-computed, threshold masuk/keluar ketat + prioritas keluar, quantization grid & ekonomi executable, risk veto & kill persistence, state restart recovery, retry jujur (GET boleh di-retry, order ga pernah di-retry buta), perilaku dashboard read-only, telemetry entry blocker, dan integrasi bot-cycle (fill, keluar, cooldown, boundary stop, drawdown kill) lawan stub market. Test-nya lebih banyak dari followers pertama lo. 🔥
 
-## Mode Live — Peringatan
+## Mode Live — Peringatan 🚨
 
-Live trading dinonaktifkan oleh setiap default. Mengaktifkannya butuh tiga gerbang eksplisit di atas dan keputusan operator sadar pada mesin di mana `.env` berisi live key. **Jangan aktifkan mode live tanpa review independen.** Penulis tidak menerima liability untuk kerugian trading.
+Live trading itu **disabled by default** dan itu bukan accident, itu desain. Buat ngaktifin butuh tiga gerbang eksplisit di atas PLUS keputusan operator yang sadar dan penuh kesadaran di mesin yang `.env`-nya beneran berisi live key. **Jangan aktifin mode live tanpa review independen.** Nggak ada dukun, nggak ada sinyal grup, nggak ada "katanya". Penulis ga nerima liability buat kerugian trading — kerugian lo ya lo yang pegang, bestie. Kalau ragu: tetep di paper/testnet, santuy, ga usah buru-buru. Market bakal masih buka besok. 🧘‍♂️
