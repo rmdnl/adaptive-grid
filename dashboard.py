@@ -237,13 +237,13 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "updated_at": st.updated_at,
     }
     # Entry blocker telemetry (read-only tuning statistics; the bot is the
-    # sole writer, the dashboard only displays).
+    # sole writer, the dashboard only displays). Legacy RSI/VO/BB columns
+    # removed; new strategy uses stoch cross and stoch K.
     payload["entry_telemetry"] = {
         "entry_evaluations": st.entry_evaluations,
         "blocked_adx": st.blocked_adx,
-        "blocked_rsi": st.blocked_rsi,
-        "blocked_vo": st.blocked_vo,
-        "blocked_bb": st.blocked_bb,
+        "blocked_stoch_cross": st.blocked_stoch_cross,
+        "blocked_stoch_k": st.blocked_stoch_k,
         "blocked_grid": st.blocked_grid,
         "blocked_budget": st.blocked_budget,
         "blocked_risk": st.blocked_risk,
@@ -602,14 +602,7 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     stoch_no_cross: "STOCH RSI %K HAS NOT CROSSED UP THROUGH %D",
     stoch_k_too_high: "STOCH RSI %K ABOVE ENTRY LIMIT",
     min_interval_not_elapsed: "MINIMUM HOURS BETWEEN ENTRIES NOT ELAPSED",
-    rsi_not_low: "RSI ABOVE ENTRY THRESHOLD",
     adx_not_low: "ADX ABOVE ENTRY LIMIT",
-    adx_trending: "ADX INDICATES TRENDING MARKET",
-    volume_osc_not_positive: "VOLUME OSCILLATOR BELOW MINIMUM",
-    volume_osc_insufficient: "VOLUME OSCILLATOR TOO LOW",
-    percent_b_not_low: "PRICE NOT AT LOWER BOLLINGER BAND",
-    bb_not_low: "PRICE NOT AT LOWER BOLLINGER BAND",
-    zscore_too_high: "Z-SCORE EXCEEDS ENTRY LIMIT",
     boundary_breach: "15M CANDLE BREACHED LOWER BOUNDARY",
     boundary_unknown: "15M BOUNDARY DATA UNAVAILABLE",
     risk_veto: "RISK ENGINE VETOED ENTRY",
@@ -681,9 +674,8 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     m.appendChild(sec("ENTRY TELEMETRY"));
     m.appendChild(kv("EVALUATIONS", telemetryCounter(t, "entry_evaluations")));
     m.appendChild(kv("ADX BLOCKED", telemetryCounter(t, "blocked_adx")));
-    m.appendChild(kv("RSI BLOCKED", telemetryCounter(t, "blocked_rsi")));
-    m.appendChild(kv("VO BLOCKED", telemetryCounter(t, "blocked_vo")));
-    m.appendChild(kv("BB BLOCKED", telemetryCounter(t, "blocked_bb")));
+    m.appendChild(kv("STOCH CROSS BLOCKED", telemetryCounter(t, "blocked_stoch_cross")));
+    m.appendChild(kv("STOCH K BLOCKED", telemetryCounter(t, "blocked_stoch_k")));
     m.appendChild(kv("GRID BLOCKED", telemetryCounter(t, "blocked_grid")));
     m.appendChild(kv("BUDGET BLOCKED", telemetryCounter(t, "blocked_budget")));
     m.appendChild(kv("RISK BLOCKED", telemetryCounter(t, "blocked_risk")));

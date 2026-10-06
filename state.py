@@ -100,11 +100,13 @@ _SYMBOL_COLUMNS = {
     "inventory_qty", "avg_cost", "risk_status",
     # Regime + Recovery lifecycle + directional/stochastic telemetry (v7)
     "grid_started_ts", "soft_exit_ts", "plus_di", "minus_di", "stoch_k", "stoch_d",
-    # Entry blocker telemetry (v5): read-only tuning statistics
-    "entry_evaluations", "blocked_adx", "blocked_rsi", "blocked_vo",
-    "blocked_bb", "blocked_grid", "blocked_budget", "blocked_risk",
-    "blocked_cooldown", "blocked_exit_priority", "entries_total", "last_entry_ts",
-    "last_entry_blocker", "last_grid_reject_reason",
+# Entry blocker telemetry (v5): read-only tuning statistics
+            # v5: legacy RSI/VO/BB columns kept for backward compat; new strategy uses stoch
+            "entry_evaluations", "blocked_adx", "blocked_rsi", "blocked_vo",
+            "blocked_bb", "blocked_stoch_cross", "blocked_stoch_k",
+            "blocked_grid", "blocked_budget", "blocked_risk",
+            "blocked_cooldown", "blocked_exit_priority", "entries_total", "last_entry_ts",
+            "last_entry_blocker", "last_grid_reject_reason",
 }
 
 OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
@@ -116,7 +118,9 @@ OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
 # Schema v6 adds blocked_exit_priority to the telemetry set.
 # Schema v7 adds Regime + Recovery lifecycle fields (grid_started_ts,
 # soft_exit_ts) and +DI/-DI/Stoch-%K/%D telemetry columns.
-SCHEMA_VERSION = 7
+# Schema v8 adds blocked_stoch_cross and blocked_stoch_k for new
+# Regime + Recovery entry gate telemetry.
+SCHEMA_VERSION = 8
 
 # Inventory dust below this absolute quantity is zeroed after a SELL.
 _INVENTORY_DUST = 1e-12
@@ -160,6 +164,8 @@ class SymbolState:
     blocked_rsi: int = 0
     blocked_vo: int = 0
     blocked_bb: int = 0
+    blocked_stoch_cross: int = 0
+    blocked_stoch_k: int = 0
     blocked_grid: int = 0
     blocked_budget: int = 0
     blocked_risk: int = 0
@@ -295,6 +301,17 @@ class StateStore:
                     ("minus_di", "REAL"),
                     ("stoch_k", "REAL"),
                     ("stoch_d", "REAL"),
+                ):
+                    if column not in cols:
+                        conn.execute(f"ALTER TABLE symbols ADD COLUMN {column} {decl}")
+            if version < 8:
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(symbols)").fetchall()
+                }
+                for column, decl in (
+                    ("blocked_stoch_cross", "INTEGER DEFAULT 0"),
+                    ("blocked_stoch_k", "INTEGER DEFAULT 0"),
                 ):
                     if column not in cols:
                         conn.execute(f"ALTER TABLE symbols ADD COLUMN {column} {decl}")

@@ -690,6 +690,8 @@ class Bot:
         "rsi_not_low": "blocked_rsi",
         "volume_osc_not_positive": "blocked_vo",
         "percent_b_not_low": "blocked_bb",
+        "stoch_no_cross": "blocked_stoch_cross",
+        "stoch_k_too_high": "blocked_stoch_k",
         "cooldown": "blocked_cooldown",
     }
 

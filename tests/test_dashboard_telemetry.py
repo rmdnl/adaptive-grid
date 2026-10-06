@@ -29,9 +29,8 @@ DASH = "\u2014"
 TELEMETRY_ROWS = [
     ("EVALUATIONS", "entry_evaluations"),
     ("ADX BLOCKED", "blocked_adx"),
-    ("RSI BLOCKED", "blocked_rsi"),
-    ("VO BLOCKED", "blocked_vo"),
-    ("BB BLOCKED", "blocked_bb"),
+    ("STOCH CROSS BLOCKED", "blocked_stoch_cross"),
+    ("STOCH K BLOCKED", "blocked_stoch_k"),
     ("GRID BLOCKED", "blocked_grid"),
     ("BUDGET BLOCKED", "blocked_budget"),
     ("RISK BLOCKED", "blocked_risk"),
@@ -47,8 +46,8 @@ TELEMETRY_ROWS = [
 
 def _seed_telemetry(store: StateStore, symbol: str, **values) -> None:
     full = dict(
-        entry_evaluations=0, blocked_adx=0, blocked_rsi=0, blocked_vo=0,
-        blocked_bb=0, blocked_grid=0, blocked_budget=0, blocked_risk=0,
+        entry_evaluations=0, blocked_adx=0, blocked_stoch_cross=0, blocked_stoch_k=0,
+        blocked_grid=0, blocked_budget=0, blocked_risk=0,
         blocked_cooldown=0, blocked_exit_priority=0, entries_total=0,
         last_entry_ts=None, last_entry_blocker=None, last_grid_reject_reason=None,
     )
@@ -64,8 +63,8 @@ def _store_with_telemetry(tmp_path: Path) -> str:
     store.set_meta("configured_symbols", json.dumps(symbols, separators=(",", ":")))
     _seed_telemetry(
         store, "BTC/USDT",
-        entry_evaluations=128, blocked_adx=91, blocked_rsi=14, blocked_vo=8,
-        blocked_bb=7, blocked_grid=5, blocked_budget=0, blocked_risk=0,
+        entry_evaluations=128, blocked_adx=91, blocked_stoch_cross=14, blocked_stoch_k=8,
+        blocked_grid=5, blocked_budget=0, blocked_risk=0,
         blocked_cooldown=3, blocked_exit_priority=4, entries_total=2,
         last_entry_ts=1791300075.0,
         last_entry_blocker="adx_not_low",
@@ -90,9 +89,8 @@ def test_api_state_includes_entry_telemetry(tmp_path):
     t = btc["entry_telemetry"]
     assert t["entry_evaluations"] == 128
     assert t["blocked_adx"] == 91
-    assert t["blocked_rsi"] == 14
-    assert t["blocked_vo"] == 8
-    assert t["blocked_bb"] == 7
+    assert t["blocked_stoch_cross"] == 14
+    assert t["blocked_stoch_k"] == 8
     assert t["blocked_grid"] == 5
     assert t["blocked_budget"] == 0
     assert t["blocked_risk"] == 0
@@ -252,9 +250,8 @@ def test_js_renders_entry_telemetry_section(tmp_path):
     rows = _card_rows(flat, occurrence=0)  # BTC card
     assert rows["EVALUATIONS"] == "128"
     assert rows["ADX BLOCKED"] == "91"
-    assert rows["RSI BLOCKED"] == "14"
-    assert rows["VO BLOCKED"] == "8"
-    assert rows["BB BLOCKED"] == "7"
+    assert rows["STOCH CROSS BLOCKED"] == "14"
+    assert rows["STOCH K BLOCKED"] == "8"
     assert rows["GRID BLOCKED"] == "5"
     assert rows["BUDGET BLOCKED"] == "0"
     assert rows["RISK BLOCKED"] == "0"
@@ -310,7 +307,7 @@ def test_js_partially_missing_fields_render_dash(tmp_path):
     rows = _card_rows(flat, occurrence=1)
     assert rows["ADX BLOCKED"] == "3"       # present -> rendered
     assert rows["TOTAL ENTRIES"] == "0"     # explicit zero -> "0", not dash
-    assert rows["RSI BLOCKED"] == DASH      # missing -> dash
+    assert rows["STOCH CROSS BLOCKED"] == DASH      # missing -> dash
     assert rows["EVALUATIONS"] == DASH
     assert rows["LAST BLOCKER"] == DASH
 
