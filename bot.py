@@ -142,6 +142,9 @@ class Bot:
         # the runtime's own record (display only — no gate reads it).
         store.set_meta("mode_binance_env", cfg.binance_env)
         store.set_meta("mode_execution", cfg.execution_mode)
+        # Risk parameters the read-only dashboard displays (display only —
+        # the dashboard never enforces anything).
+        store.set_meta_float("risk_max_drawdown_percent", cfg.max_drawdown * 100.0)
         # The active session's configured symbol list is the dashboard's
         # display scope: a JSON array in PAIR_LIST order. Updated on every
         # startup, so a PAIR_LIST change on a future restart is picked up

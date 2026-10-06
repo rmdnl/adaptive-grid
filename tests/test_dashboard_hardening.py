@@ -53,7 +53,10 @@ def test_payload_carries_runtime_mode(seeded):
     page = render_page()
     assert "TESTNET WALLET" in page
     assert "PAPER EQUITY" in page
-    assert "EXCHANGE EQUITY" in page
+    # The equity KPI is the session PnL model in every mode; the actual
+    # exchange read is the adjacent TESTNET WALLET KPI.
+    assert "SESSION EQUITY" in page
+    assert "EXCHANGE EQUITY" not in page
 
 
 def test_payload_mode_reflects_runtime_record(seeded):

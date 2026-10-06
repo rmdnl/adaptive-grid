@@ -150,6 +150,35 @@ def test_payload_on_missing_database(tmp_path):
     assert payload["symbols"] == []
 
 
+def test_payload_drawdown_none_before_first_cycle(tmp_path):
+    """A fresh database has no equity/reference yet: drawdown must be None
+    (dash), never a fabricated 0.00%."""
+    path = str(tmp_path / "state.db")
+    store = StateStore(path)
+    store.ensure_symbols(["BTC/USDT"])
+    payload = build_payload(path)
+    assert payload["global"]["equity"] is None
+    assert payload["global"]["reference_equity"] is None
+    assert payload["global"]["drawdown"] is None
+
+
+def test_payload_max_drawdown_from_runtime_meta(tmp_path):
+    """Standalone deployments get the MAX DRAWDOWN limit from the runtime's
+    own persisted meta record; an explicit caller argument overrides it."""
+    path = str(tmp_path / "state.db")
+    store = StateStore(path)
+    store.ensure_symbols(["BTC/USDT"])
+    store.set_meta_float("risk_max_drawdown_percent", 2.0)
+    assert build_payload(path)["global"]["max_drawdown_percent"] == pytest.approx(2.0)
+    assert build_payload(path, max_drawdown_percent=1.5)[
+        "global"]["max_drawdown_percent"] == pytest.approx(1.5)
+    # Without the meta record and without a caller argument: unknown.
+    store2 = StateStore(str(tmp_path / "fresh.db"))
+    store2.ensure_symbols(["BTC/USDT"])
+    assert build_payload(str(tmp_path / "fresh.db"))[
+        "global"]["max_drawdown_percent"] is None
+
+
 def test_dashboard_server_read_only(seeded):
     from http.server import ThreadingHTTPServer
 

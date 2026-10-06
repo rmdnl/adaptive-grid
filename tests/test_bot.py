@@ -107,6 +107,17 @@ def env(tmp_path):
     return bot, store, market
 
 
+def test_startup_persists_dashboard_risk_meta(env):
+    """Bot startup persists the display-only risk parameters the read-only
+    dashboard shows (MAX DRAWDOWN KPI in standalone deployments)."""
+    bot, store, _market = env
+    assert store.get_meta_float("risk_max_drawdown_percent") == pytest.approx(
+        bot.cfg.max_drawdown * 100.0
+    )
+    assert store.get_meta("mode_binance_env") == bot.cfg.binance_env
+    assert store.get_meta("mode_execution") == bot.cfg.execution_mode
+
+
 def test_entry_places_grid_and_sets_active(env):
     bot, store, market = env
     # LOWER_PRICE=50000, stop_if_below_lower=0.02 => threshold=49000

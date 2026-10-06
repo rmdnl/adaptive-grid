@@ -375,6 +375,28 @@ def test_js_existing_price_and_state_rendering_unchanged(tmp_path):
     assert rows["UNREALIZED PNL"] == "+0.25"
 
 
+def test_js_adaptive_params_render_when_present(tmp_path):
+    """Adaptive planner parameters surface in the GRID/POSITION section only
+    for symbols that have them; symbols without never show fabricated rows."""
+    path = _store_with_telemetry(tmp_path)
+    store = StateStore(path)
+    store.update_symbol(
+        "BTC/USDT",
+        adaptive_lower_price=47799.0, adaptive_upper_price=50100.0,
+        adaptive_total_grids=5, adaptive_quote_budget=1200.5,
+    )
+    flat = _run_js(_full_payload(path), tmp_path)
+    btc = _card_rows(flat, occurrence=0)
+    eth = _card_rows(flat, occurrence=1)
+    assert btc["LOWER BOUNDARY"] == "47,799.00"
+    assert btc["RANGE HIGH"] == "50,100.00"
+    assert btc["PLANNED GRIDS"] == "5"
+    assert btc["QUOTE BUDGET"] == "1,200.50"
+    # ETH has no adaptive record: rows absent, nothing fabricated
+    for label in ("LOWER BOUNDARY", "RANGE HIGH", "PLANNED GRIDS", "QUOTE BUDGET"):
+        assert label not in eth, label
+
+
 def test_telemetry_section_uses_existing_css_classes(tmp_path):
     """The section reuses the existing visual language (sec/kv/hr): verified
     on the DOM the shipped JS actually produces."""

@@ -163,7 +163,9 @@ def _global_payload(store: StateStore) -> Dict:
     reference = store.get_meta_float("reference_equity")
     kill_active, kill_reason = store.global_kill()
     runtime_status, last_cycle_ts = store.last_runtime()
-    drawdown = 0.0
+    # Drawdown is None until BOTH equity and reference exist — a missing
+    # measurement is never displayed as a measured zero.
+    drawdown: Optional[float] = None
     if reference is not None and reference > 0 and equity is not None:
         drawdown = (reference - equity) / reference
     binance_env = store.get_meta("mode_binance_env")
@@ -176,6 +178,10 @@ def _global_payload(store: StateStore) -> Dict:
         "start_equity": store.get_meta_float("session_start_equity"),
         "initial_cash": store.get_meta_float("session_initial_cash"),
     }
+    # MAX DRAWDOWN display: the caller-supplied value is authoritative;
+    # standalone deployments fall back to the runtime's own persisted
+    # record (meta key written by bot.py).
+    max_drawdown = store.get_meta_float("risk_max_drawdown_percent")
     return {
         "execution_mode": execution_mode,
         "execution_mode_human": human_execution_mode(execution_mode),
@@ -184,7 +190,7 @@ def _global_payload(store: StateStore) -> Dict:
         "equity": equity,
         "reference_equity": reference,
         "drawdown": drawdown,
-        "max_drawdown_percent": None,  # filled by caller when known
+        "max_drawdown_percent": max_drawdown,  # filled by caller when known
         "kill_active": kill_active,
         "kill_reason": kill_reason,
         "open_orders": store.count_open_orders(),
@@ -345,7 +351,10 @@ def build_payload(db_path: str, max_drawdown_percent: Optional[float] = None) ->
             "active_symbol_config": False,
         }
         return {"global": glob, "symbols": symbols}
-    glob["max_drawdown_percent"] = max_drawdown_percent
+    # The caller-supplied limit overrides the runtime-persisted record;
+    # an unsupplied one (standalone deployment) keeps the meta fallback.
+    if max_drawdown_percent is not None:
+        glob["max_drawdown_percent"] = max_drawdown_percent
     return {"global": glob, "symbols": symbols}
 
 
@@ -569,8 +578,9 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
   function fmtSigned(v) {
     if (v === null || v === undefined || isNaN(Number(v))) return DASH;
     var n = Number(v);
-    var s = Math.abs(n).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
-    return (n >= 0 ? "+" : "\\u2212") + s;
+    var mag = Math.abs(n).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    if (mag === "0.00") return mag;  // exact zero or rounds to zero: no sign
+    return (n >= 0 ? "+" : "\\u2212") + mag;
   }
   function fmtPctFrac(v) { // fraction -> signed percent
     if (v === null || v === undefined || isNaN(Number(v))) return DASH;
@@ -580,7 +590,9 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
   }
   function fmtTs(ts) {
     if (ts === null || ts === undefined || isNaN(Number(ts))) return DASH;
-    var d = new Date(Number(ts) * 1000);
+    var t = Number(ts);
+    if (t <= 0) return DASH;  // unset timestamps are never a wall-clock time
+    var d = new Date(t * 1000);
     return isNaN(d.getTime()) ? DASH : d.toLocaleTimeString("en-GB");
   }
   function set(id, text) { var n = $(id); if (n) n.textContent = text; }
@@ -735,8 +747,10 @@ function renderGlobal(g) {
     set("execution", g.execution_mode_human || mode || "UNKNOWN");
     setCls("ind-exec", "ind" + (mode === "LIVE" ? " live" : mode === "PAPER" ? " paper" : " testnet"));
     set("lastcycle", fmtTs(g.last_cycle_ts));
-    // mode-aware capital labels
-    set("k-equity-label", mode === "PAPER" ? "PAPER EQUITY" : mode === "TESTNET" ? "EXCHANGE EQUITY" : "EQUITY");
+    // mode-aware capital labels — the equity KPI is the session PnL model
+    // (start + realized − fees + unrealized) in EVERY mode; the actual
+    // exchange read is the adjacent WALLET KPI.
+    set("k-equity-label", mode === "PAPER" ? "PAPER EQUITY" : mode === "TESTNET" ? "SESSION EQUITY" : "EQUITY");
     set("k-wallet", fmtNum(g.wallet_usdt, 2));
 
     // system safety telemetry — explicit text, never color alone
@@ -813,6 +827,20 @@ function renderGlobal(g) {
       m.appendChild(sec("GRID / POSITION"));
       m.appendChild(kv("MODE", s.grid_mode ? String(s.grid_mode).toUpperCase() : DASH));
       m.appendChild(kv("STEP", fmtNum(s.grid_step, 4)));
+      // Adaptive planner parameters (present once a grid has been planned):
+      // the lower boundary is the 15m protection line the risk gate enforces.
+      if (typeof s.adaptive_lower_price === "number") {
+        m.appendChild(kv("LOWER BOUNDARY", fmtPrice(s.adaptive_lower_price)));
+      }
+      if (typeof s.adaptive_upper_price === "number") {
+        m.appendChild(kv("RANGE HIGH", fmtPrice(s.adaptive_upper_price)));
+      }
+      if (typeof s.adaptive_total_grids === "number") {
+        m.appendChild(kv("PLANNED GRIDS", String(s.adaptive_total_grids)));
+      }
+      if (typeof s.adaptive_quote_budget === "number") {
+        m.appendChild(kv("QUOTE BUDGET", fmtNum(s.adaptive_quote_budget, 2)));
+      }
       m.appendChild(kv("COUNT", s.grid_count === null || s.grid_count === undefined
                        ? DASH : String(s.grid_count)));
       m.appendChild(kv("GROSS", fmtPctFrac(s.gross_pct)));
