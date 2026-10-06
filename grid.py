@@ -306,9 +306,14 @@ def build_grid(
             continue
 
         # Smallest compliant quantity: >= minNotional and >= minQty.
-        qty = quantize_qty_ceil(filters.min_notional / buy_price, filters.step_size)
-        if filters.min_qty > 0 and qty < filters.min_qty:
+        # Start from min_qty when present (quantized UP to step size) so the
+        # max-qty check below sees the true minimum orderable quantity, then
+        # raise it until it also clears min_notional.
+        qty = 0.0
+        if filters.min_qty > 0:
             qty = quantize_qty_ceil(filters.min_qty, filters.step_size)
+        if qty * buy_price < filters.min_notional:
+            qty = quantize_qty_ceil(filters.min_notional / buy_price, filters.step_size)
         if qty <= 0:
             break
         # Guard against float drift: notional must really satisfy the filter.
@@ -343,11 +348,20 @@ def build_grid(
                 max_allowed_qty = quantize_qty_floor(
                     filters.max_notional / max_price, filters.step_size
                 )
-                # Feasibility check: reduced qty must still satisfy min_notional
-                # and min_qty filters
+                # Feasibility check: reduced qty must still satisfy
+                # min_notional and min_qty. max_allowed_qty is already a
+                # multiple of step_size, so raising it to ceil(min_qty)
+                # keeps it step-aligned; reject only when that no longer
+                # fits max_notional (mathematically untradeable pair).
+                if filters.min_qty > 0 and max_allowed_qty < filters.min_qty:
+                    max_allowed_qty = quantize_qty_ceil(
+                        filters.min_qty, filters.step_size
+                    )
+                    if max_allowed_qty * max_price > filters.max_notional:
+                        dropped_levels += 1
+                        continue
                 if max_allowed_qty > 0 and \
-                   max_allowed_qty * buy_price >= filters.min_notional and \
-                   (filters.min_qty <= 0 or max_allowed_qty >= filters.min_qty):
+                   max_allowed_qty * buy_price >= filters.min_notional:
                     qty = max_allowed_qty
                 else:
                     dropped_levels += 1

@@ -277,3 +277,62 @@ def test_buy_sell_price_ordering_for_both_modes(cfg):
         assert plan.executable is True
         for level in plan.levels:
             assert 0 < level.buy_price < level.sell_price
+
+
+# ----- filter interaction edge cases (audit fixes) -----
+
+def test_min_qty_above_max_qty_blocks_grid(cfg):
+    """When min_qty itself exceeds maxQty, no orderable quantity exists:
+    the grid must be BLOCKED, never emitted with a qty over maxQty."""
+    f = ExchangeFilters(
+        tick_size=0.01, step_size=0.00001, min_notional=10.0,
+        min_qty=0.5, max_qty=0.2,
+    )
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, f, test_cfg)
+    assert plan.executable is False
+    for level in plan.levels:
+        assert level.qty <= 0.2
+
+
+def test_max_notional_reduction_respects_min_qty(cfg):
+    """Coarse step_size where floor(max_notional/price) quantizes to zero
+    but ceil(min_qty) is a feasible, step-aligned quantity satisfying all
+    filters — the level must be kept at that reduced qty, not dropped."""
+    f = ExchangeFilters(
+        tick_size=0.01, step_size=1.0, min_notional=40.0,
+        min_qty=49.0, max_notional=50.0,
+    )
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 0.5},
+        upper_price={"BTC/USDT": 2.0},
+        total_grids=3,
+        total_quote_budget={"BTC/USDT": 5000.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 1.0, 0.0075, f, test_cfg)
+    assert plan.executable is True
+    assert plan.levels
+    for level in plan.levels:
+        assert level.qty >= 49.0
+        assert level.qty % 1.0 == pytest.approx(0.0) or level.qty == int(level.qty)
+        assert level.buy_price * level.qty >= 40.0 - 1e-9
+        assert level.sell_price * level.qty <= 50.0 + 1e-9
+
+
+def test_infeasible_min_max_notional_pair_drops_levels(cfg):
+    """min_notional > max_notional is mathematically untradeable: every
+    level must be dropped and the grid blocked."""
+    f = ExchangeFilters(
+        tick_size=0.01, step_size=0.1, min_notional=100.0, max_notional=50.0,
+    )
+    test_cfg = make_config(
+        lower_price={"BTC/USDT": 47000.0},
+        upper_price={"BTC/USDT": 70000.0},
+        total_quote_budget={"BTC/USDT": 500.0},
+    )
+    plan = grid.build_grid("BTC/USDT", "arithmetic", 50000.0, 350.0, f, test_cfg)
+    assert plan.executable is False
