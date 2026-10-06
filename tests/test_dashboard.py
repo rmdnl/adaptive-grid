@@ -87,10 +87,6 @@ def test_payload_symbol_fields(seeded):
     assert btc["strategy_state"] == "ACTIVE"
     assert btc["timeframe"] == "4h"
     assert btc["adx"] == pytest.approx(15.0)
-    assert btc["rsi"] == pytest.approx(30.0)
-    assert btc["percent_b"] == pytest.approx(-0.1)
-    assert btc["volume_osc"] == pytest.approx(0.2)
-    assert btc["zscore"] == pytest.approx(0.5)
     assert btc["atr"] == pytest.approx(350.0)
     assert btc["entry_status"] == "allowed"
     assert btc["exit_status"] == "none"
@@ -112,7 +108,8 @@ def test_payload_missing_data_is_none_not_inferred(seeded):
     eth = next(s for s in build_payload(seeded)["symbols"] if s["symbol"] == "ETH/USDT")
     assert eth["strategy_state"] == "WAITING"
     assert eth["adx"] is None
-    assert eth["rsi"] is None
+    assert eth["plus_di"] is None
+    assert eth["stoch_k"] is None
     assert eth["last_price"] is None
     assert eth["grid_mode"] is None
     assert eth["grid_count"] == 0

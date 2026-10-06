@@ -55,6 +55,10 @@ STATE_LABELS = {
 
 ENTRY_BLOCKER_LABELS = {
     "exit_priority": "Exit signal takes priority",
+    "adx_rising": "ADX rising — regime strengthening",
+    "stoch_no_cross": "Stoch RSI %K has not crossed up through %D",
+    "stoch_k_too_high": "Stoch RSI %K above entry limit",
+    "min_interval_not_elapsed": "Minimum hours between entries not elapsed",
     "rsi_not_low": "RSI above entry threshold",
     "adx_trending": "ADX indicates trending market",
     "bb_not_low": "Price not at lower Bollinger Band",
@@ -78,6 +82,11 @@ EXIT_REASON_LABELS = {
     "exit_rsi_min": "RSI minimum threshold met",
     "exit_bb_percent_b_min": "BB %B minimum threshold met",
     "exit_zscore_abs_max": "Z-score absolute maximum exceeded",
+    "adx_trending_up": "ADX trending up with +DI dominant — SOFT exit (buys cancelled, sells left to fill)",
+    "stoch_k_overbought": "Stoch RSI %K overbought — SOFT exit (buys cancelled, sells left to fill)",
+    "adx_trending_down": "ADX trending with -DI dominant — HARD exit (liquidated)",
+    "time_stop": "Time stop — grid older than HOLD_MAX_HOURS (SOFT exit)",
+    "time_stop_escalation": "Time stop — inventory remained after the SOFT window (HARD exit)",
     "lower_boundary_breach": "15m close breached lower stop boundary",
     "global_drawdown": "Global equity drawdown limit hit",
     "risk_engine_veto": "Risk engine vetoed continuation",
@@ -196,10 +205,10 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "timeframe": st.timeframe,
         "last_price": st.last_price,
         "adx": st.adx,
-        "rsi": st.rsi,
-        "percent_b": st.percent_b,
-        "volume_osc": st.volume_osc,
-        "zscore": st.zscore,
+        "plus_di": st.plus_di,
+        "minus_di": st.minus_di,
+        "stoch_k": st.stoch_k,
+        "stoch_d": st.stoch_d,
         "atr": st.atr,
         "strategy_state": st.strategy_state,
         "strategy_state_human": human_state(st.strategy_state),
@@ -589,6 +598,10 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
 
   var BLOCKER_LABELS = {
     exit_priority: "EXIT SIGNAL TAKES PRIORITY",
+    adx_rising: "ADX RISING — REGIME STRENGTHENING",
+    stoch_no_cross: "STOCH RSI %K HAS NOT CROSSED UP THROUGH %D",
+    stoch_k_too_high: "STOCH RSI %K ABOVE ENTRY LIMIT",
+    min_interval_not_elapsed: "MINIMUM HOURS BETWEEN ENTRIES NOT ELAPSED",
     rsi_not_low: "RSI ABOVE ENTRY THRESHOLD",
     adx_not_low: "ADX ABOVE ENTRY LIMIT",
     adx_trending: "ADX INDICATES TRENDING MARKET",
@@ -783,11 +796,10 @@ function renderGlobal(g) {
       m.appendChild(hr());
       m.appendChild(sec("INDICATORS"));
       m.appendChild(kv("ADX", fmtNum(s.adx, 2)));
-      m.appendChild(kv("RSI", fmtNum(s.rsi, 2)));
-      m.appendChild(kv("%B", fmtNum(s.percent_b, 3)));
-      m.appendChild(kv("VO", s.volume_osc === null || s.volume_osc === undefined
-                       ? DASH : fmtSigned(Number(s.volume_osc) * 100) + "%"));
-      m.appendChild(kv("Z-SCORE", fmtSigned(s.zscore)));
+      m.appendChild(kv("+DI", fmtNum(s.plus_di, 2)));
+      m.appendChild(kv("-DI", fmtNum(s.minus_di, 2)));
+      m.appendChild(kv("STOCH %K", fmtNum(s.stoch_k, 3)));
+      m.appendChild(kv("STOCH %D", fmtNum(s.stoch_d, 3)));
       m.appendChild(kv("ATR", fmtNum(s.atr, 4)));
       m.appendChild(hr());
       m.appendChild(sec("GRID / POSITION"));

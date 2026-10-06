@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS symbols (
     adaptive_timeframe TEXT,
     inventory_qty REAL DEFAULT 0, avg_cost REAL DEFAULT 0,
     risk_status TEXT DEFAULT 'ok',
+    -- Regime + Recovery lifecycle (grid start / soft-exit marker) and
+    -- current directional/stochastic telemetry
+    grid_started_ts REAL, soft_exit_ts REAL,
+    plus_di REAL, minus_di REAL, stoch_k REAL, stoch_d REAL,
     -- Entry blocker telemetry (read-only tuning statistics)
     entry_evaluations INTEGER DEFAULT 0,
     blocked_adx INTEGER DEFAULT 0, blocked_rsi INTEGER DEFAULT 0,
@@ -94,6 +98,8 @@ _SYMBOL_COLUMNS = {
     "adaptive_quote_budget", "adaptive_grid_step", "adaptive_reference_price",
     "adaptive_timeframe",
     "inventory_qty", "avg_cost", "risk_status",
+    # Regime + Recovery lifecycle + directional/stochastic telemetry (v7)
+    "grid_started_ts", "soft_exit_ts", "plus_di", "minus_di", "stoch_k", "stoch_d",
     # Entry blocker telemetry (v5): read-only tuning statistics
     "entry_evaluations", "blocked_adx", "blocked_rsi", "blocked_vo",
     "blocked_bb", "blocked_grid", "blocked_budget", "blocked_risk",
@@ -108,7 +114,9 @@ OPEN_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
 # Schema v4 adds adaptive grid parameters for automatic grid range/count/budget.
 # Schema v5 adds per-symbol entry blocker telemetry (read-only tuning stats).
 # Schema v6 adds blocked_exit_priority to the telemetry set.
-SCHEMA_VERSION = 6
+# Schema v7 adds Regime + Recovery lifecycle fields (grid_started_ts,
+# soft_exit_ts) and +DI/-DI/Stoch-%K/%D telemetry columns.
+SCHEMA_VERSION = 7
 
 # Inventory dust below this absolute quantity is zeroed after a SELL.
 _INVENTORY_DUST = 1e-12
@@ -162,6 +170,13 @@ class SymbolState:
     last_entry_blocker: Optional[str] = None
     last_grid_reject_reason: Optional[str] = None
     risk_status: str = "ok"
+    # Regime + Recovery lifecycle + directional/stochastic telemetry (v7)
+    grid_started_ts: Optional[float] = None
+    soft_exit_ts: Optional[float] = None
+    plus_di: Optional[float] = None
+    minus_di: Optional[float] = None
+    stoch_k: Optional[float] = None
+    stoch_d: Optional[float] = None
     updated_at: float = 0.0
 
 
@@ -268,6 +283,21 @@ class StateStore:
                         "ALTER TABLE symbols ADD COLUMN blocked_exit_priority "
                         "INTEGER DEFAULT 0"
                     )
+            if version < 7:
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(symbols)").fetchall()
+                }
+                for column, decl in (
+                    ("grid_started_ts", "REAL"),
+                    ("soft_exit_ts", "REAL"),
+                    ("plus_di", "REAL"),
+                    ("minus_di", "REAL"),
+                    ("stoch_k", "REAL"),
+                    ("stoch_d", "REAL"),
+                ):
+                    if column not in cols:
+                        conn.execute(f"ALTER TABLE symbols ADD COLUMN {column} {decl}")
             if version < SCHEMA_VERSION:
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('schema_version', ?) "

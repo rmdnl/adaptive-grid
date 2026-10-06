@@ -1,12 +1,24 @@
-"""Strategy evaluation: indicator snapshot, entry gate, exit gate.
+"""Strategy evaluation: Regime + Recovery entry/exit gates.
 
-Entry requires ALL conditions (thresholds configured via .env):
-    ADX < ENTRY_ADX_MAX AND RSI <= ENTRY_RSI_MAX
-    AND VolumeOscillator >= ENTRY_VOLUME_OSC_MIN AND %B <= ENTRY_BB_PERCENT_B_MAX
+Indicator set (CLOSED candles only, INDICATOR_TIMEFRAME): ADX(14) with
++DI/-DI, Stoch RSI (RSI 14, stoch 14, smoothK 3, smoothD 3, 0..1 scale),
+ATR(14). The legacy RSI / BB %B / Volume-Oscillator / Z-score gates are
+removed — they are no longer part of any decision.
 
-Exit fires when ANY condition holds:
-    RSI >= EXIT_RSI_MIN OR ADX > EXIT_ADX_MIN
-    OR %B > EXIT_BB_PERCENT_B_MIN OR |Z| > EXIT_ZSCORE_ABS_MAX
+Entry requires ALL conditions:
+    ADX < ENTRY_ADX_MAX                 (ranging regime)
+    ADX <= ADX[ADX_REGIME_LOOKBACK bars ago]   (regime not strengthening)
+    Stoch RSI %K crosses UP through %D  (K[-2] <= D[-2] and K[-1] > D[-1])
+    %K < ENTRY_STOCH_K_MAX              (recovery still early)
+Grid economics and the global MIN_HOURS_BETWEEN_ENTRIES pacing gate are
+enforced separately by the bot/plan layer.
+
+Exit fires when ANY condition holds and carries a SEVERITY:
+    SOFT  — ADX > EXIT_ADX_MIN and +DI > -DI, or Stoch RSI %K > EXIT_STOCH_K_MAX:
+            cancel unfilled BUYs only, let SELLs fill, never market-sell.
+    HARD  — ADX > EXIT_ADX_MIN and -DI > +DI:
+            cancel everything and liquidate.
+    (the 15m lower-boundary breach is a separate HARD path in the bot)
 
 EXIT HAS PRIORITY OVER ENTRY. Insufficient indicator history blocks entry
 (fail-closed: NO TRADE) and cannot trigger an exit.
@@ -19,6 +31,11 @@ from typing import Dict, List, Optional, Tuple
 
 import indicators
 
+# How many bars back the ADX regime must not have strengthened.
+ADX_REGIME_LOOKBACK = 3
+
+STOCH_SCALE = 1.0  # Stoch RSI is on the 0..1 scale
+
 
 @dataclass(frozen=True)
 class IndicatorSnapshot:
@@ -26,10 +43,13 @@ class IndicatorSnapshot:
     last_close: Optional[float] = None
     last_candle_time: Optional[int] = None
     adx: Optional[float] = None
-    rsi: Optional[float] = None
-    percent_b: Optional[float] = None
-    volume_osc: Optional[float] = None
-    zscore: Optional[float] = None
+    adx_prev: Optional[float] = None       # ADX ADX_REGIME_LOOKBACK bars ago
+    plus_di: Optional[float] = None
+    minus_di: Optional[float] = None
+    stoch_k: Optional[float] = None
+    stoch_d: Optional[float] = None
+    stoch_k_prev: Optional[float] = None   # %K two closed bars ago
+    stoch_d_prev: Optional[float] = None   # %D two closed bars ago
     atr: Optional[float] = None
 
 
@@ -43,6 +63,7 @@ class EntryDecision:
 class ExitDecision:
     should_exit: bool
     reason: Optional[str] = None
+    severity: Optional[str] = None  # "soft" | "hard" | None
 
 
 def build_snapshot(
@@ -51,12 +72,11 @@ def build_snapshot(
     symbol: str = "",
     adx_period: int = 14,
     rsi_period: int = 14,
-    bb_period: int = 20,
-    bb_std: float = 2.0,
-    vo_fast: int = 5,
-    vo_slow: int = 10,
-    zscore_period: int = 20,
+    stoch_rsi_length: int = 14,
+    stoch_smooth_k: int = 3,
+    stoch_smooth_d: int = 3,
     atr_period: int = 14,
+    adx_regime_lookback: int = ADX_REGIME_LOOKBACK,
 ) -> IndicatorSnapshot:
     """Build the indicator snapshot from CLOSED candles only."""
     if not closed_candles:
@@ -64,18 +84,51 @@ def build_snapshot(
     closes = [float(c["close"]) for c in closed_candles]
     highs = [float(c["high"]) for c in closed_candles]
     lows = [float(c["low"]) for c in closed_candles]
-    volumes = [float(c["volume"]) for c in closed_candles]
+
+    dmi = indicators.adx_dmi(highs, lows, closes, adx_period)
+    adx_value = adx_prev = plus_di = minus_di = None
+    if dmi is not None:
+        adx_series, plus_di, minus_di = dmi
+        adx_value = adx_series[-1]
+        if len(adx_series) > adx_regime_lookback:
+            adx_prev = adx_series[-1 - adx_regime_lookback]
+
+    stoch = indicators.stoch_rsi(
+        closes, rsi_period, stoch_rsi_length, stoch_smooth_k, stoch_smooth_d
+    )
+    stoch_k = stoch_d = stoch_k_prev = stoch_d_prev = None
+    if stoch is not None:
+        k_series, d_series = stoch
+        stoch_k, stoch_d = k_series[-1], d_series[-1]
+        stoch_k_prev, stoch_d_prev = k_series[-2], d_series[-2]
+
     return IndicatorSnapshot(
         symbol=symbol,
         last_close=closes[-1],
         last_candle_time=int(closed_candles[-1]["close_time"]),
-        adx=indicators.adx(highs, lows, closes, adx_period),
-        rsi=indicators.rsi(closes, rsi_period),
-        percent_b=indicators.bollinger_percent_b(closes, bb_period, bb_std),
-        volume_osc=indicators.volume_oscillator(volumes, vo_fast, vo_slow),
-        zscore=indicators.zscore(closes, zscore_period),
+        adx=adx_value,
+        adx_prev=adx_prev,
+        plus_di=plus_di,
+        minus_di=minus_di,
+        stoch_k=stoch_k,
+        stoch_d=stoch_d,
+        stoch_k_prev=stoch_k_prev,
+        stoch_d_prev=stoch_d_prev,
         atr=indicators.atr(highs, lows, closes, atr_period),
     )
+
+
+def stoch_kd_cross_up(snapshot: IndicatorSnapshot) -> bool:
+    """True when %K crossed UP through %D on the last closed bar:
+    K[-2] <= D[-2] and K[-1] > D[-1]. Missing values never cross."""
+    if (
+        snapshot.stoch_k is None
+        or snapshot.stoch_d is None
+        or snapshot.stoch_k_prev is None
+        or snapshot.stoch_d_prev is None
+    ):
+        return False
+    return snapshot.stoch_k_prev <= snapshot.stoch_d_prev and snapshot.stoch_k > snapshot.stoch_d
 
 
 def entry_blockers(snapshot: IndicatorSnapshot, cfg) -> List[str]:
@@ -84,20 +137,22 @@ def entry_blockers(snapshot: IndicatorSnapshot, cfg) -> List[str]:
     entry decision and the per-condition blocker telemetry."""
     if (
         snapshot.adx is None
-        or snapshot.rsi is None
-        or snapshot.percent_b is None
-        or snapshot.volume_osc is None
+        or snapshot.adx_prev is None
+        or snapshot.stoch_k is None
+        or snapshot.stoch_d is None
+        or snapshot.stoch_k_prev is None
+        or snapshot.stoch_d_prev is None
     ):
         return ["insufficient_data"]
     failed: List[str] = []
     if not (snapshot.adx < cfg.entry_adx_max):
         failed.append("adx_not_low")
-    if not (snapshot.rsi <= cfg.entry_rsi_max):
-        failed.append("rsi_not_low")
-    if not (snapshot.volume_osc >= cfg.entry_volume_osc_min):
-        failed.append("volume_osc_not_positive")
-    if not (snapshot.percent_b <= cfg.entry_bb_percent_b_max):
-        failed.append("percent_b_not_low")
+    if not (snapshot.adx <= snapshot.adx_prev):
+        failed.append("adx_rising")
+    if not stoch_kd_cross_up(snapshot):
+        failed.append("stoch_no_cross")
+    if not (snapshot.stoch_k < cfg.entry_stoch_k_max):
+        failed.append("stoch_k_too_high")
     return failed
 
 
@@ -111,15 +166,19 @@ def evaluate_entry(snapshot: IndicatorSnapshot, cfg) -> EntryDecision:
 def evaluate_exit(snapshot: IndicatorSnapshot, cfg) -> ExitDecision:
     # Missing indicators cannot fire their condition (fail-closed: an exit
     # is never triggered by fabricated data).
-    if snapshot.rsi is not None and snapshot.rsi >= cfg.exit_rsi_min:
-        return ExitDecision(True, "rsi_overbought")
-    if snapshot.adx is not None and snapshot.adx > cfg.exit_adx_min:
-        return ExitDecision(True, "adx_trending")
-    if snapshot.percent_b is not None and snapshot.percent_b > cfg.exit_bb_percent_b_min:
-        return ExitDecision(True, "bb_upper_break")
-    if snapshot.zscore is not None and abs(snapshot.zscore) > cfg.exit_zscore_abs_max:
-        return ExitDecision(True, "zscore_extreme")
-    return ExitDecision(False, None)
+    if (
+        snapshot.adx is not None
+        and snapshot.plus_di is not None
+        and snapshot.minus_di is not None
+        and snapshot.adx > cfg.exit_adx_min
+    ):
+        if snapshot.plus_di > snapshot.minus_di:
+            return ExitDecision(True, "adx_trending_up", "soft")
+        if snapshot.minus_di > snapshot.plus_di:
+            return ExitDecision(True, "adx_trending_down", "hard")
+    if snapshot.stoch_k is not None and snapshot.stoch_k > cfg.exit_stoch_k_max:
+        return ExitDecision(True, "stoch_k_overbought", "soft")
+    return ExitDecision(False, None, None)
 
 
 def evaluate_signal(

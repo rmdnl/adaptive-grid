@@ -1,16 +1,19 @@
 """Deterministic technical indicators over CLOSED candles only.
 
-Every function returns the value as of the last element of the input
-series and None when history is insufficient or the value is degenerate
-(e.g. zero deviation). Insufficient history means NO TRADE — never a
-fabricated number. No lookahead: only the data passed in is used, and
-callers must pass closed candles (see `closed_candles`).
+Regime + Recovery indicator set: ADX(14) with +DI/-DI, Stoch RSI
+(RSI 14, stoch 14, smoothK 3, smoothD 3) and Wilder's ATR(14).
+
+Every function returns None (or an empty/short series) when history is
+insufficient or the value is degenerate (e.g. zero true range). Insufficient
+history means NO TRADE — never a fabricated number. No lookahead: only the
+data passed in is used, and callers must pass closed candles (see
+`closed_candles`).
 """
 
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 def closed_candles(candles: List[Dict], now_ms: Optional[int] = None) -> List[Dict]:
@@ -18,40 +21,6 @@ def closed_candles(candles: List[Dict], now_ms: Optional[int] = None) -> List[Di
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     return [c for c in candles if int(c["close_time"]) < now_ms]
-
-
-def _stddev(values: Sequence[float]) -> float:
-    n = len(values)
-    mean = sum(values) / n
-    var = sum((v - mean) ** 2 for v in values) / n
-    return var ** 0.5
-
-
-def rsi(closes: Sequence[float], period: int) -> Optional[float]:
-    """Wilder's RSI. None if fewer than period+1 closes, or flat history."""
-    if len(closes) < period + 1:
-        return None
-    gains = 0.0
-    losses = 0.0
-    for i in range(1, period + 1):
-        change = closes[i] - closes[i - 1]
-        if change > 0:
-            gains += change
-        else:
-            losses -= change
-    avg_gain = gains / period
-    avg_loss = losses / period
-    for i in range(period + 1, len(closes)):
-        change = closes[i] - closes[i - 1]
-        gain = change if change > 0 else 0.0
-        loss = -change if change < 0 else 0.0
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else None
-    if avg_gain == 0:
-        return 0.0
-    return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
 
 
 def atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], period: int) -> Optional[float]:
@@ -67,6 +36,46 @@ def atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], 
     return value
 
 
+def rsi_series(closes: Sequence[float], period: int) -> List[float]:
+    """Wilder's RSI evaluated at every bar where it is defined.
+
+    The first element corresponds to index `period` of the input closes
+    (the first bar a full change window exists). Flat-loss history yields
+    0.0, flat-gain history 100.0 (standard conventions), so the series
+    never contains fabricated None holes once defined.
+    """
+    n = len(closes)
+    if n < period + 1:
+        return []
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, period + 1):
+        change = closes[i] - closes[i - 1]
+        if change > 0:
+            gains += change
+        else:
+            losses -= change
+    avg_gain = gains / period
+    avg_loss = losses / period
+    out: List[float] = [_rsi_of(avg_gain, avg_loss)]
+    for i in range(period + 1, n):
+        change = closes[i] - closes[i - 1]
+        gain = change if change > 0 else 0.0
+        loss = -change if change < 0 else 0.0
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        out.append(_rsi_of(avg_gain, avg_loss))
+    return out
+
+
+def _rsi_of(avg_gain: float, avg_loss: float) -> float:
+    if avg_loss == 0:
+        return 100.0
+    if avg_gain == 0:
+        return 0.0
+    return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+
+
 def _true_ranges(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float]) -> List[float]:
     trs = []
     for i in range(1, len(closes)):
@@ -79,9 +88,17 @@ def _true_ranges(highs: Sequence[float], lows: Sequence[float], closes: Sequence
     return trs
 
 
-def adx(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], period: int) -> Optional[float]:
-    """Wilder's ADX. None if history is insufficient or degenerate (zero
-    true range / zero directional movement)."""
+def adx_dmi(
+    highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], period: int
+) -> Optional[Tuple[List[float], float, float]]:
+    """Wilder's ADX together with the latest +DI and -DI.
+
+    Returns (adx_series, plus_di, minus_di) where adx_series holds every
+    smoothed-ADX value in order (the last element is the current ADX), or
+    None when history is insufficient or degenerate (zero true range /
+    zero directional movement). The +DI/-DI values are the most recent
+    smoothed directional-index values (100 * smoothed DM / smoothed TR).
+    """
     n = len(closes)
     if n < 2 * period + 1:
         return None
@@ -101,72 +118,91 @@ def adx(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], 
             )
         )
 
-    def dx_of(sm_plus: float, sm_minus: float, sm_tr: float) -> Optional[float]:
-        if sm_tr <= 0:
-            return None
-        plus_di = 100.0 * sm_plus / sm_tr
-        minus_di = 100.0 * sm_minus / sm_tr
-        denom = plus_di + minus_di
-        if denom <= 0:
-            return None
-        return 100.0 * abs(plus_di - minus_di) / denom
-
     sm_plus = sum(plus_dms[:period])
     sm_minus = sum(minus_dms[:period])
     sm_tr = sum(trs[:period])
+    if sm_tr <= 0:
+        return None
+
     dxs: List[float] = []
-    first = dx_of(sm_plus, sm_minus, sm_tr)
-    if first is not None:
-        dxs.append(first)
+    plus_di_last = 100.0 * sm_plus / sm_tr
+    minus_di_last = 100.0 * sm_minus / sm_tr
+    denom = plus_di_last + minus_di_last
+    if denom > 0:
+        dxs.append(100.0 * abs(plus_di_last - minus_di_last) / denom)
     for i in range(period, len(trs)):
         sm_plus = sm_plus - sm_plus / period + plus_dms[i]
         sm_minus = sm_minus - sm_minus / period + minus_dms[i]
         sm_tr = sm_tr - sm_tr / period + trs[i]
-        dx = dx_of(sm_plus, sm_minus, sm_tr)
-        if dx is not None:
-            dxs.append(dx)
+        if sm_tr <= 0:
+            return None
+        plus_di_last = 100.0 * sm_plus / sm_tr
+        minus_di_last = 100.0 * sm_minus / sm_tr
+        denom = plus_di_last + minus_di_last
+        if denom > 0:
+            dxs.append(100.0 * abs(plus_di_last - minus_di_last) / denom)
     if len(dxs) < period:
         return None
+    adx_series: List[float] = []
     value = sum(dxs[:period]) / period
+    adx_series.append(value)
     for dx in dxs[period:]:
         value = (value * (period - 1) + dx) / period
-    return value
+        adx_series.append(value)
+    return adx_series, plus_di_last, minus_di_last
 
 
-def bollinger_percent_b(closes: Sequence[float], period: int, num_std: float) -> Optional[float]:
-    """Bollinger %B = (close - lower) / (upper - lower). None if the band
-    is degenerate (upper <= lower)."""
-    if len(closes) < period:
+def adx(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], period: int) -> Optional[float]:
+    """Current Wilder's ADX (scalar convenience over adx_dmi)."""
+    result = adx_dmi(highs, lows, closes, period)
+    if result is None:
         return None
-    window = list(closes[-period:])
-    mean = sum(window) / period
-    sd = _stddev(window)
-    upper = mean + num_std * sd
-    lower = mean - num_std * sd
-    if upper <= lower:
-        return None
-    return (closes[-1] - lower) / (upper - lower)
+    return result[0][-1]
 
 
-def volume_oscillator(volumes: Sequence[float], fast: int, slow: int) -> Optional[float]:
-    """VO = SMA(volume, fast) / SMA(volume, slow) - 1."""
-    if len(volumes) < slow or fast >= slow:
-        return None
-    fast_avg = sum(volumes[-fast:]) / fast
-    slow_avg = sum(volumes[-slow:]) / slow
-    if slow_avg == 0:
-        return None
-    return fast_avg / slow_avg - 1.0
+def stoch_rsi(
+    closes: Sequence[float],
+    rsi_period: int,
+    stoch_period: int,
+    smooth_k: int,
+    smooth_d: int,
+) -> Optional[Tuple[List[float], List[float]]]:
+    """Stochastic RSI on the 0..1 scale with smoothed %K and %D.
 
+    raw = (rsi - min(rsi over stoch window)) / (max - min);
+    %K = SMA(raw, smooth_k); %D = SMA(%K, smooth_d).
 
-def zscore(closes: Sequence[float], period: int) -> Optional[float]:
-    """Z = (close - SMA(period)) / population-std(period). None if the
-    deviation is zero."""
-    if len(closes) < period:
+    Returns (k_series, d_series) — full smoothed series in bar order, the
+    last elements being the current values — or None when history is
+    insufficient (fail-closed: NO TRADE) or the stoch window is flat
+    (max == min), which carries no stochastic information.
+    """
+    if rsi_period < 1 or stoch_period < 1 or smooth_k < 1 or smooth_d < 1:
         return None
-    window = list(closes[-period:])
-    mean = sum(window) / period
-    sd = _stddev(window)
-    if sd == 0:
+    rsi_vals = rsi_series(closes, rsi_period)
+    if len(rsi_vals) < stoch_period + smooth_k + smooth_d - 1:
+        # %D needs smooth_d %K values, %K needs smooth_k raw values, raw
+        # needs stoch_period RSI values, and at least two %K/%D pairs must
+        # exist for crossover detection.
         return None
-    return (closes[-1] - mean) / sd
+
+    raws: List[float] = []
+    for i in range(stoch_period - 1, len(rsi_vals)):
+        window = rsi_vals[i - stoch_period + 1 : i + 1]
+        lo = min(window)
+        hi = max(window)
+        if hi == lo:
+            return None  # flat RSI window: no stochastic information
+        raws.append((rsi_vals[i] - lo) / (hi - lo))
+
+    k_series: List[float] = []
+    for i in range(smooth_k - 1, len(raws)):
+        k_series.append(sum(raws[i - smooth_k + 1 : i + 1]) / smooth_k)
+    if len(k_series) < smooth_d:
+        return None
+    d_series: List[float] = []
+    for i in range(smooth_d - 1, len(k_series)):
+        d_series.append(sum(k_series[i - smooth_d + 1 : i + 1]) / smooth_d)
+    if len(d_series) < 2:
+        return None  # crossover detection needs at least two K/D pairs
+    return k_series, d_series

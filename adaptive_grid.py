@@ -20,11 +20,21 @@ from grid import ExchangeFilters, GridLevel
 log = logging.getLogger("adaptive_grid")
 
 
+# The 15m lower-boundary sits this far below the lowest BUY level; the
+# boundary stop itself triggers STOP_IF_BELOW_LOWER_PERCENT below it.
+LOWER_BOUNDARY_BUFFER = 0.02
+
+
 @dataclass(frozen=True)
 class AdaptiveGridPlan:
-    """Complete adaptive grid plan ready for execution."""
+    """Complete adaptive grid plan ready for execution.
+
+    lower_price is the PROTECTION BOUNDARY (LOWER_BOUNDARY_BUFFER below the
+    lowest BUY level) — the value the 15m lower-boundary gate enforces.
+    lowest_buy is the grid's own deepest BUY level."""
     lower_price: float
     upper_price: float
+    lowest_buy: float
     total_grids: int
     quote_budget: float
     step: float
@@ -119,7 +129,10 @@ class AdaptiveGridPlanner:
         if atr_step <= 0:
             raise ValueError("computed grid_step <= 0")
         econ_step = grid_mod.economic_min_step(current_price, cfg, cfg.grid_mode(symbol))
-        base_step = max(atr_step, econ_step)
+        # Regime + Recovery floor: the step never drops below
+        # MIN_STEP_PERCENT of price (in addition to the economics floor).
+        min_pct_step = cfg.min_step_percent * current_price
+        base_step = max(atr_step, min_pct_step, econ_step)
 
         # Try candidate grid counts from MAX_GRIDS down to MIN_GRIDS
         # (prefer highest usable count that passes all constraints)
@@ -194,8 +207,11 @@ class AdaptiveGridPlanner:
             )
 
         return AdaptiveGridPlan(
-            lower_price=best_lower,
+            # The protection boundary sits LOWER_BOUNDARY_BUFFER below the
+            # deepest BUY level (15m lower-boundary gate enforces it).
+            lower_price=best_lower * (1.0 - LOWER_BOUNDARY_BUFFER),
             upper_price=best_upper,
+            lowest_buy=best_lower,
             total_grids=best_count,
             quote_budget=per_symbol_budget,
             step=best_plan.step,

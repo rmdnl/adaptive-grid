@@ -419,7 +419,7 @@ def test_make_config_smoke():
     """Guard that the shared config still validates (no strategy drift from
     dashboard-only changes)."""
     cfg = make_config()
-    assert cfg.entry_rsi_max == 40.0
-    assert cfg.entry_bb_percent_b_max == 0.20
+    assert cfg.entry_stoch_k_max == 0.3
+    assert cfg.exit_stoch_k_max == 0.8
     assert cfg.dry_run is True
     assert cfg.allow_live_execution is False

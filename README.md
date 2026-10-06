@@ -1,6 +1,6 @@
 # adaptive-grid 🤖📉
 
-Bot grid **Binance Spot** konservatif multi-simbol yang vibes-nya *"abang nakal tapi sopan santunya keterbaca"*: gerbang masuk/keluar berbasis indikator ketat, validasi ekonomi grid executable, kill switch drawdown global 2%, plus dashboard read-only yang aesthetic™.
+Bot grid **Binance Spot** konservatif multi-simbol yang vibes-nya *"abang nakal tapi sopan santunnya keterbaca"*: gerbang masuk/keluar berbasis indikator ketat, validasi ekonomi grid executable, kill switch drawdown global 2%, plus dashboard read-only yang aesthetic™.
 
 Ada dua mode eksekusi non-live: **PAPER** (simulasi internal; modal sesi dari saldo USDT testnet; literally **zero order** yang nyampe Binance — bot cuma mimpi 💭) dan **TESTNET EXECUTION** (order Spot **Testnet Binance** asli pakai dana virtual, jadi sengsaranya juga virtual 😌). Mode LIVE? Terkunci berlapis-lapis. Buka kuncinya butuh **empat gerbang sekaligus**: `EXECUTION_MODE=live`, `BINANCE_ENV=live`, `DRY_RUN=false`, `ALLOW_LIVE_EXECUTION=true`. Salah satu aja ga kebuka — fail-closed vibes only 🔒.
 
@@ -25,18 +25,45 @@ Plot twist-nya sederhana: bot ini nunggu pasar lagi **santuy dan oversold**, tar
 - Gerbang batas-bawah 15m **fail-closed**: kalau data 15m-nya ghosting (ilang/invalid), bot ga nebak-nebak — dia blokir order baru buat simbol itu. Mature. Communicative. Green flag. ✅
 - Rekonsiliasi fill mode live udah diimplementasi tapi belum diuji lawan kondisi produksi beneran. Jadi anggep aja mode live itu statusnya "belum prove". Jangan dipake dulu. 🙅
 
+## Strategi Baru: "Regime + Recovery" 🧠
+
+**GANTI total dari strategi lama (RSI/BB/VO/Z-score) ke sistem dua lapis:**
+
+### 1. REGIME FILTER (ADX + DI)
+- **ADX(14) < 20** → pasar ranging / sideway, aman buat grid
+- **ADX ga naik** → ADX sekarang <= ADX 3 candle lalu (regime ga makin kuat)
+- **+DI / -DI** dipakai buat arah exit: +DI > -DI = soft exit, -DI > +DI = hard exit
+
+### 2. RECOVERY TIMING (Stochastic RSI)
+- **Stoch RSI** (RSI 14, stoch 14, smoothK 3, smoothD 3) — skala 0..1
+- **Entry:** %K cross UP lewat %D (K[-2] <= D[-2] dan K[-1] > D[-1]) DAN %K < 0.3
+- **Soft Exit:** %K > 0.8 (overbought lokal)
+- **Hard Exit:** ADX > 25 DAN -DI > +DI (trend down kuat)
+
+### PRIORITAS: EXIT > ENTRY
+Kalau exit condition nyala, entry diblokir total — meski simbol ga punya grid. `blocked_exit_priority` counter di dashboard hitung berapa kali ini terjadi per simbol.
+
+### TIME STOP & PACING
+- **HOLD_MAX_HOURS = 72** → grid umur > 72 jam = soft exit otomatis
+- **SOFT_COOLDOWN_HOURS = 2** → sesudah soft exit, tunggu sell fill, baru cooldown
+- **HARD_COOLDOWN_HOURS = 24** → sesudah hard exit / likuidasi penuh
+- **MIN_HOURS_BETWEEN_ENTRIES = 48** → global pacing: max 1 entry per 48 jam SEMUA simbol
+
+---
+
 ## Arsitektur 🏗️
 
 ```
 adaptive-grid/
 ├── .env.example      # template konfigurasi (.env adalah SUMBER KONFIGURASI TUNGGAL, no cap)
 ├── config.py         # load + validasi .env -> satu objek Config immutable
-├── indicators.py     # ADX/RSI/BB %B/VO/Z-score/ATR deterministik (candle CLOSED doang)
+├── indicators.py     # ADX/DMI, Stoch RSI, ATR deterministik (candle CLOSED doang)
 ├── strategy.py       # gerbang masuk, gerbang keluar, prioritas keluar, cooldown
 ├── grid.py           # konstruksi grid + ekonomi executable (sadar quantization)
+├── adaptive_grid.py  # planner grid adaptif: ATR-based range, step ekonomis, budget
 ├── risk.py           # veto order, kill drawdown 2%, gerbang batas-bawah 15m
 ├── exchange.py       # Binance Spot REST (testnet default), dry-run + live executor
-├── state.py          # database SQLite tunggal (state, order, fill, PnL, kills)
+├── state.py          # database SQLite tunggal (state, order, fill, PnL, kills, telemetry)
 ├── bot.py            # loop runtime yang ngorkestrasi siklus penuh
 ├── dashboard.py      # dashboard HTTP read-only di atas database state
 └── tests/            # test suite deterministik (offline, ga borno ke internet)
@@ -54,11 +81,12 @@ Grup kunci:
 |---|---|
 | Environment & safety | `BINANCE_ENV` (`testnet`/`live`), `EXECUTION_MODE` (`paper`/`testnet`/`live`), `DRY_RUN`, `ALLOW_LIVE_EXECUTION` |
 | Scope pasar | `PAIR_LIST` (cth `BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT`), `INDICATOR_TIMEFRAME` |
-| Indikator | `ADX_PERIOD`, `RSI_PERIOD`, `BB_PERIOD`, `BB_STD`, `VO_FAST`, `VO_SLOW`, `ZSCORE_PERIOD`, `ATR_PERIOD` |
-| Gerbang masuk (SEMUA harus lolos) | `ENTRY_ADX_MAX`, `ENTRY_RSI_MAX`, `ENTRY_VOLUME_OSC_MIN`, `ENTRY_BB_PERCENT_B_MAX` |
-| Gerbang keluar (SALAH SATU = gas keluar) | `EXIT_RSI_MIN`, `EXIT_ADX_MIN`, `EXIT_BB_PERCENT_B_MIN`, `EXIT_ZSCORE_ABS_MAX` |
-| Ekonomi grid | `ATR_GRID_MULTIPLIER`, `GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`, `MAKER_FEE`, `TAKER_FEE`, `SLIPPAGE_ESTIMATE` |
-| Risiko | `MAX_DRAWDOWN_PERCENT` (hard cap 2), `STOP_IF_BELOW_LOWER_PERCENT` (hard cap 2), `START_EQUITY`, `COOLDOWN_HOURS` |
+| Indikator (Regime + Recovery) | `ADX_PERIOD`, `RSI_PERIOD`, `STOCH_RSI_LENGTH`, `STOCH_SMOOTH_K`, `STOCH_SMOOTH_D`, `ATR_PERIOD` |
+| Gerbang masuk (SEMUA harus lolos) | `ENTRY_ADX_MAX` (default 20), `ADX_REGIME_LOOKBACK` (default 3), `ENTRY_STOCH_K_MAX` (default 0.3) |
+| Gerbang keluar (SALAH SATU = gas keluar) | `EXIT_ADX_MIN` (default 25), `EXIT_STOCH_K_MAX` (default 0.8) |
+| Ekonomi grid | `ATR_GRID_MULTIPLIER`, `GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`, `MAKER_FEE`, `TAKER_FEE`, `SLIPPAGE_ESTIMATE`, `MIN_STEP_PERCENT` |
+| Risiko & lifecycle | `MAX_DRAWDOWN_PERCENT` (hard cap 2), `STOP_IF_BELOW_LOWER_PERCENT` (hard cap 2), `START_EQUITY`, `SOFT_COOLDOWN_HOURS`, `HARD_COOLDOWN_HOURS`, `HOLD_MAX_HOURS`, `MIN_HOURS_BETWEEN_ENTRIES` |
+| Grid Adaptif | `ADAPTIVE_GRID`, `MIN_GRIDS`, `MAX_GRIDS`, `QUOTE_RESERVE_PERCENT`, `MAX_QUOTE_ALLOCATION_PERCENT` |
 | Kredensial | `BINANCE_TESTNET_API_KEY/SECRET` (testnet), `BINANCE_API_KEY/SECRET` (produksi; ga kepake kecuali live benar-benar kebuka gerbangnya) |
 
 Hard floor yang divalidasi (coba di-nerf, bakal ditolak config — bot ini literally ga bisa di-bullied): `GRID_GROSS_MIN >= 0.005` (0.50%), `MIN_NET_PROFIT_PER_GRID >= 0.002` (0.20%), `MAX_DRAWDOWN_PERCENT <= 2`, `STOP_IF_BELOW_LOWER_PERCENT <= 2`.
@@ -93,25 +121,32 @@ Endpoint & kredensial live dipake **cuma kalau** **ketiganya** terpenuhi:
 
 Kombinasi laen? Tetep di testnet, atau ditolak startup (cth: env `live` dengan `DRY_RUN=false` tapi gerbang lain masih ketutup = ditolak). `DRY_RUN=true` (default) = ga pernah nembak order ke Binance. Bot cuma jalan-jalan liat-liat pasar, window shopping aja. 🛍️
 
-## Aturan Strategi 🧠
+---
 
-**Masuk** (simbol boleh mulai grid cuma kalau SEMUA lolos, diukur di candle CLOSED `INDICATOR_TIMEFRAME`):
+## Aturan Strategi (Regime + Recovery) 📋
 
-- ADX(14) < 20 — pasar harus lagi *santuy*, lagi ga ada drama trend
-- RSI(14) <= 40 — lagi diskon, minimal diskon tipis-tipis
-- Volume Oscillator(5,10) >= 0 — ada yang nyari, minimal nyari-nyari dikit
-- Bollinger %B(20,2) <= 0.20 — harga lagi mampir di lantai bawah band
+**MASUK** (simbol boleh mulai grid cuma kalau SEMUA lolos, diukur di candle CLOSED `INDICATOR_TIMEFRAME`):
+
+1. **ADX < ENTRY_ADX_MAX** (default 20) — pasar santuy, ga ada drama trend
+2. **ADX <= ADX[3 bars ago]** — regime ga makin kuat (slope check)
+3. **Stoch RSI %K cross UP lewat %D** — K[-2] <= D[-2] dan K[-1] > D[-1]
+4. **%K < ENTRY_STOCH_K_MAX** (default 0.3) — recovery masih early
 
 Riwayat candle kurang? **NO TRADE.** Bukan "ah yaudah kira-kira lah", bukan exception kambuh, bukan nilai karangan. Zero trade. Ini yang bikin ortu nyaman. 🧘
 
-**Keluar** (grid aktif keluar kalau SALAH SATU kena; keluar SELALU prioritas di atas masuk):
+**KELUAR** (grid aktif keluar kalau SALAH SATU kena; keluar SELALU prioritas di atas masuk):
 
-- RSI(14) >= 70
-- ADX(14) > 25
-- Bollinger %B > 1
-- abs(Z-Score(20)) > 2.5
+**SOFT EXIT** (cancel unfilled BUYs only, biarkan SELLs fill, NO market sell):
+- ADX > EXIT_ADX_MIN (default 25) DAN +DI > -DI (trend up lembut)
+- ATAU Stoch RSI %K > EXIT_STOCH_K_MAX (default 0.8) — overbought lokal
 
-Keluar otomatis itu SOP yang rapi: stop order baru → cancel semua order terbuka → **verifikasi** → market-sell inventory yang dipegang → **verifikasi lagi** → catat alasan keluar, realized PnL, fee → cooldown (`COOLDOWN_HOURS`, default 3 jam) → ga ada re-entry otomatis selama cooldown. Verifikasi gagal dikit aja? Fail-closed: simbol berhenti di `ERROR` buat ditengok operator. Bot ga pernah "yaudah anggep aja berhasil". Never delulu. 🙃
+**HARD EXIT** (cancel ALL, verify, liquidate, verify, stop simbol):
+- ADX > EXIT_ADX_MIN DAN -DI > +DI (trend down kuat)
+- ATAU 15m close breach boundary (lebih parah, override semua)
+
+**TIME STOP**: Grid umur > 72 jam → soft exit; kalau inventory masih ada setelah 2 jam soft window → escalate ke HARD.
+
+Keluar otomatis itu SOP yang rapi: stop order baru → cancel semua order terbuka → **verifikasi** → market-sell inventory yang dipegang (HARD) / biarkan sell fill (SOFT) → **verifikasi lagi** → catat alasan keluar, realized PnL, fee → cooldown → ga ada re-entry otomatis selama cooldown. Verifikasi gagal dikit aja? Fail-closed: simbol berhenti di `ERROR` buat ditengok operator. Bot ga pernah "yaudah anggep aja berhasil". Never delulu. 🙃
 
 Setelah keluar otomatis, simbol ga bisa mulai grid baru sebelum cooldown selesai — dan cooldown tetap bertahan walau botnya di-restart. Nggak bisa di-tgep. 💅
 
@@ -121,16 +156,35 @@ Perintah `--check-grid` (read-only) ngevalidasi grid + ekonomi net executable-ny
 python bot.py --check-grid
 ```
 
-Ini pake **jalur produksi persis** (`MarketData` + `grid.build_grid`): ambil filter exchange, harga rata-rata terbobot reference, ATR candle closed, bangun plan dengan logika quantization/fee/slippage/PERCENT_PRICE_BY_SIDE yang sama kayak live, terus cetak ACCEPTED/REJECTED per simbol lengkap dengan min/max/average executable net profit dan level yang di bawah minimum. Ga submit apa-apa, ga cancel apa-apa, ga sentuh database state. Exit non-zero kalau ada simbol yang gagal gerbang. Jujur itu mahal, tapi di sini gratis. ✨
+Ini pake **jalur produksi persis** (`MarketData` + `AdaptiveGridPlanner.plan`): ambil filter exchange, harga rata-rata terbobot reference, ATR candle closed, bangun plan dengan logika quantization/fee/slippage/PERCENT_PRICE_BY_SIDE yang sama kayak live, terus cetak ACCEPTED/REJECTED per simbol lengkap dengan min/max/average executable net profit dan level yang di bawah minimum. Ga submit apa-apa, ga cancel apa-apa, ga sentuh database state. Exit non-zero kalau ada simbol yang gagal gerbang. Jujur itu mahal, tapi di sini gratis. ✨
+
+---
 
 ## Ekonomi Grid 📐
 
-- Grid step = yang lebih besar antara `ATR_GRID_MULTIPLIER × ATR(14)` dan **economic minimum step**. Jadi pas volatilitas ngilang (ATR mungil), grid ga tumbang cuma karena langkahnya kegedean buat nutup fee — step-nya di-*floor* ke ukuran minimum yang masih economically viable, dihitung dari fee + slippage + required profitability (deterministik, bukan angka sulap). Setelah itu grid **direbuild ulang** dan divalidasi penuh. Kandidat ga lolos = ditolak. Ekonomi ga pernah diturunin demi "biar kebuka". 💢
-- Grid arithmetic buat BTC/ETH/BNB, geometric buat SOL (mapping ada di `config.py`).
+- **Grid step = max(ATR × multiplier, MIN_STEP_PERCENT × price, economic minimum step)**. Jadi pas volatilitas ngilang (ATR mungil), grid ga tumbang cuma karena langkahnya kegedean buat nutup fee — step-nya di-*floor* ke ukuran minimum yang masih economically viable, dihitung dari fee + slippage + required profitability (deterministik, bukan angka sulap). Kandidat ga lolos = ditolak. Ekonomi ga pernah diturunin demi "biar kebuka". 💢
+- Grid **arithmetic** buat BTC/ETH/BNB, **geometric** buat SOL (mapping ada di `config.py`).
 - Harga buy dibulatkan **ke bawah**, sell **ke atas** ke tick size exchange; qty nge-hormatin step size dan minimum notional. Konservatif itu default aesthetic-nya.
 - **Ekonomi executable** (setelah quantization exchange, plus fee buy, fee sell, dan estimasi slippage dua sisi) itu yang jadi hakim. Bukan angka teoretis yang cakep di spreadsheet. 📊
 - Grid **diblokir** kecuali executable gross >= 0.50% DAN executable net >= 0.20% (`GRID_GROSS_MIN`, `MIN_NET_PROFIT_PER_GRID`). Grid jelek ga pernah diperlebar, dipaksa, atau dibujuk. Rejection tanpa drama.
 - **PERCENT_PRICE_BY_SIDE di-parse dan di-enforce lokal.** Buat tiap simbol, harga rata-rata terbobot exchange (`GET /api/v3/avgPrice`, via filter `avgPriceMins` — ga dianggap sama dengan last price, karena bot ga suka asumsi) jadi reference: level BUY harus ada di `reference × [bidMultiplierDown, bidMultiplierUp]`, harga SELL di `reference × [askMultiplierDown, askMultiplierUp]`. Level yang bandel di luar band di-drop dari plan (atau grid diblokir kalau ga ada sisa); child sell di luar band di-defer ke siklus berikutnya, bukan dibanting ke Binance biar ditolak. Penolakan definitif (HTTP 400 filter failure, kode -1013/-2010) bikin simbol berhenti di `ERROR` — ga pernah di-retry buta. Ghosted by the exchange? Bot langsung stop, ga nagih-nagih. 🚫👻
+
+### Adaptive Grid Planner (Phase 1) 🎯
+
+`ADAPTIVE_GRID=true` (default) → LOWER_PRICE, UPPER_PRICE, TOTAL_GRIDS, TOTAL_QUOTE_BUDGET jadi **opsional**. Bot hitung otomatis:
+
+1. **Step** = ATR × `ATR_GRID_MULTIPLIER` (di-floor ke `MIN_STEP_PERCENT` + economic min)
+2. **Range** = ±(MAX_GRIDS/2) step di sekitar harga sekarang → simetri
+3. **Kuantisasi** ke tick size exchange
+4. **Cari candidate grid count terbaik** dari `MIN_GRIDS` sampai `MAX_GRIDS` yang lolos:
+   - Ekonomi executable (net >= 0.20%)
+   - Filter Binance (tick, step, min/max notional, PERCENT_PRICE_BY_SIDE)
+   - Budget feasible (pakai `QUOTE_RESERVE_PERCENT` + `MAX_QUOTE_ALLOCATION_PERCENT`)
+5. **Fail-closed** kalau ga ada candidate yang lolos
+
+**Grid aktif = parameter terkunci.** ATR berubah, harga berubah, grid tetep pake nilai pas pertama kali aktif. Grid baru hanya dibuat setelah grid lama benar-benar inactive (exit selesai + cooldown).
+
+---
 
 ## Aturan Risiko 🚨
 
@@ -142,9 +196,18 @@ Ini pake **jalur produksi persis** (`MarketData` + `grid.build_grid`): ambil fil
 - BUY yang ke-fill dikonversi jadi child SELL order pakai **qty aktual yang diterima** (net komisi base asset; dilacak per order di `child_sell_qty`, diupdate atomis bareng pembuatan child) — duplicate child sell secara struktural mustahil. Kayak OTP yang udah dipake. ♻️
 - Likuidasi pake satu client order id per attempt (dilacak end-to-end), rekonsiliasi id eksak setelah error network, sisa dihitung dari qty executed aktual, terus hasilnya diverifikasi lawan **saldo base asset di akun** (otoritatif, testnet/live). Verifikasi gagal atau masih ada sisa = TIDAK dilikuidasi, simbol fail-closed. Ga ada setengah-setengah. 🎯
 
+---
+
 ## State 🗃️
 
-Satu database SQLite (`state.db` default, path via `--db`) nampung semua: state global bot, per-simbol state, cooldown, nilai plan grid, order, fill, fee, realized PnL, risk event, kill state, plus **telemetry entry blocker** (statistik read-only: berapa kali dicblock ADX/RSI/VO/BB, grid economics, budget, risk veto, cooldown, jumlah entry sukses, entry blocker terakhir, alasan grid rejection terakhir). Schema bawa version stamp (`schema_version` di `meta`), dimigrasi deterministik minimal saat startup. Ga ada tabel kompatibilitas buat arsitektur lama — move on, heal, glow up. ✨
+Satu database SQLite (`state.db` default, path via `--db`) nampung semua: state global bot, per-simbol state, cooldown, nilai plan grid, order, fill, fee, realized PnL, risk event, kill state, plus **telemetry entry blocker** (statistik read-only: berapa kali dicblock ADX level/slope, Stoch cross/limit, grid economics, budget, risk veto, cooldown, jumlah entry sukses, entry blocker terakhir, alasan grid rejection terakhir). Schema bawa version stamp (`schema_version` di `meta`), dimigrasi deterministik minimal saat startup (v4→v5→v6→v7). Ga ada tabel kompatibilitas buat arsitektur lama — move on, heal, glow up. ✨
+
+**Schema v7 fields baru:**
+- `grid_started_ts`, `soft_exit_ts` — lifecycle tracking
+- `plus_di`, `minus_di`, `stoch_k`, `stoch_d` — indikator snapshot
+- `blocked_exit_priority` — counter exit veto (v6 carryover)
+
+---
 
 ## Dashboard 📡
 
@@ -156,9 +219,17 @@ Konsol operator retrofuturistik read-only (*"sistem kontrol trading crypto seriu
 
 Routes (GET only): `GET /` (shell console — static HTML/CSS/JS, no external assets), `GET /api/state` (JSON snapshot, termasuk `entry_telemetry` per simbol), `GET /api/history` (telemetry net PnL kumulatif dari fill ledger; kosong kalau emang ga ada fill — history ga pernah dikarang). Semua method write = `405`. Console ga punya logic strategi, ga place/cancel apa pun, ga expose kredensial, ga pernah baca `.env` atau environment variable, dan render nilai dynamic murni lewat DOM API aman (`textContent`). Skema keamanannya tertib. 🧷
 
+**Telemetry Baru (Regime + Recovery):**
+- INDICATORS: ADX, +DI, -DI, STOCH %K, STOCH %D, ATR (lama: RSI, BB%B, VO, Z-score — sudah dihapus)
+- EXIT PRIORITY row: `adx_trending_up` (soft), `adx_trending_down` (hard), `stoch_k_overbought` (soft), `lower_boundary_breach` (hard), `time_stop` (soft), `time_stop_escalation` (hard)
+- BLOCKER labels: `adx_not_low`, `adx_rising`, `stoch_no_cross`, `stoch_k_too_high`, `cooldown`, `min_interval_not_elapsed`, `exit_priority`, `boundary_unknown`, `balance_unavailable`, `insufficient_balance`, `risk_*`, `grid_economics`, `quote_budget_exceeded`
+- `entry_telemetry` payload: 10 counter + 3 timestamp per simbol
+
 Data yang tampil: equity global, reference equity, drawdown, open orders, realized PnL, fees, kill switch state/reason, runtime & database status; per simbol: state, risk status, price (harga ticker live), timeframe, entry status/blocker, exit status/reason, cooldown, grid mode/step/count, gross & net per grid, inventory, average cost, open orders, realized PnL, fees, dan entry telemetry.
 
 State simbol ditampilkan **verbatim** dari database — ga pernah di-infer: `WAITING`, `ENTRY_BLOCKED`, `GRID_BLOCKED`, `ACTIVE`, `COOLDOWN`, `EXITING`, `STOPPED`, `KILL_ACTIVE`, `ERROR`. Database-nya down? Console tetep hidup dan nampilin `DATABASE UNAVAILABLE`, bukan crash. Stabil di masa sulit. 💪
+
+---
 
 ## Instalasi 🧰
 
@@ -195,6 +266,25 @@ python bot.py                                        # jalankan eksekusi testnet
 ```
 
 Order self-test itu flag-gated dan ga pernah jalan otomatis; dia nempatin LIMIT_MAKER buy 50% di bawah market terus cancel — secuek apa pun market-nya, order itu ga mungkin ke-fill. It's giving *safety drill*. 🧯
+
+---
+
+## Testing 🧪
+
+```bash
+pytest -q
+```
+
+Suite (**418 test**) deterministik dan offline: validasi konfigurasi & live gates, matematika indikator lawan referensi hand-computed (ADX DMI zigzag, Stoch RSI K/D crossover, RSI series), threshold masuk/keluar ketat + prioritas keluar, quantization grid & ekonomi executable, risk veto & kill persistence, state restart recovery, retry jujur (GET boleh di-retry, order ga pernah di-retry buta), perilaku dashboard read-only, telemetry entry blocker (null-vs-zero distinction wajib), dan integrasi bot-cycle (fill, keluar, cooldown, boundary stop, drawdown kill, soft/hard exit flow, time stop escalation, global pacing) lawan stub market. Test-nya lebih banyak dari followers pertama lo. 🔥
+
+**Test files utama:**
+- `tests/test_indicators.py` — 18 test (ADX, Stoch RSI, RSI hand-computed)
+- `tests/test_strategy.py` — 33 test (entry/exit gates, snapshot build, priority)
+- `tests/test_bot.py` — 55 test (cycle flow, soft/hard exit, telemetry, pacing)
+- `tests/test_adaptive_grid.py` — 27 test (boundary buffer, min step, economic step)
+- `tests/test_dashboard_telemetry.py` — 13 test (Node harness real JS execution)
+
+---
 
 ## Deployment (VPS / systemd) 🐧
 
@@ -252,14 +342,22 @@ grep -E '^DRY_RUN=|^ALLOW_LIVE_EXECUTION=|^BINANCE_ENV=' /opt/adaptive-grid/.env
 
 Dashboard bind `0.0.0.0:8080` via CLI flags eksplisit — unit ga ngoper environment variables atau environment file ke proses dashboard. Mau expose publik? Lewat reverse proxy/tunnel sendiri; konfigurasi itu di luar repo ini. (Dan ya, dashboard tanpa auth itu gaya hidup berisiko — kasih proxy auth kalau ga mau saldo lo jadi konten publik. 💀)
 
-## Testing 🧪
-
-```bash
-pytest -q
-```
-
-Suite (**391 test**) deterministik dan offline: validasi konfigurasi & live gates, matematika indikator lawan referensi hand-computed, threshold masuk/keluar ketat + prioritas keluar, quantization grid & ekonomi executable, risk veto & kill persistence, state restart recovery, retry jujur (GET boleh di-retry, order ga pernah di-retry buta), perilaku dashboard read-only, telemetry entry blocker, dan integrasi bot-cycle (fill, keluar, cooldown, boundary stop, drawdown kill) lawan stub market. Test-nya lebih banyak dari followers pertama lo. 🔥
+---
 
 ## Mode Live — Peringatan 🚨
 
 Live trading itu **disabled by default** dan itu bukan accident, itu desain. Buat ngaktifin butuh tiga gerbang eksplisit di atas PLUS keputusan operator yang sadar dan penuh kesadaran di mesin yang `.env`-nya beneran berisi live key. **Jangan aktifin mode live tanpa review independen.** Nggak ada dukun, nggak ada sinyal grup, nggak ada "katanya". Penulis ga nerima liability buat kerugian trading — kerugian lo ya lo yang pegang, bestie. Kalau ragu: tetep di paper/testnet, santuy, ga usah buru-buru. Market bakal masih buka besok. 🧘‍♂️
+
+---
+
+## Changelog Singkat 📝
+
+| Versi | Highlight |
+|---|---|
+| **v5.1.0** | Regime + Recovery strategy (ADX+DI, Stoch RSI), soft/hard exit, time stop, global pacing, 2% boundary buffer, economic min step, schema v7, 418 tests |
+| **v5.0.0** | Multi-symbol locked strategy, adaptive grid planner, dashboard telemetry v4 |
+| **v4.x** | Legacy RSI/BB/VO/Z-score strategy (deprecated) |
+
+---
+
+**Stay safe, stay humble, protect the bag.** 🤝

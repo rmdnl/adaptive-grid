@@ -15,18 +15,23 @@ def test_loads_valid_env_file(tmp_path):
     assert cfg.dry_run is True
     assert cfg.allow_live_execution is False
     assert cfg.pair_list == ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT")
-    assert cfg.indicator_timeframe == "4h"
+    assert cfg.indicator_timeframe == "1h"
     assert cfg.adx_period == 14
-    assert cfg.bb_std == 2.0
+    assert cfg.stoch_rsi_length == 14
     assert cfg.entry_adx_max == 20.0
-    assert cfg.exit_zscore_abs_max == 2.5
+    assert cfg.entry_stoch_k_max == 0.3
+    assert cfg.exit_stoch_k_max == 0.8
+    assert cfg.min_hours_between_entries == 48.0
+    assert cfg.min_step_percent == 0.006
+    assert cfg.soft_cooldown_hours == 1.0
+    assert cfg.hard_cooldown_hours == 2.0
+    assert cfg.hold_max_hours == 72.0
     assert cfg.grid_gross_min == 0.005
     assert cfg.min_net_profit_per_grid == 0.002
     assert cfg.maker_fee == 0.001
     assert cfg.slippage_estimate == 0.0005
     assert cfg.max_drawdown_percent == 2.0
     assert cfg.stop_if_below_lower_percent == 2.0
-    assert cfg.cooldown_hours == 3.0
     assert cfg.max_drawdown == 0.02
     assert cfg.stop_if_below_lower == 0.02
 

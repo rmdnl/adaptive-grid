@@ -638,6 +638,19 @@ class DryRunExecutor(BaseExecutor):
             log.info("dry-run cancel %s order=%s", symbol, order["client_order_id"])
         return len(self.store.open_orders(symbol)) == 0
 
+    def cancel_buys(self, symbol: str) -> bool:
+        """Soft exit: cancel only unfilled BUY orders; SELLs stay working.
+        Verified locally: no open BUY may remain afterwards."""
+        for order in list(self.store.open_orders(symbol)):
+            if order["side"] != "BUY":
+                continue
+            self.store.update_order_status(order["id"], "CANCELED", order["filled_qty"])
+            log.info("dry-run cancel-buy %s order=%s", symbol, order["client_order_id"])
+        remaining_buys = [
+            o for o in self.store.open_orders(symbol) if o["side"] == "BUY"
+        ]
+        return len(remaining_buys) == 0
+
     def sync_fills(self, symbol: str, candle: Optional[Dict], allow_renewal: bool = True) -> None:
         if candle is None:
             return
@@ -892,6 +905,50 @@ class LiveExecutor(BaseExecutor):
             )
         try:
             return len(self.spot.get_open_orders(symbol)) == 0
+        except ExchangeError as exc:
+            log.error("open-order verification failed for %s: %s", symbol, exc)
+            return False
+
+    def cancel_buys(self, symbol: str) -> bool:
+        """Soft exit: cancel only unfilled BUY orders; SELLs stay working.
+
+        Every BUY cancel is reconciled per client id (a cancel racing a fill
+        records FILLED, never a fake CANCELED), and the verified result is
+        that NO open BUY remains on the exchange. SELL orders are untouched.
+        Any unresolvable order fails closed (False)."""
+        for order in list(self.store.open_orders(symbol)):
+            if order["side"] != "BUY":
+                continue
+            cid = order["client_order_id"]
+            try:
+                remote = self.spot.cancel_order(symbol, cid)
+            except ExchangeError as exc:
+                # The cancel may have failed because the order is already in
+                # a terminal state — reconcile before judging.
+                remote = None
+                try:
+                    remote = self.spot.get_order(symbol, cid)
+                except ExchangeError:
+                    pass
+                if remote is None:
+                    log.error("cancel-buy unresolvable for %s %s: %s", symbol, cid, exc)
+                    return False
+            self._record_remote_trades(symbol, remote)
+            status = remote.get("status", "CANCELED")
+            self.store.update_order_status(
+                order["id"], status, float(remote.get("executedQty") or 0)
+            )
+        # Authoritative verification: no open BUY may remain (SELLs may).
+        try:
+            remaining_buys = [
+                o for o in self.spot.get_open_orders(symbol)
+                if o.get("side") == "BUY"
+            ]
+            if remaining_buys:
+                log.error("cancel-buy verification failed for %s: %d BUY(s) remain",
+                          symbol, len(remaining_buys))
+                return False
+            return True
         except ExchangeError as exc:
             log.error("open-order verification failed for %s: %s", symbol, exc)
             return False

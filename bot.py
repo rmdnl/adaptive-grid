@@ -76,12 +76,11 @@ class MarketData:
             symbol=symbol,
             adx_period=cfg.adx_period,
             rsi_period=cfg.rsi_period,
-            bb_period=cfg.bb_period,
-            bb_std=cfg.bb_std,
-            vo_fast=cfg.vo_fast,
-            vo_slow=cfg.vo_slow,
-            zscore_period=cfg.zscore_period,
+            stoch_rsi_length=cfg.stoch_rsi_length,
+            stoch_smooth_k=cfg.stoch_smooth_k,
+            stoch_smooth_d=cfg.stoch_smooth_d,
             atr_period=cfg.atr_period,
+            adx_regime_lookback=cfg.adx_regime_lookback,
         )
         close_15m: Optional[float] = None
         candle_15m_time: Optional[int] = None
@@ -356,11 +355,16 @@ class Bot:
         market_fields = dict(
             timeframe=self.cfg.indicator_timeframe,
             adx=snap.adx,
-            rsi=snap.rsi,
-            percent_b=snap.percent_b,
-            volume_osc=snap.volume_osc,
-            zscore=snap.zscore,
+            plus_di=snap.plus_di,
+            minus_di=snap.minus_di,
+            stoch_k=snap.stoch_k,
+            stoch_d=snap.stoch_d,
             atr=snap.atr,
+            # legacy gate indicators are no longer computed (Regime + Recovery)
+            rsi=None,
+            percent_b=None,
+            volume_osc=None,
+            zscore=None,
         )
         if st.risk_status != "stopped":
             market_fields.update(exit_status=0, exit_reason=None)
@@ -399,14 +403,59 @@ class Bot:
             effective_lower = adaptive_lower if adaptive_lower is not None else configured_lower
             boundary = self.risk.boundary_status(close_15m_for_boundary, effective_lower)
             if boundary == BREACH:
+                # 15m close beyond the boundary is a HARD exit: cancel all,
+                # verify, liquidate, verify, hard cooldown.
                 self.store.update_symbol(symbol, exit_status=1, exit_reason="lower_boundary_breach")
-                self._exit_symbol(symbol, "lower_boundary_breach", now, cooldown=False)
+                self._exit_symbol(symbol, "lower_boundary_breach", now,
+                                  cooldown_hours=self.cfg.hard_cooldown_hours)
                 return
+            if exit_decision.should_exit and exit_decision.severity == "hard":
+                # A HARD signal always escalates immediately — even while a
+                # soft exit is already in progress.
+                self.store.update_symbol(
+                    symbol, exit_status=1, exit_reason=exit_decision.reason
+                )
+                self._exit_symbol(symbol, exit_decision.reason, now,
+                                  cooldown_hours=self.cfg.hard_cooldown_hours)
+                return
+
+            if st.soft_exit_ts is not None:
+                # Soft exit in progress: unfilled BUYs are cancelled, SELLs
+                # stay working. Keep reconciling fills; finish into a soft
+                # cooldown once everything has sold, and escalate to a HARD
+                # exit if inventory still remains after the soft window. A
+                # soft signal re-firing here is a no-op (already soft exiting).
+                self.executor.sync_fills(symbol, view.last_candle, allow_renewal=False)
+                st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
+                inventory = float(st.inventory_qty or 0.0)
+                if inventory <= QTY_TOLERANCE and self.store.count_open_orders(symbol) == 0:
+                    self.store.add_risk_event(symbol, "soft_exit_complete", st.exit_reason or "")
+                    self._finish_exit(symbol, st.exit_reason or "soft_exit", now,
+                                      cooldown_hours=self.cfg.soft_cooldown_hours)
+                    return
+                if inventory > QTY_TOLERANCE and \
+                        now >= (st.soft_exit_ts or now) + self.cfg.soft_cooldown_hours * 3600.0:
+                    # SELLs did not clear within the soft window: hard exit.
+                    self.store.update_symbol(symbol, exit_status=1, exit_reason="time_stop_escalation")
+                    self._exit_symbol(symbol, "time_stop_escalation", now,
+                                      cooldown_hours=self.cfg.hard_cooldown_hours)
+                    return
+                self.store.set_symbol_state(symbol, "ACTIVE")
+                return
+
             if exit_decision.should_exit:
                 self.store.update_symbol(
                     symbol, exit_status=1, exit_reason=exit_decision.reason
                 )
-                self._exit_symbol(symbol, exit_decision.reason, now, cooldown=True)
+                self._soft_exit_symbol(symbol, exit_decision.reason, now)
+                return
+
+            # TIME STOP: a grid older than HOLD_MAX_HOURS gets a SOFT exit;
+            # escalation to hard happens above once soft_exit_ts is set.
+            if st.grid_started_ts is not None and \
+                    now - st.grid_started_ts >= self.cfg.hold_max_hours * 3600.0:
+                self.store.update_symbol(symbol, exit_status=1, exit_reason="time_stop")
+                self._soft_exit_symbol(symbol, "time_stop", now)
                 return
 
             allow_renewal = boundary != UNKNOWN
@@ -424,7 +473,7 @@ class Bot:
                 self.store.add_risk_event(
                     symbol, "interrupted_exit_recovery", "inventory without covering sell orders"
                 )
-                self._exit_symbol(symbol, "interrupted_exit_recovery", now, cooldown=False)
+                self._exit_symbol(symbol, "interrupted_exit_recovery", now, cooldown_hours=None)
                 return
             self.store.set_symbol_state(symbol, "ACTIVE")
             return
@@ -468,6 +517,16 @@ class Bot:
                 self._tally_entry_blockers(symbol, [], veto.reason)
                 self.store.increment_symbol_counters(symbol, {"blocked_risk": 1})
                 self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker=veto.reason)
+                return
+            # Regime + Recovery pacing: at most one new grid entry across ALL
+            # symbols per MIN_HOURS_BETWEEN_ENTRIES window. 0 disables the
+            # pacing gate. Purely a gate — recorded like any other blocker.
+            last_entry = self.store.get_meta_float("last_entry_ts_global")
+            if last_entry is not None and                     now - last_entry < self.cfg.min_hours_between_entries * 3600.0:
+                self._tally_entry_blockers(symbol, [], "min_interval_not_elapsed")
+                self.store.set_symbol_state(
+                    symbol, "ENTRY_BLOCKED", entry_blocker="min_interval_not_elapsed"
+                )
                 return
             filters = self.market.filters(symbol)
             reference = self.market.avg_price(symbol)
@@ -527,14 +586,16 @@ class Bot:
                 if not self._place_grid(symbol, plan):
                     return
                 self._tally_entry_success(symbol, now)
+                self.store.set_meta_float("last_entry_ts_global", now)
                 self.store.update_symbol(
                     symbol,
                     strategy_state="ACTIVE",
+                    grid_started_ts=now,
                     entry_blocker=None,
                     block_reason=None,
                     grid_mode=plan.mode,
                     grid_step=plan.step,
-                    grid_lower=plan.lower_price,
+                    grid_lower=adaptive_plan.lowest_buy,
                     gross_pct=plan.gross_pct,
                     net_pct=plan.net_pct,
                     # Persist adaptive parameters (locked for active grid)
@@ -575,6 +636,7 @@ class Bot:
                 if not self._place_grid(symbol, plan):
                     return
                 self._tally_entry_success(symbol, now)
+                self.store.set_meta_float("last_entry_ts_global", now)
                 self.store.set_symbol_state(
                     symbol,
                     "ACTIVE",
@@ -585,6 +647,7 @@ class Bot:
                     grid_lower=plan.lower_price,
                     gross_pct=plan.gross_pct,
                     net_pct=plan.net_pct,
+                    grid_started_ts=now,
                 )
                 return
 
@@ -619,9 +682,11 @@ class Bot:
     # ----- grid lifecycle -----
 
     # entry blocker -> telemetry counter column (read-only tuning statistics;
-    # never consulted by any trading decision)
+    # never consulted by any trading decision). Both ADX regime conditions
+    # (level and slope) count as the ADX entry-condition failure.
     _BLOCKER_COUNTERS = {
         "adx_not_low": "blocked_adx",
+        "adx_rising": "blocked_adx",
         "rsi_not_low": "blocked_rsi",
         "volume_osc_not_positive": "blocked_vo",
         "percent_b_not_low": "blocked_bb",
@@ -723,10 +788,12 @@ class Bot:
         )
         return True
 
-    def _exit_symbol(self, symbol: str, reason: str, now: float, cooldown: bool) -> None:
-        """Automatic exit: cancel → verify → liquidate → verify → record →
-        cooldown. Any verification failure is fail-closed (state ERROR)."""
-        log.info("exit %s reason=%s", symbol, reason)
+    def _exit_symbol(self, symbol: str, reason: str, now: float,
+                     cooldown_hours: Optional[float]) -> None:
+        """HARD exit: cancel all → verify → liquidate → verify → record →
+        cooldown (or risk stop when cooldown_hours is None). Any
+        verification failure is fail-closed (state ERROR)."""
+        log.info("hard exit %s reason=%s", symbol, reason)
         self.store.set_symbol_state(symbol, "EXITING", exit_reason=reason)
         if not self.executor.cancel_all(symbol):
             self.store.add_risk_event(symbol, "cancel_verify_failed", reason)
@@ -750,12 +817,20 @@ class Bot:
                 log.error("fail-closed: liquidation verification failed for %s", symbol)
                 return
         self.store.add_risk_event(symbol, "auto_exit", reason)
-        
-        # Clear adaptive grid parameters on successful exit — they were locked
-        # for the grid that just exited and must not be reused as an active
-        # boundary when no grid is running. Historical values are preserved
-        # implicitly in the fills/order/risk-event ledger.
-        clear_adaptive = {
+        if cooldown_hours is not None:
+            self._finish_exit(symbol, reason, now, cooldown_hours)
+        else:
+            # Fail-closed stop (e.g. interrupted-exit recovery): no automatic
+            # re-entry until explicit operator action.
+            self.risk.stop_symbol(symbol, reason)
+            self.store.update_symbol(symbol, **self._clear_grid_fields())
+
+    def _clear_grid_fields(self) -> Dict:
+        """Grid-scoped fields cleared on every completed exit — they were
+        locked for the grid that just exited and must not leak into the next
+        cycle. Historical values are preserved implicitly in the fills,
+        order and risk-event ledger."""
+        return {
             "adaptive_lower_price": None,
             "adaptive_upper_price": None,
             "adaptive_total_grids": None,
@@ -768,17 +843,33 @@ class Bot:
             "grid_lower": None,
             "gross_pct": None,
             "net_pct": None,
+            "grid_started_ts": None,
+            "soft_exit_ts": None,
         }
-        
-        if cooldown:
-            self.store.set_cooldown(symbol, now + self.cfg.cooldown_hours * 3600.0)
-            self.store.set_symbol_state(symbol, "COOLDOWN", exit_reason=reason, **clear_adaptive)
-        else:
-            # Risk stop (e.g. lower-boundary breach): no automatic re-entry.
-            self.risk.stop_symbol(symbol, reason)
-            # Also clear adaptive fields for risk stops — the stopped grid's
-            # boundary must not be enforced after exit.
-            self.store.update_symbol(symbol, **clear_adaptive)
+
+    def _soft_exit_symbol(self, symbol: str, reason: str, now: float) -> None:
+        """SOFT exit: cancel ONLY unfilled BUY orders (verified), leave SELL
+        orders working to fill — never a market sell. The symbol stays
+        managed (soft_exit_ts persisted) until every SELL has filled, then
+        finishes into a SOFT cooldown. Inventory that still remains after
+        the soft window escalates to a HARD exit. Any cancel-verification
+        failure is fail-closed (state ERROR)."""
+        log.info("soft exit %s reason=%s", symbol, reason)
+        self.store.update_symbol(symbol, soft_exit_ts=now)
+        if not self.executor.cancel_buys(symbol):
+            self.store.add_risk_event(symbol, "cancel_verify_failed", reason)
+            self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+            log.error("fail-closed: BUY cancellation verification failed for %s (soft exit)", symbol)
+            return
+        self.store.add_risk_event(symbol, "soft_exit_started", reason)
+
+    def _finish_exit(self, symbol: str, reason: str, now: float,
+                     cooldown_hours: float) -> None:
+        """Record a completed exit into its cooldown window and clear all
+        grid-scoped fields."""
+        self.store.set_cooldown(symbol, now + cooldown_hours * 3600.0)
+        self.store.set_symbol_state(symbol, "COOLDOWN", exit_reason=reason,
+                                    **self._clear_grid_fields())
 
     def _global_kill(self, reason: str) -> None:
         """Global kill switch.
@@ -824,23 +915,9 @@ class Bot:
                             symbol,
                         )
                         continue
-                # Clear adaptive grid parameters on successful kill cleanup —
+                # Clear grid-scoped parameters on successful kill cleanup —
                 # the killed grid's boundary must not be reused.
-                clear_adaptive = {
-                    "adaptive_lower_price": None,
-                    "adaptive_upper_price": None,
-                    "adaptive_total_grids": None,
-                    "adaptive_quote_budget": None,
-                    "adaptive_grid_step": None,
-                    "adaptive_reference_price": None,
-                    "adaptive_timeframe": None,
-                    "grid_mode": None,
-                    "grid_step": None,
-                    "grid_lower": None,
-                    "gross_pct": None,
-                    "net_pct": None,
-                }
-                self.store.set_symbol_state(symbol, "KILL_ACTIVE", **clear_adaptive)
+                self.store.set_symbol_state(symbol, "KILL_ACTIVE", **self._clear_grid_fields())
             except OrderUnknownState as exc:
                 self.store.add_risk_event(symbol, "order_unknown_state", str(exc))
                 self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")

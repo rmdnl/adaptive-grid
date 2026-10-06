@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import pytest
 
+import adaptive_grid
 from adaptive_grid import AdaptiveGridPlanner
 from config import Config
 from grid import ExchangeFilters, GridLevel, economic_min_step
@@ -146,7 +147,8 @@ class TestAdaptiveGridPlanner:
         assert plan.lower_price < plan.reference_price
         assert plan.upper_price <= plan.reference_price
         # Bounds must correspond to actual executable levels
-        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lowest_buy == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lower_price == pytest.approx(min(lvl.buy_price for lvl in plan.levels) * (1.0 - adaptive_grid.LOWER_BOUNDARY_BUFFER))
         assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
         # Bounds should be quantized to tick_size (0.01)
         assert plan.lower_price == pytest.approx(round(plan.lower_price, 2))
@@ -209,7 +211,9 @@ class TestAdaptiveGridPlanner:
             available_usdt=10000.0,
         )
         econ = economic_min_step(50000.0, cfg, cfg.grid_mode("BTC/USDT"))
-        assert plan.step == pytest.approx(econ)
+        min_pct_step = cfg.min_step_percent * 50000.0
+        assert min_pct_step > econ  # precondition: the percent floor dominates
+        assert plan.step == pytest.approx(min_pct_step)
         # the rebuilt executable grid clears BOTH economics gates
         assert plan.gross_pct >= cfg.grid_gross_min
         assert plan.net_pct >= cfg.min_net_profit_per_grid
@@ -487,7 +491,8 @@ class TestAdaptiveGridPlanner:
         assert len(plan.levels) == 4
         assert plan.total_grids == len(plan.levels)
         # Bounds must be actual executable bounds
-        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lowest_buy == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lower_price == pytest.approx(min(lvl.buy_price for lvl in plan.levels) * (1.0 - adaptive_grid.LOWER_BOUNDARY_BUFFER))
         assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
         # Economics must be based on actual executable levels
         worst_net = min(lvl.net_pct for lvl in plan.levels)
@@ -531,7 +536,8 @@ class TestAdaptiveGridPlanner:
         assert len(plan.levels) == 12
         assert plan.total_grids == len(plan.levels)
         # Bounds must be actual executable bounds
-        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lowest_buy == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lower_price == pytest.approx(min(lvl.buy_price for lvl in plan.levels) * (1.0 - adaptive_grid.LOWER_BOUNDARY_BUFFER))
         assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
 
     def test_adaptive_plan_eth_style_partial_drop(self):
@@ -569,7 +575,8 @@ class TestAdaptiveGridPlanner:
         assert plan.total_grids == 9
         assert len(plan.levels) == 9
         assert plan.total_grids == len(plan.levels)
-        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lowest_buy == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lower_price == pytest.approx(min(lvl.buy_price for lvl in plan.levels) * (1.0 - adaptive_grid.LOWER_BOUNDARY_BUFFER))
         assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
 
     def test_adaptive_plan_sol_style_partial_drop(self):
@@ -607,7 +614,8 @@ class TestAdaptiveGridPlanner:
         assert plan.total_grids == 9
         assert len(plan.levels) == 9
         assert plan.total_grids == len(plan.levels)
-        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lowest_buy == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lower_price == pytest.approx(min(lvl.buy_price for lvl in plan.levels) * (1.0 - adaptive_grid.LOWER_BOUNDARY_BUFFER))
         assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
 
     def test_adaptive_plan_general_invariants(self):
@@ -626,7 +634,8 @@ class TestAdaptiveGridPlanner:
         # Core invariants
         assert plan.total_grids == len(plan.levels), "total_grids must equal actual level count"
         assert plan.total_grids > 0, "must have at least one executable level"
-        assert plan.lower_price == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lowest_buy == min(lvl.buy_price for lvl in plan.levels)
+        assert plan.lower_price == pytest.approx(min(lvl.buy_price for lvl in plan.levels) * (1.0 - adaptive_grid.LOWER_BOUNDARY_BUFFER))
         assert plan.upper_price == max(lvl.sell_price for lvl in plan.levels)
         assert plan.net_pct == pytest.approx(min(lvl.net_pct for lvl in plan.levels))
         assert plan.gross_pct == pytest.approx(min(lvl.gross_pct for lvl in plan.levels))
@@ -662,14 +671,16 @@ VO_SLOW=10
 ZSCORE_PERIOD=20
 ATR_PERIOD=14
 ENTRY_ADX_MAX=20
-ENTRY_RSI_MAX=35
-ENTRY_VOLUME_OSC_MIN=0
-ENTRY_BB_PERCENT_B_MAX=0
-EXIT_RSI_MIN=70
+ADX_REGIME_LOOKBACK=3
+ENTRY_STOCH_K_MAX=0.3
 EXIT_ADX_MIN=25
-EXIT_BB_PERCENT_B_MIN=1
-EXIT_ZSCORE_ABS_MAX=2.5
+EXIT_STOCH_K_MAX=0.8
 GRID_STEP_ATR_MULTIPLIER=1.0
+MIN_HOURS_BETWEEN_ENTRIES=48
+MIN_STEP_PERCENT=0.006
+SOFT_COOLDOWN_HOURS=2
+HARD_COOLDOWN_HOURS=24
+HOLD_MAX_HOURS=72
 GRID_GROSS_MIN=0.005
 MIN_NET_PROFIT_PER_GRID=0.002
 MAKER_FEE=0.001

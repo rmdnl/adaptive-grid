@@ -1,24 +1,28 @@
-"""Strategy tests: strict entry gate, exit gate, exit priority, cooldown."""
+"""Strategy tests: Regime + Recovery entry gate, soft/hard exit gate,
+exit priority, cooldown."""
 
 from __future__ import annotations
 
 import pytest
 
-import indicators
 import strategy
 from conftest import make_candle
 from strategy import EntryDecision, ExitDecision, IndicatorSnapshot
 
 
 def entry_valid_snapshot(**overrides) -> IndicatorSnapshot:
+    """A snapshot that satisfies every entry condition and fires no exit."""
     values = dict(
         symbol="BTC/USDT",
         last_close=50000.0,
         adx=15.0,
-        rsi=30.0,
-        percent_b=-0.1,
-        volume_osc=0.2,
-        zscore=0.5,
+        adx_prev=16.0,          # ADX not rising: 15 <= 16
+        plus_di=18.0,
+        minus_di=22.0,
+        stoch_k=0.25,
+        stoch_d=0.20,           # K above D on the last bar
+        stoch_k_prev=0.15,      # K was below D two bars ago -> cross up
+        stoch_d_prev=0.22,
         atr=350.0,
     )
     values.update(overrides)
@@ -31,145 +35,159 @@ def test_entry_allowed_when_all_conditions_hold(cfg):
     assert strategy.evaluate_entry(entry_valid_snapshot(), cfg) == EntryDecision(True, None)
 
 
-def test_entry_blocked_when_adx_not_below_max(cfg):
+def test_entry_blocked_when_adx_at_max(cfg):
     d = strategy.evaluate_entry(entry_valid_snapshot(adx=20.0), cfg)
     assert d == EntryDecision(False, "adx_not_low")  # 20 < 20 is false: strict
 
 
-def test_entry_allowed_when_rsi_below_max(cfg):
-    # spec test 1: RSI below 40 passes when all other conditions pass
-    d = strategy.evaluate_entry(entry_valid_snapshot(rsi=39.9), cfg)
-    assert d == EntryDecision(True, None)
-
-
-def test_entry_allowed_when_rsi_exactly_max(cfg):
-    # spec test 2: RSI exactly 40 passes (inclusive boundary)
-    d = strategy.evaluate_entry(entry_valid_snapshot(rsi=40.0), cfg)
-    assert d == EntryDecision(True, None)
-
-
-def test_entry_blocked_when_rsi_above_max(cfg):
-    # spec test 3: RSI above 40 is blocked
-    d = strategy.evaluate_entry(entry_valid_snapshot(rsi=40.1), cfg)
-    assert d == EntryDecision(False, "rsi_not_low")
-
-
 def test_entry_allowed_when_adx_below_max(cfg):
-    # spec test 4: ADX below 20 passes
-    d = strategy.evaluate_entry(entry_valid_snapshot(adx=19.9), cfg)
-    assert d == EntryDecision(True, None)
-
-
-def test_entry_allowed_when_volume_osc_exactly_zero(cfg):
-    # spec test 6: VO exactly 0 passes (inclusive boundary)
-    d = strategy.evaluate_entry(entry_valid_snapshot(volume_osc=0.0), cfg)
-    assert d == EntryDecision(True, None)
-
-
-def test_entry_blocked_when_volume_osc_negative(cfg):
-    # spec test 7: VO below 0 is blocked
-    d = strategy.evaluate_entry(entry_valid_snapshot(volume_osc=-0.001), cfg)
-    assert d == EntryDecision(False, "volume_osc_not_positive")
-
-
-def test_entry_allowed_when_percent_b_equals_zero(cfg):
-    # spec test 8: BB %B exactly 0 passes
-    d = strategy.evaluate_entry(entry_valid_snapshot(percent_b=0.0), cfg)
+    d = strategy.evaluate_entry(entry_valid_snapshot(adx=19.9, adx_prev=20.0), cfg)
     assert d.allowed is True
 
 
-def test_entry_allowed_when_percent_b_between_zero_and_max(cfg):
-    # spec test 9: BB %B between 0 and 0.20 passes
-    d = strategy.evaluate_entry(entry_valid_snapshot(percent_b=0.1), cfg)
+def test_entry_blocked_when_adx_rising(cfg):
+    d = strategy.evaluate_entry(entry_valid_snapshot(adx=15.0, adx_prev=14.0), cfg)
+    assert d == EntryDecision(False, "adx_rising")
+
+
+def test_entry_allowed_when_adx_exactly_flat(cfg):
+    # ADX <= ADX[lookback bars ago] includes the exact equality boundary
+    d = strategy.evaluate_entry(entry_valid_snapshot(adx=15.0, adx_prev=15.0), cfg)
     assert d.allowed is True
 
 
-def test_entry_allowed_when_percent_b_exactly_max(cfg):
-    # spec test 10: BB %B exactly 0.20 passes (inclusive boundary)
-    d = strategy.evaluate_entry(entry_valid_snapshot(percent_b=0.20), cfg)
+def test_entry_blocked_when_stoch_kd_already_crossed(cfg):
+    # K was already above D two bars ago: no fresh cross
+    d = strategy.evaluate_entry(
+        entry_valid_snapshot(stoch_k=0.25, stoch_d=0.20, stoch_k_prev=0.25, stoch_d_prev=0.20),
+        cfg,
+    )
+    assert d == EntryDecision(False, "stoch_no_cross")
+
+
+def test_entry_blocked_when_kd_crossing_down(cfg):
+    d = strategy.evaluate_entry(
+        entry_valid_snapshot(stoch_k=0.15, stoch_d=0.22, stoch_k_prev=0.30, stoch_d_prev=0.10),
+        cfg,
+    )
+    assert d == EntryDecision(False, "stoch_no_cross")
+
+
+def test_entry_allowed_when_k_crosses_up_from_below(cfg):
+    d = strategy.evaluate_entry(
+        entry_valid_snapshot(stoch_k=0.25, stoch_d=0.20, stoch_k_prev=0.10, stoch_d_prev=0.20),
+        cfg,
+    )
     assert d.allowed is True
 
 
-def test_entry_blocked_when_percent_b_above_max(cfg):
-    # spec test 11: BB %B above 0.20 is blocked
-    d = strategy.evaluate_entry(entry_valid_snapshot(percent_b=0.21), cfg)
-    assert d == EntryDecision(False, "percent_b_not_low")
+def test_entry_blocked_when_stoch_k_too_high(cfg):
+    d = strategy.evaluate_entry(entry_valid_snapshot(stoch_k=0.31, stoch_d=0.20), cfg)
+    assert d == EntryDecision(False, "stoch_k_too_high")
+
+
+def test_entry_allowed_when_stoch_k_exactly_below_limit(cfg):
+    d = strategy.evaluate_entry(entry_valid_snapshot(stoch_k=0.2999, stoch_d=0.20), cfg)
+    assert d.allowed is True
 
 
 def test_entry_blockers_report_every_failed_condition(cfg):
-    """The telemetry helper reports ALL failed conditions, not just the first."""
-    snap = entry_valid_snapshot(adx=25.0, rsi=50.0, volume_osc=-1.0, percent_b=0.5)
+    snap = entry_valid_snapshot(
+        adx=25.0, adx_prev=20.0, stoch_k=0.5, stoch_d=0.6,
+        stoch_k_prev=0.6, stoch_d_prev=0.4,
+    )
     failed = strategy.entry_blockers(snap, cfg)
-    assert failed == [
-        "adx_not_low",
-        "rsi_not_low",
-        "volume_osc_not_positive",
-        "percent_b_not_low",
-    ]
-    # and reports none when all conditions hold
+    assert failed == ["adx_not_low", "adx_rising", "stoch_no_cross", "stoch_k_too_high"]
     assert strategy.entry_blockers(entry_valid_snapshot(), cfg) == []
 
 
-@pytest.mark.parametrize("missing", ["adx", "rsi", "percent_b", "volume_osc"])
+def test_stoch_kd_cross_up_semantics():
+    assert strategy.stoch_kd_cross_up(
+        entry_valid_snapshot(stoch_k=0.25, stoch_d=0.20, stoch_k_prev=0.10, stoch_d_prev=0.20)
+    ) is True
+    # equality on the previous bar still counts as a cross (K[-2] <= D[-2])
+    assert strategy.stoch_kd_cross_up(
+        entry_valid_snapshot(stoch_k=0.25, stoch_d=0.20, stoch_k_prev=0.20, stoch_d_prev=0.20)
+    ) is True
+    # no cross when K stays above D
+    assert strategy.stoch_kd_cross_up(
+        entry_valid_snapshot(stoch_k=0.25, stoch_d=0.20, stoch_k_prev=0.25, stoch_d_prev=0.20)
+    ) is False
+    # missing data never crosses
+    assert strategy.stoch_kd_cross_up(entry_valid_snapshot(stoch_k_prev=None)) is False
+
+
+@pytest.mark.parametrize("missing", ["adx", "adx_prev", "stoch_k", "stoch_d", "stoch_k_prev", "stoch_d_prev"])
 def test_entry_blocked_on_missing_indicator(cfg, missing):
     values = {missing: None}
     d = strategy.evaluate_entry(entry_valid_snapshot(**values), cfg)
     assert d == EntryDecision(False, "insufficient_data")
 
 
-# ----- exit -----
+# ----- exits: soft vs hard severity -----
 
-def test_exit_on_rsi_overbought(cfg):
-    assert strategy.evaluate_exit(entry_valid_snapshot(rsi=70.0), cfg) == ExitDecision(True, "rsi_overbought")
-
-
-def test_no_exit_just_below_rsi_threshold(cfg):
-    assert strategy.evaluate_exit(entry_valid_snapshot(rsi=69.9), cfg).should_exit is False
+def test_exit_soft_on_adx_up_with_plus_di_dominant(cfg):
+    d = strategy.evaluate_exit(entry_valid_snapshot(adx=30.0, plus_di=30.0, minus_di=10.0), cfg)
+    assert d == ExitDecision(True, "adx_trending_up", "soft")
 
 
-def test_exit_on_adx_trending(cfg):
-    assert strategy.evaluate_exit(entry_valid_snapshot(adx=25.1), cfg) == ExitDecision(True, "adx_trending")
+def test_exit_hard_on_adx_with_minus_di_dominant(cfg):
+    d = strategy.evaluate_exit(entry_valid_snapshot(adx=30.0, plus_di=10.0, minus_di=30.0), cfg)
+    assert d == ExitDecision(True, "adx_trending_down", "hard")
 
 
 def test_no_exit_at_adx_threshold(cfg):
-    # ADX > 25 is strict: exactly 25 does not exit
-    assert strategy.evaluate_exit(entry_valid_snapshot(adx=25.0), cfg).should_exit is False
+    # ADX > 25 is strict: exactly 25 does not exit regardless of DI side
+    assert strategy.evaluate_exit(
+        entry_valid_snapshot(adx=25.0, plus_di=30.0, minus_di=10.0), cfg
+    ).should_exit is False
 
 
-def test_exit_on_bb_upper_break(cfg):
-    assert strategy.evaluate_exit(entry_valid_snapshot(percent_b=1.001), cfg) == ExitDecision(True, "bb_upper_break")
+def test_no_exit_when_adx_high_but_di_balanced(cfg):
+    # +DI == -DI: neither direction dominates -> no ADX exit
+    assert strategy.evaluate_exit(
+        entry_valid_snapshot(adx=30.0, plus_di=20.0, minus_di=20.0), cfg
+    ).should_exit is False
 
 
-def test_no_exit_at_percent_b_one(cfg):
-    assert strategy.evaluate_exit(entry_valid_snapshot(percent_b=1.0), cfg).should_exit is False
+def test_exit_soft_on_stoch_k_overbought(cfg):
+    d = strategy.evaluate_exit(entry_valid_snapshot(stoch_k=0.81), cfg)
+    assert d == ExitDecision(True, "stoch_k_overbought", "soft")
 
 
-def test_exit_on_extreme_zscore_negative(cfg):
-    assert strategy.evaluate_exit(entry_valid_snapshot(zscore=-2.6), cfg) == ExitDecision(True, "zscore_extreme")
-
-
-def test_exit_on_extreme_zscore_positive(cfg):
-    assert strategy.evaluate_exit(entry_valid_snapshot(zscore=2.6), cfg) == ExitDecision(True, "zscore_extreme")
-
-
-def test_no_exit_at_zscore_threshold(cfg):
-    assert strategy.evaluate_exit(entry_valid_snapshot(zscore=2.5), cfg).should_exit is False
-    assert strategy.evaluate_exit(entry_valid_snapshot(zscore=-2.5), cfg).should_exit is False
+def test_no_exit_at_stoch_k_threshold(cfg):
+    # %K > 0.8 is strict: exactly 0.8 does not exit
+    assert strategy.evaluate_exit(entry_valid_snapshot(stoch_k=0.8), cfg).should_exit is False
 
 
 def test_missing_indicators_cannot_trigger_exit(cfg):
-    # fail-closed: an exit is never triggered by missing data
     empty = IndicatorSnapshot(symbol="BTC/USDT")
-    assert strategy.evaluate_exit(empty, cfg) == ExitDecision(False, None)
+    assert strategy.evaluate_exit(empty, cfg) == ExitDecision(False, None, None)
+
+
+def test_stoch_overbought_wins_over_soft_adx_ordering(cfg):
+    # both soft conditions hold: ADX-up fires first (stable ordering)
+    d = strategy.evaluate_exit(
+        entry_valid_snapshot(adx=30.0, plus_di=30.0, minus_di=10.0, stoch_k=0.9), cfg
+    )
+    assert d.reason == "adx_trending_up" and d.severity == "soft"
+
+
+def test_hard_adx_takes_precedence_when_di_flips(cfg):
+    # ADX down (hard) is checked before the stochastic soft exit
+    d = strategy.evaluate_exit(
+        entry_valid_snapshot(adx=30.0, plus_di=10.0, minus_di=30.0, stoch_k=0.9), cfg
+    )
+    assert d.reason == "adx_trending_down" and d.severity == "hard"
 
 
 # ----- exit priority -----
 
 def test_exit_has_priority_over_entry(cfg):
-    # z-score exit can coexist with all entry conditions being true
-    snap = entry_valid_snapshot(zscore=3.0)
+    # stochastic overbought can coexist with all entry conditions being true
+    snap = entry_valid_snapshot(stoch_k=0.9)
     exit_d, entry_d = strategy.evaluate_signal(snap, cfg)
-    assert exit_d == ExitDecision(True, "zscore_extreme")
+    assert exit_d == ExitDecision(True, "stoch_k_overbought", "soft")
     assert entry_d == EntryDecision(False, "exit_priority")
 
 
@@ -191,12 +209,12 @@ def test_cooldown_active_semantics():
 # ----- snapshot construction from closed candles -----
 
 def _wiring_candles():
-    closes = [10.0] * 19 + [5.0]
-    volumes = [10.0] * 15 + [30.0, 40.0, 50.0, 60.0, 70.0]
+    """Mostly-flat series with a final dip: ADX degenerate-ish, RSI low."""
+    closes = [10.0] * 39 + [5.0]
     candles = []
     for i, c in enumerate(closes):
         candles.append(
-            make_candle(c, c + 1.0, c - 1.0, volumes[i], i * 1000, i * 1000 + 999)
+            make_candle(c, c + 1.0, c - 1.0, 1.0, i * 1000, i * 1000 + 999)
         )
     return candles
 
@@ -207,25 +225,29 @@ def test_build_snapshot_from_closed_candles():
         symbol="BTC/USDT",
         adx_period=14,
         rsi_period=14,
-        bb_period=20,
-        bb_std=2.0,
-        vo_fast=5,
-        vo_slow=10,
-        zscore_period=20,
+        stoch_rsi_length=14,
+        stoch_smooth_k=3,
+        stoch_smooth_d=3,
         atr_period=14,
+        adx_regime_lookback=3,
     )
     assert snap.symbol == "BTC/USDT"
     assert snap.last_close == 5.0
-    assert snap.rsi == 0.0                      # only losses recently
-    assert snap.percent_b == pytest.approx(-0.5897247, abs=1e-6)
-    assert snap.volume_osc == pytest.approx(50.0 / 30.0 - 1.0)
-    assert snap.zscore == pytest.approx(-4.3588989, abs=1e-6)
     assert snap.atr is not None and snap.atr > 0
-    # degenerate mostly-flat series -> ADX undefined -> NO TRADE (fail-closed)
-    assert snap.adx is None
+    # RSI series exists for the stoch engine; K/D are on the 0..1 scale
+    if snap.stoch_k is not None:
+        assert 0.0 <= snap.stoch_k <= 1.0
+        assert 0.0 <= snap.stoch_d <= 1.0
 
 
 def test_build_snapshot_empty_is_insufficient():
     snap = strategy.build_snapshot([], symbol="BTC/USDT")
     assert snap.last_close is None
-    assert snap.adx is None and snap.rsi is None and snap.atr is None
+    assert snap.adx is None and snap.stoch_k is None and snap.atr is None
+
+
+def test_build_snapshot_short_history_is_insufficient():
+    # too few candles for the ADX/stoch stack -> NO TRADE (fail-closed)
+    candles = [make_candle(10.0, 11.0, 9.0, 1.0, i * 1000, i * 1000 + 999) for i in range(20)]
+    snap = strategy.build_snapshot(candles, symbol="BTC/USDT")
+    assert snap.adx is None or snap.adx_prev is None or snap.stoch_k is None

@@ -59,23 +59,18 @@ class Config:
     indicator_timeframe: str
 
     adx_period: int
-    rsi_period: int
-    bb_period: int
-    bb_std: float
-    vo_fast: int
-    vo_slow: int
-    zscore_period: int
+    rsi_period: int          # inner RSI of the Stoch RSI
+    stoch_rsi_length: int
+    stoch_smooth_k: int
+    stoch_smooth_d: int
     atr_period: int
 
     entry_adx_max: float
-    entry_rsi_max: float
-    entry_volume_osc_min: float
-    entry_bb_percent_b_max: float
+    entry_stoch_k_max: float
+    adx_regime_lookback: int
 
-    exit_rsi_min: float
     exit_adx_min: float
-    exit_bb_percent_b_min: float
-    exit_zscore_abs_max: float
+    exit_stoch_k_max: float
 
     grid_step_atr_multiplier: float
     grid_gross_min: float
@@ -88,7 +83,12 @@ class Config:
     max_drawdown_percent: float
     stop_if_below_lower_percent: float
 
-    cooldown_hours: float
+    # Regime + Recovery pacing / grid floors / time stop
+    min_hours_between_entries: float   # global gate across all symbols
+    min_step_percent: float            # grid step floor as fraction of price
+    soft_cooldown_hours: float
+    hard_cooldown_hours: float
+    hold_max_hours: float
 
     # Execution mode: paper (internal simulation, no orders), testnet (real
     # Binance Spot TESTNET orders) or live (gated production). See
@@ -312,25 +312,18 @@ def load_config(env_file: str = ".env") -> Config:
         indicator_timeframe = None
 
     adx_period = _get_int(env, "ADX_PERIOD", minimum=1, errors=errors)
-    rsi_period = _get_int(env, "RSI_PERIOD", minimum=1, errors=errors)
-    bb_period = _get_int(env, "BB_PERIOD", minimum=2, errors=errors)
-    bb_std = _get_float(env, "BB_STD", minimum=0.000001, maximum=None, errors=errors)
-    vo_fast = _get_int(env, "VO_FAST", minimum=1, errors=errors)
-    vo_slow = _get_int(env, "VO_SLOW", minimum=2, errors=errors)
-    if vo_fast is not None and vo_slow is not None and vo_fast >= vo_slow:
-        errors.append("VO_FAST must be < VO_SLOW")
-    zscore_period = _get_int(env, "ZSCORE_PERIOD", minimum=2, errors=errors)
+    rsi_period = _get_int(env, "RSI_PERIOD", minimum=1, errors=errors)  # inner Stoch RSI RSI
+    stoch_rsi_length = _get_int(env, "STOCH_RSI_LENGTH", minimum=2, errors=errors, default=14)
+    stoch_smooth_k = _get_int(env, "STOCH_SMOOTH_K", minimum=1, errors=errors, default=3)
+    stoch_smooth_d = _get_int(env, "STOCH_SMOOTH_D", minimum=1, errors=errors, default=3)
     atr_period = _get_int(env, "ATR_PERIOD", minimum=1, errors=errors)
 
     entry_adx_max = _get_float(env, "ENTRY_ADX_MAX", minimum=0.000001, maximum=None, errors=errors)
-    entry_rsi_max = _get_float(env, "ENTRY_RSI_MAX", minimum=0.0, maximum=100.0, errors=errors)
-    entry_volume_osc_min = _get_float(env, "ENTRY_VOLUME_OSC_MIN", minimum=None, maximum=None, errors=errors)
-    entry_bb_percent_b_max = _get_float(env, "ENTRY_BB_PERCENT_B_MAX", minimum=None, maximum=None, errors=errors)
+    entry_stoch_k_max = _get_float(env, "ENTRY_STOCH_K_MAX", minimum=0.000001, maximum=1.0, errors=errors)
+    adx_regime_lookback = _get_int(env, "ADX_REGIME_LOOKBACK", minimum=1, errors=errors, default=3)
 
-    exit_rsi_min = _get_float(env, "EXIT_RSI_MIN", minimum=0.000001, maximum=100.0, errors=errors)
     exit_adx_min = _get_float(env, "EXIT_ADX_MIN", minimum=0.000001, maximum=None, errors=errors)
-    exit_bb_percent_b_min = _get_float(env, "EXIT_BB_PERCENT_B_MIN", minimum=None, maximum=None, errors=errors)
-    exit_zscore_abs_max = _get_float(env, "EXIT_ZSCORE_ABS_MAX", minimum=0.000001, maximum=None, errors=errors)
+    exit_stoch_k_max = _get_float(env, "EXIT_STOCH_K_MAX", minimum=0.000001, maximum=1.0, errors=errors)
 
     # ATR_GRID_MULTIPLIER is the authoritative name; the legacy
     # GRID_STEP_ATR_MULTIPLIER spelling is still accepted (same .env source,
@@ -354,7 +347,15 @@ def load_config(env_file: str = ".env") -> Config:
         env, "STOP_IF_BELOW_LOWER_PERCENT", minimum=0.000001, maximum=STOP_BELOW_LOWER_CAP_PERCENT, errors=errors
     )
 
-    cooldown_hours = _get_float(env, "COOLDOWN_HOURS", minimum=0.0, maximum=None, errors=errors)
+    min_hours_between_entries = _get_float(
+        env, "MIN_HOURS_BETWEEN_ENTRIES", minimum=0.0, maximum=None, errors=errors
+    )
+    min_step_percent = _get_float(
+        env, "MIN_STEP_PERCENT", minimum=0.000001, maximum=None, errors=errors
+    )
+    soft_cooldown_hours = _get_float(env, "SOFT_COOLDOWN_HOURS", minimum=0.0, maximum=None, errors=errors)
+    hard_cooldown_hours = _get_float(env, "HARD_COOLDOWN_HOURS", minimum=0.0, maximum=None, errors=errors)
+    hold_max_hours = _get_float(env, "HOLD_MAX_HOURS", minimum=0.000001, maximum=None, errors=errors)
 
     # Phase 7: Market data freshness (conservative default for 4h strategy + 15m risk)
     max_market_data_age_seconds = _get_float(
@@ -368,8 +369,8 @@ def load_config(env_file: str = ".env") -> Config:
     # When adaptive_grid=true (default), LOWER_PRICE, UPPER_PRICE, TOTAL_GRIDS,
     # TOTAL_QUOTE_BUDGET are computed automatically and need not be configured.
     adaptive_grid = _get_bool(env, "ADAPTIVE_GRID", default=True, errors=errors)
-    min_grids = _get_int(env, "MIN_GRIDS", minimum=1, errors=errors, default=3)
-    max_grids = _get_int(env, "MAX_GRIDS", minimum=1, errors=errors, default=12)
+    min_grids = _get_int(env, "MIN_GRIDS", minimum=1, errors=errors, default=4)
+    max_grids = _get_int(env, "MAX_GRIDS", minimum=1, errors=errors, default=5)
     if min_grids is not None and max_grids is not None and min_grids > max_grids:
         errors.append("MIN_GRIDS must be <= MAX_GRIDS")
     quote_reserve_percent = _get_float(env, "QUOTE_RESERVE_PERCENT", minimum=0.0, maximum=100.0, errors=errors, default=20.0)
@@ -541,20 +542,15 @@ def load_config(env_file: str = ".env") -> Config:
         indicator_timeframe=indicator_timeframe,
         adx_period=adx_period,
         rsi_period=rsi_period,
-        bb_period=bb_period,
-        bb_std=bb_std,
-        vo_fast=vo_fast,
-        vo_slow=vo_slow,
-        zscore_period=zscore_period,
+        stoch_rsi_length=stoch_rsi_length,
+        stoch_smooth_k=stoch_smooth_k,
+        stoch_smooth_d=stoch_smooth_d,
         atr_period=atr_period,
         entry_adx_max=entry_adx_max,
-        entry_rsi_max=entry_rsi_max,
-        entry_volume_osc_min=entry_volume_osc_min,
-        entry_bb_percent_b_max=entry_bb_percent_b_max,
-        exit_rsi_min=exit_rsi_min,
+        entry_stoch_k_max=entry_stoch_k_max,
+        adx_regime_lookback=adx_regime_lookback,
         exit_adx_min=exit_adx_min,
-        exit_bb_percent_b_min=exit_bb_percent_b_min,
-        exit_zscore_abs_max=exit_zscore_abs_max,
+        exit_stoch_k_max=exit_stoch_k_max,
         grid_step_atr_multiplier=grid_step_atr_multiplier,
         grid_gross_min=grid_gross_min,
         min_net_profit_per_grid=min_net_profit_per_grid,
@@ -563,7 +559,11 @@ def load_config(env_file: str = ".env") -> Config:
         slippage_estimate=slippage_estimate,
         max_drawdown_percent=max_drawdown_percent,
         stop_if_below_lower_percent=stop_if_below_lower_percent,
-        cooldown_hours=cooldown_hours,
+        min_hours_between_entries=min_hours_between_entries,
+        min_step_percent=min_step_percent,
+        soft_cooldown_hours=soft_cooldown_hours,
+        hard_cooldown_hours=hard_cooldown_hours,
+        hold_max_hours=hold_max_hours,
         start_equity=start_equity,
         max_market_data_age_seconds=max_market_data_age_seconds,
         adaptive_grid=bool(adaptive_grid),
