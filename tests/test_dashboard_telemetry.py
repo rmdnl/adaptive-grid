@@ -365,12 +365,14 @@ def test_js_existing_price_and_state_rendering_unchanged(tmp_path):
     path = _store_with_telemetry(tmp_path)
     store = StateStore(path)
     store.update_symbol("BTC/USDT", last_price=50123.45, strategy_state="ACTIVE",
-                        risk_status="ok")
+                        risk_status="ok", inventory_qty=0.002, avg_cost=50000.0)
     flat = _run_js(_full_payload(path), tmp_path)
     rows = _card_rows(flat, occurrence=0)
     assert rows["PRICE"] == "50,123.45"                  # existing fmtPrice path
     assert rows["STATE"] == "ACTIVE — GRID RUNNING"       # human state preserved
     assert rows["RISK"] == "OK — All risk gates clear"
+    # unrealized PnL = 0.002 * (50123.45 - 50000.0) = 0.2469 -> "+0.25"
+    assert rows["UNREALIZED PNL"] == "+0.25"
 
 
 def test_telemetry_section_uses_existing_css_classes(tmp_path):

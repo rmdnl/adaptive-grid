@@ -199,6 +199,21 @@ def _global_payload(store: StateStore) -> Dict:
     }
 
 
+def _unrealized(st) -> Optional[float]:
+    """Unrealized (paper) PnL from undelivered inventory:
+    inventory_qty * (last_price - avg_cost). Returns None when any input
+    is missing so the dashboard shows the unavailable dash instead of a
+    fabricated zero."""
+    qty = st.inventory_qty
+    cost = st.avg_cost
+    price = st.last_price
+    if qty is None or cost is None or price is None:
+        return None
+    if qty <= 0.0 or price <= 0 or cost <= 0:
+        return None
+    return qty * (price - cost)
+
+
 def _symbol_payload(store: StateStore, st) -> Dict:
     payload = {
         "symbol": st.symbol,
@@ -229,6 +244,7 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "net_pct": st.net_pct,
         "inventory_qty": st.inventory_qty,
         "avg_cost": st.avg_cost,
+        "unrealized_pnl": _unrealized(st),
         "open_orders": store.count_open_orders(st.symbol),
         "realized_pnl": store.sum_realized_pnl(st.symbol),
         "fees": store.sum_fees(st.symbol),
@@ -808,6 +824,9 @@ function renderGlobal(g) {
       m.appendChild(kv("PNL", fmtSigned(s.realized_pnl),
                        typeof s.realized_pnl === "number"
                        ? (s.realized_pnl >= 0 ? "ok" : "danger") : ""));
+      m.appendChild(kv("UNREALIZED PNL", fmtSigned(s.unrealized_pnl),
+                       typeof s.unrealized_pnl === "number"
+                       ? (s.unrealized_pnl >= 0 ? "ok" : "danger") : ""));
       m.appendChild(kv("FEES", fmtNum(s.fees, 4)));
       renderEntryTelemetry(m, s);
       grid.appendChild(m);
