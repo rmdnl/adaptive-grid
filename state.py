@@ -532,6 +532,22 @@ class StateStore:
         finally:
             conn.close()
 
+    def rollback_child_sell_conversion(self, parent_order_id: int, qty: float) -> None:
+        """Undo the child_sell_qty conversion marker after the exchange
+        definitively rejected the child sell. The quantity returns to
+        'pending conversion' so the terminal-BUY respawn sweep retries it
+        on a later cycle. Never makes the marker negative."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE orders SET child_sell_qty = MAX(0, child_sell_qty - ?), "
+                "updated_at=? WHERE id=?",
+                (qty, time.time(), parent_order_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def update_order_status(
         self, order_id: int, status: str, filled_qty: Optional[float] = None
     ) -> None:

@@ -40,19 +40,44 @@ LIVE_BASE = "https://api.binance.com"
 _TERMINAL_STATUSES = {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
 
 # Binance error codes that DEFINITIVELY reject an order at submit time:
-# the order was never created and retrying the same order cannot succeed
-# (e.g. -1013 filter failures, -2010 NEW_ORDER_REJECTED).
-_DEFINITIVE_REJECTION_CODES = {-1013, -2010}
+# the order was never created and retrying the same order cannot succeed.
+# -1013 filter failures, -2010 NEW_ORDER_REJECTED, -1021 timestamp,
+# -1022 signature, -1100/-1101/-1102 malformed request, -2015 bad
+# key/permissions: each is an HTTP 400 meaning no order exists.
+_DEFINITIVE_REJECTION_CODES = {
+    -1013, -2010, -1021, -1022, -1100, -1101, -1102, -2015,
+}
+
+# Binance error code for "unknown order sent" — a cancel of an order that
+# no longer exists (already filled/canceled/expired).
+_ERROR_CODE_UNKNOWN_ORDER = -2011
+
+
+def _binance_error_code(exc: ExchangeError) -> Optional[int]:
+    """Extract the Binance error code from an exception message: either the
+    JSON response body embedded by the request layer
+    ('{"code":-2011,"msg":...}') or a leading plain-text token ('-2011 ...')."""
+    message = str(exc)
+    match = re.search(r'"code"\s*:\s*(-\d+)', message)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"(?<![\w.])-(\d{4})(?![\w.])", message)
+    return int(match.group(0)) if match else None
 
 
 def is_definitive_rejection(exc: ExchangeError) -> bool:
     """True when an HTTP 400 from order submission carries a Binance error
     code that definitively rejects the order (it does not exist)."""
     message = str(exc)
-    match = re.search(r'"code"\s*:\s*(-\d+)', message)
-    if match and int(match.group(1)) in _DEFINITIVE_REJECTION_CODES:
+    if _binance_error_code(exc) in _DEFINITIVE_REJECTION_CODES:
         return True
     return "Filter failure" in message
+
+
+def is_unknown_order_error(exc: ExchangeError) -> bool:
+    """True when a CANCEL failed because the order no longer exists
+    (-2011): there is nothing left to cancel."""
+    return _binance_error_code(exc) == _ERROR_CODE_UNKNOWN_ORDER
 
 
 class ExchangeError(Exception):
@@ -339,6 +364,15 @@ class BinanceSpot:
         for b in account.get("balances", []):
             if b.get("asset") == asset:
                 return float(b.get("free") or 0) + float(b.get("locked") or 0)
+        return 0.0
+
+    def get_free_balance(self, asset: str) -> float:
+        """Spendable (free) balance for one asset. Locked funds belong to
+        working orders and are NOT available for new grids."""
+        account = self.get_account()
+        for b in account.get("balances", []):
+            if b.get("asset") == asset:
+                return float(b.get("free") or 0)
         return 0.0
 
     def validate_trading_access(self, symbols: List[str]) -> Dict:
@@ -737,7 +771,34 @@ class LiveExecutor(BaseExecutor):
     def _place_child_sell(self, parent: Dict, qty: float) -> None:
         """Submit the child SELL for acquired quantity; the local row and
         the parent's child_sell_qty are created atomically by
-        StateStore.create_child_sell_order."""
+        StateStore.create_child_sell_order.
+
+        The submitted quantity is the net-of-commission delta, which is
+        generally NOT a multiple of LOT_SIZE stepSize: it is floored to
+        step size here. A floored quantity that would violate min_qty or
+        min_notional is DEFERRED (nothing booked) — the residual stays
+        pending conversion and the respawn sweep retries it as fills
+        accumulate. A definitive exchange rejection rolls the conversion
+        marker back so the quantity is retried, never stranded."""
+        filters = self._filters_for(parent["symbol"])
+        if filters is not None and filters.step_size > 0:
+            qty = quantize_qty_floor(qty, filters.step_size)
+            if qty <= 0:
+                return  # sub-step dust: untradeable on its own, stays pending
+            if filters.min_qty > 0 and qty < filters.min_qty - QTY_TOLERANCE:
+                log.warning(
+                    "child sell for %s deferred: qty %s below min_qty %s",
+                    parent["symbol"], qty, filters.min_qty,
+                )
+                return
+            if filters.min_notional > 0 and \
+                    qty * parent["target_sell_price"] < filters.min_notional - 1e-12:
+                log.warning(
+                    "child sell for %s deferred: notional %.8f below min_notional %s",
+                    parent["symbol"], qty * parent["target_sell_price"],
+                    filters.min_notional,
+                )
+                return
         violation = self._child_sell_band_violation(
             parent["symbol"], parent["target_sell_price"]
         )
@@ -761,12 +822,18 @@ class LiveExecutor(BaseExecutor):
         except ExchangeError as exc:
             if is_definitive_rejection(exc):
                 self.store.update_order_status(local_id, "REJECTED")
+                # Un-book the conversion marker: the quantity returns to
+                # pending conversion and the respawn sweep retries it.
+                self.store.rollback_child_sell_conversion(parent["id"], qty)
                 raise OrderRejected(
                     f"child sell {cid} rejected: {exc}"
                 ) from None
             existing = self._reconcile_by_cid(parent["symbol"], cid)
             if existing is None:
                 self.store.update_order_status(local_id, "UNKNOWN")
+                # NO rollback here: the order may exist on the exchange —
+                # the conversion marker stays booked (fail-closed) until
+                # an operator resolves the unknown state.
                 raise OrderUnknownState(
                     f"child sell {cid} state unknown after submit failure: {exc}"
                 ) from None
@@ -896,6 +963,12 @@ class LiveExecutor(BaseExecutor):
                 except ExchangeError:
                     pass
                 if remote is None:
+                    if is_unknown_order_error(exc):
+                        # -2011 and the order is definitively absent: it
+                        # never reached the book, so nothing to cancel and
+                        # no trades can exist. Mark terminal and continue.
+                        self.store.update_order_status(order["id"], "CANCELED")
+                        continue
                     log.error("cancel unresolvable for %s %s: %s", symbol, cid, exc)
                     return False
             self._record_remote_trades(symbol, remote)
@@ -931,6 +1004,11 @@ class LiveExecutor(BaseExecutor):
                 except ExchangeError:
                     pass
                 if remote is None:
+                    if is_unknown_order_error(exc):
+                        # -2011 and definitively absent: never on the book,
+                        # no trades possible. Mark terminal and continue.
+                        self.store.update_order_status(order["id"], "CANCELED")
+                        continue
                     log.error("cancel-buy unresolvable for %s %s: %s", symbol, cid, exc)
                     return False
             self._record_remote_trades(symbol, remote)
@@ -971,6 +1049,44 @@ class LiveExecutor(BaseExecutor):
                 raise OrderUnknownState(
                     f"unknown exchange order {remote_order.get('clientOrderId')} for {symbol}"
                 )
+        self._respawn_terminal_buy_children(symbol)
+
+    def _respawn_terminal_buy_children(self, symbol: str) -> None:
+        """Spawn child SELLs for TERMINAL BUY orders with unconverted
+        executed quantity.
+
+        Covers the cases the open-order pass cannot see: a BUY that filled
+        completely while the bot was offline (restart reconciliation
+        deliberately creates no orders), a final partial fill that landed
+        between the last sync and a cancel, and a child sell whose
+        submission was definitively rejected (conversion marker rolled
+        back). Idempotent: the delta comes from the fills ledger minus the
+        conversion marker, so each spawn happens at most once.
+
+        Terminal orders have no other sync path, so this sweep first
+        reconciles their (idempotent) trade ledger — a fill that landed
+        after the order left the book is otherwise invisible forever."""
+        for order in self.store.symbol_orders(symbol):
+            if order["side"] != "BUY" or order["status"] not in ("FILLED", "CANCELED"):
+                continue
+            if self.spot is not None:
+                try:
+                    remote = self.spot.get_order(symbol, order["client_order_id"])
+                except ExchangeError as exc:
+                    # Transient read failure: skip this candidate; the sweep
+                    # retries on the next cycle (never worse than before).
+                    log.warning("terminal BUY sync skipped for %s %s: %s",
+                                symbol, order["client_order_id"], exc)
+                    remote = None
+                if remote is not None:
+                    self._record_remote_trades(symbol, remote)
+            net_filled = self.store.order_net_filled_qty(order["id"])
+            converted = float(order["child_sell_qty"] or 0.0)
+            if net_filled - converted > QTY_TOLERANCE:
+                fresh = self.store.get_order(order["id"])
+                if fresh is None:
+                    continue
+                self._spawn_child_sells(fresh)
 
     def _sync_order_from_remote(
         self,

@@ -12,6 +12,7 @@ import pytest
 from bot import Bot, CycleView
 from conftest import make_config
 from exchange import DryRunExecutor
+import grid as grid_mod
 from grid import ExchangeFilters
 from state import StateStore
 from strategy import IndicatorSnapshot
@@ -1242,7 +1243,9 @@ def test_time_stop_soft_exits_an_old_grid(tmp_path):
 
 def test_time_stop_escalates_to_hard_exit_when_inventory_remains(tmp_path):
     """After the SOFT window, inventory that still remains escalates to a
-    HARD exit: full liquidation and the HARD cooldown."""
+    HARD exit: full liquidation and the HARD cooldown. The escalation reason
+    is attributed to the original exit reason (time_stop), which a real
+    mid-soft-exit state always carries (set when the soft exit began)."""
     import time as _time
     bot, store, market = _active_grid_with_inventory(tmp_path)
     # grid aged past HOLD_MAX_HOURS, soft exit already in its past
@@ -1250,6 +1253,8 @@ def test_time_stop_escalates_to_hard_exit_when_inventory_remains(tmp_path):
         "BTC/USDT",
         grid_started_ts=_time.time() - 80 * 3600.0,
         soft_exit_ts=_time.time() - 2 * 3600.0,        # soft window (1h) elapsed
+        exit_status=1,
+        exit_reason="time_stop",                       # set when soft exit began
     )
     market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
     bot.run_once()
@@ -1313,3 +1318,94 @@ def test_adx_rising_counts_as_adx_condition_failure(tmp_path):
     assert st.blocked_adx == 1
     assert st.last_entry_blocker == "adx_rising"
     assert st.entries_total == 0
+
+
+# ----- audit-fix regression tests -----
+
+def test_paper_entry_derives_available_usdt_from_ledger(tmp_path):
+    """PAPER (DRY_RUN) has no signed balance read: the adaptive budget base
+    comes from the session ledger (initial cash + realized - fees). A spot
+    stub without a balance API must not be consulted."""
+    bot, store, market = _env(tmp_path, adaptive=True)
+
+    class _NoBalanceSpot:
+        def __getattr__(self, name):
+            raise AssertionError(f"paper entry must not call spot.{name}")
+
+    market.spot = _NoBalanceSpot()
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ACTIVE"          # entry succeeded via ledger
+    assert store.get_meta_float("last_entry_ts_global") is not None
+
+
+def test_resume_stopped_clears_stale_soft_exit_ts(tmp_path):
+    """--resume-stopped must clear soft_exit_ts: a stale marker would route
+    the next grid into the soft-exit branch and instantly market-sell its
+    first fill."""
+    from bot import _resume_stopped_symbols
+    bot, store, market = _env(tmp_path, adaptive=True)
+    store.update_symbol(
+        "BTC/USDT",
+        risk_status="stopped",
+        strategy_state="STOPPED",
+        soft_exit_ts=12345.0,
+        exit_status=1,
+        exit_reason="time_stop",
+    )
+    import io
+    out = io.StringIO()
+    _resume_stopped_symbols(bot.cfg, None, store, out=out)
+    st = store.get_symbol("BTC/USDT")
+    assert st.risk_status == "ok"
+    assert st.strategy_state == "WAITING"
+    assert st.soft_exit_ts is None
+
+
+def test_is_active_dust_inventory_is_not_active(tmp_path):
+    """Inventory below QTY_TOLERANCE (but above the record_fill dust floor)
+    must not wedge the symbol in the active path forever."""
+    bot, store, _market = _env(tmp_path)
+    store.update_symbol("BTC/USDT", inventory_qty=5e-10)
+    st = store.get_symbol("BTC/USDT")
+    assert bot._is_active("BTC/USDT", st) is False
+
+
+def test_place_grid_failure_cancels_placed_levels(tmp_path):
+    """A failure mid-placement (e.g. level 2 rejected) must not leave the
+    already-placed BUYs resting without grid metadata: best-effort cancel
+    runs before the failure propagates."""
+    from exchange import OrderRejected
+
+    class _FailLater(DryRunExecutor):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.calls = 0
+
+        def place_limit(self, *a, **k):
+            self.calls += 1
+            if self.calls >= 3:
+                raise OrderRejected("level 3 rejected")
+            return super().place_limit(*a, **k)
+
+    store = StateStore(str(tmp_path / "state.db"))
+    market = StubMarket()
+    cfg = make_config()
+    executor = _FailLater(cfg, store)
+    bot = Bot(cfg, store, market, executor)
+    plan = grid_mod.GridPlan(
+        symbol="BTC/USDT", mode="arithmetic", step=350.0,
+        levels=[
+            grid_mod.GridLevel(1, 49650.0, 50000.0, 0.00021, 0.007, 0.004),
+            grid_mod.GridLevel(2, 49300.0, 49650.0, 0.00021, 0.007, 0.004),
+            grid_mod.GridLevel(3, 48950.0, 49300.0, 0.00021, 0.007, 0.004),
+            grid_mod.GridLevel(4, 48600.0, 48950.0, 0.00021, 0.007, 0.004),
+        ],
+        lower_price=48600.0, upper_price=50000.0,
+        gross_pct=0.007, net_pct=0.004, executable=True,
+    )
+    with pytest.raises(OrderRejected):
+        bot._place_grid("BTC/USDT", plan)
+    assert executor.calls == 3                     # failed on level 3
+    assert store.count_open_orders("BTC/USDT") == 0  # levels 1-2 cancelled

@@ -288,6 +288,10 @@ class Bot:
                     self.store.add_risk_event(symbol, "order_rejected", str(exc))
                     self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
                     log.error("order rejected (%s) during kill cleanup: %s", symbol, exc)
+                except Exception as exc:  # contained: never skip remaining symbols
+                    self.store.add_risk_event(symbol, "kill_cleanup_error", str(exc))
+                    self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                    log.exception("kill cleanup failed for %s", symbol)
             self.store.set_runtime("KILL_ACTIVE", now)
             return
         for symbol in self.cfg.pair_list:
@@ -370,7 +374,11 @@ class Bot:
             zscore=None,
         )
         if st.risk_status != "stopped":
-            market_fields.update(exit_status=0, exit_reason=None)
+            # While a SOFT exit is in progress the recorded reason must
+            # survive (the completion path records it in the risk event and
+            # cooldown bookkeeping); it is wiped again after the exit ends.
+            if st.soft_exit_ts is None:
+                market_fields.update(exit_status=0, exit_reason=None)
 
         # Fetch live ticker price for dashboard/equity telemetry.
         # This is SEPARATE from the closed-candle indicator snapshot.
@@ -431,6 +439,24 @@ class Bot:
                 self.executor.sync_fills(symbol, view.last_candle, allow_renewal=False)
                 st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
                 inventory = float(st.inventory_qty or 0.0)
+                # A failed BUY cancellation must not deadlock the soft exit:
+                # retry cancelling any BUYs still resting on the book.
+                open_buys = [
+                    o for o in self.store.open_orders(symbol) if o["side"] == "BUY"
+                ]
+                if open_buys:
+                    if not self.executor.cancel_buys(symbol):
+                        self.store.add_risk_event(
+                            symbol, "cancel_verify_failed", "soft-exit BUY cancel retry"
+                        )
+                        self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                        log.error(
+                            "fail-closed: BUY cancel retry failed for %s during soft exit",
+                            symbol,
+                        )
+                        return
+                    st = self.store.get_symbol(symbol) or SymbolState(symbol=symbol)
+                    inventory = float(st.inventory_qty or 0.0)
                 if inventory <= QTY_TOLERANCE and self.store.count_open_orders(symbol) == 0:
                     self.store.add_risk_event(symbol, "soft_exit_complete", st.exit_reason or "")
                     self._finish_exit(symbol, st.exit_reason or "soft_exit", now,
@@ -438,9 +464,11 @@ class Bot:
                     return
                 if inventory > QTY_TOLERANCE and \
                         now >= (st.soft_exit_ts or now) + self.cfg.soft_cooldown_hours * 3600.0:
-                    # SELLs did not clear within the soft window: hard exit.
-                    self.store.update_symbol(symbol, exit_status=1, exit_reason="time_stop_escalation")
-                    self._exit_symbol(symbol, "time_stop_escalation", now,
+                    # SELLs did not clear within the soft window: hard exit,
+                    # attributed to the original exit reason.
+                    escalation_reason = (st.exit_reason or "soft_exit") + "_escalation"
+                    self.store.update_symbol(symbol, exit_status=1, exit_reason=escalation_reason)
+                    self._exit_symbol(symbol, escalation_reason, now,
                                       cooldown_hours=self.cfg.hard_cooldown_hours)
                     return
                 self.store.set_symbol_state(symbol, "ACTIVE")
@@ -536,13 +564,30 @@ class Bot:
 
             # Adaptive grid planning (Phase 1) or static grid from config
             if self.cfg.adaptive_grid:
-                # Fetch available USDT balance for quote budget calculation
-                try:
-                    available_usdt = self.market.spot.get_balance("USDT")
-                except ExchangeError as exc:
-                    log.warning("USDT balance unavailable for %s: %s", symbol, exc)
-                    self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="balance_unavailable")
-                    return
+                # Available USDT for the quote budget calculation.
+                # PAPER (DRY_RUN): the signed balance read is refused, and
+                # paper capital lives in the session ledger — derive it as
+                # initial cash + realized PnL - fees (the equity model
+                # without the base-asset unrealized term).
+                # TESTNET/LIVE: authoritative free balance (locked funds
+                # belong to other symbols' working orders and are NOT
+                # spendable by a new grid).
+                if self.cfg.dry_run:
+                    capital = self.store.get_meta_float("session_initial_cash")
+                    if capital is None:
+                        capital = self.cfg.start_equity
+                    available_usdt = (
+                        (capital or 0.0)
+                        + self.store.sum_realized_pnl()
+                        - self.store.sum_fees()
+                    )
+                else:
+                    try:
+                        available_usdt = self.market.spot.get_free_balance("USDT")
+                    except ExchangeError as exc:
+                        log.warning("USDT balance unavailable for %s: %s", symbol, exc)
+                        self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="balance_unavailable")
+                        return
                 if available_usdt is None or available_usdt <= 0:
                     self.store.set_symbol_state(symbol, "ENTRY_BLOCKED", entry_blocker="insufficient_balance")
                     return
@@ -721,7 +766,9 @@ class Bot:
             return True
         if self.store.count_open_orders(symbol) > 0:
             return True
-        return (st.inventory_qty or 0.0) > 0.0
+        # QTY_TOLERANCE, not >0: dust below the exit-completion threshold
+        # must never wedge the symbol in an ACTIVE limbo with no orders.
+        return (st.inventory_qty or 0.0) > QTY_TOLERANCE
 
     def _has_uncovered_inventory(self, symbol: str) -> bool:
         """True when held inventory is neither covered by open sell orders
@@ -777,15 +824,32 @@ class Bot:
                 )
                 return False
 
-        for level in plan.levels:
-            self.executor.place_limit(
+        # Place every level. A failure mid-loop (rejection, unknown state,
+        # crash) must not leave orphan BUYs resting without grid metadata:
+        # best-effort cancel of everything placed so far, then re-raise so
+        # the caller fails the symbol closed.
+        try:
+            for level in plan.levels:
+                self.executor.place_limit(
+                    symbol,
+                    "BUY",
+                    level.buy_price,
+                    level.qty,
+                    parent_order_id=None,
+                    target_sell_price=level.sell_price,
+                )
+        except Exception:
+            log.exception(
+                "grid placement failed for %s after %d/%d levels — cancelling placed orders",
                 symbol,
-                "BUY",
-                level.buy_price,
-                level.qty,
-                parent_order_id=None,
-                target_sell_price=level.sell_price,
+                len(self.store.open_orders(symbol)),
+                len(plan.levels),
             )
+            try:
+                self.executor.cancel_all(symbol)
+            except Exception:  # noqa: BLE001 — original failure takes precedence
+                log.exception("cleanup cancel also failed for %s — symbol must fail closed", symbol)
+            raise
         log.info(
             "grid placed %s mode=%s step=%s gross=%.4f%% net=%.4f%% levels=%d",
             symbol, plan.mode, plan.step, plan.gross_pct * 100, plan.net_pct * 100,
@@ -1182,6 +1246,10 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
                 strategy_state="WAITING",
                 exit_reason=None,
                 exit_status=0,
+                # A stale soft-exit marker would route the next grid into the
+                # soft-exit branch and instantly escalate its first fill to a
+                # market sell — the lifecycle marker must not survive a resume.
+                soft_exit_ts=None,
             )
             print(f"  {symbol}: risk_status=ok strategy_state=WAITING (adaptive params preserved)", file=out)
         print("OVERALL: OK (recovery applied)", file=out)
@@ -1348,6 +1416,10 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
             strategy_state="WAITING",
             exit_reason=None,
             exit_status=0,
+            # A stale soft-exit marker would route the next grid into the
+            # soft-exit branch and instantly escalate its first fill to a
+            # market sell — the lifecycle marker must not survive a resume.
+            soft_exit_ts=None,
             # Do NOT change: cooldown_until, inventory_qty, avg_cost, fills, risk_events, etc.
             # Do NOT change: adaptive_* fields, grid_mode, grid_step, grid_lower, gross_pct, net_pct
         )

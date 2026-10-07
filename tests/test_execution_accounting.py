@@ -596,3 +596,129 @@ def test_liquidation_quantity_exactly_min_qty_passes(tmp_path):
     ok = executor.place_market_sell("BTC/USDT", 0.001, ref_price=100.0)
     # Should pass validation (may fail due to fill but not due to quantization)
     assert ok is not None
+
+
+# ----- child-sell integrity (audit fixes) -----
+
+def _buy_with_base_commission_fill(store, executor, spot, gross=1.0, fee=0.0012345):
+    """Place a BUY, fill it with a base-asset commission (the exact live
+    path), and return (local_id, cid)."""
+    local_id = executor.place_limit("BTC/USDT", "BUY", 100.0, gross,
+                                    target_sell_price=101.0)
+    cid = store.get_order(local_id)["client_order_id"]
+    spot.fill(cid, gross, 100.0, fee=fee, fee_asset="BTC")
+    return local_id, cid
+
+
+def test_child_sell_qty_quantized_to_step_size(tmp_path):
+    """The net-of-commission delta is generally not a LOT_SIZE multiple:
+    the submitted child sell must be floored to step size, and only the
+    placed quantity is booked into child_sell_qty."""
+    store, executor, spot = _make_env(tmp_path)
+    local_id, _cid = _buy_with_base_commission_fill(store, executor, spot)
+    executor.sync_fills("BTC/USDT", None)
+    children = child_sells(store, local_id)
+    assert len(children) == 1
+    # net received = 1.0 - 0.0012345 = 0.9987655 -> floored to step 1e-5
+    assert children[0]["qty"] == pytest.approx(0.99876)
+    parent = store.get_order(local_id)
+    assert parent["child_sell_qty"] == pytest.approx(0.99876)
+    # the sub-step residual stays pending (visible to the respawn sweep)
+    assert spot.submit_calls[-1][2] == pytest.approx(0.99876)
+
+
+def test_child_sell_below_min_notional_deferred_not_booked(tmp_path):
+    """A partial fill whose child sell would be below minNotional is
+    DEFERRED: no order submitted, nothing booked, no exception."""
+    store, executor, spot = _make_env(tmp_path)
+    local_id, cid = _buy_with_base_commission_fill(store, executor, spot,
+                                                   gross=0.05, fee=0.0)
+    # notional 0.05 * 101 = 5.05 < min_notional 10
+    executor.sync_fills("BTC/USDT", None)
+    assert child_sells(store, local_id) == []
+    assert store.get_order(local_id)["child_sell_qty"] == pytest.approx(0.0)
+    n_submits = len(spot.submit_calls)
+    # The fill accumulates past min_notional on a later partial fill -> spawn
+    spot.fill(cid, 0.06, 100.0, fee=0.0)   # net 0.11 -> notional 11.11 >= 10
+    executor.sync_fills("BTC/USDT", None)
+    assert len(spot.submit_calls) == n_submits + 1
+    children = child_sells(store, local_id)
+    assert len(children) == 1
+    assert children[0]["qty"] == pytest.approx(0.11)
+
+
+def test_fully_filled_offline_buy_respawns_child_on_next_sync(tmp_path):
+    """A BUY that filled completely while the bot was offline becomes a
+    terminal order during restart reconciliation (which creates no
+    orders); the next strategy sync MUST spawn its child sell."""
+    store, executor, spot = _make_env(tmp_path)
+    local_id, cid = _buy_with_base_commission_fill(store, executor, spot)
+    # offline fill: order went FILLED on the exchange before any sync
+    # restart reconciliation mirrors status, creates no orders
+    report = executor.restart_reconcile("BTC/USDT")
+    assert report["unknown"] == 0
+    assert child_sells(store, local_id) == []          # reconcile_only: no spawn
+    executor.sync_fills("BTC/USDT", None)              # next strategy cycle
+    children = child_sells(store, local_id)
+    assert len(children) == 1
+
+
+def test_canceled_buy_final_partial_fill_respawns_child(tmp_path):
+    """A final partial fill landing between the last sync and the cancel
+    is converted into a child sell by the terminal-BUY sweep."""
+    store, executor, spot = _make_env(tmp_path)
+    local_id = executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0,
+                                    target_sell_price=101.0)
+    cid = store.get_order(local_id)["client_order_id"]
+    spot.fill(cid, 0.4, 100.0, fee=0.0)
+    executor.sync_fills("BTC/USDT", None)              # child for 0.4
+    assert len(child_sells(store, local_id)) == 1
+    spot.fill(cid, 0.2, 100.0, fee=0.0)                # late final partial
+    assert executor.cancel_buys("BTC/USDT") is True    # cancel records the fill
+    assert store.get_order(local_id)["status"] == "CANCELED"
+    executor.sync_fills("BTC/USDT", None)              # sweep: child for 0.2
+    children = child_sells(store, local_id)
+    assert len(children) == 2
+    assert sorted(c["qty"] for c in children) == pytest.approx([0.2, 0.4])
+
+
+def test_child_sell_rejection_rolls_back_conversion_marker(tmp_path):
+    """A definitively rejected child sell un-books child_sell_qty so the
+    respawn sweep retries the quantity; the symbol still fails closed."""
+    from exchange import OrderRejected
+    store, executor, spot = _make_env(tmp_path)
+    local_id, _cid = _buy_with_base_commission_fill(store, executor, spot)
+    spot.reject_next_submit = True
+    with pytest.raises(OrderRejected):
+        executor.sync_fills("BTC/USDT", None)
+    assert store.get_order(local_id)["child_sell_qty"] == pytest.approx(0.0)
+    # after the transient rejection is cleared, the sweep retries
+    executor.sync_fills("BTC/USDT", None)
+    live_children = [c for c in child_sells(store, local_id)
+                     if c["status"] != "REJECTED"]
+    assert len(live_children) == 1
+    assert store.get_order(local_id)["child_sell_qty"] > 0.0
+
+
+def test_cancel_of_vanished_order_succeeds(tmp_path):
+    """A cancel answering -2011 for an order that no longer exists on the
+    exchange (and is not queryable) is terminal success, not failure."""
+    store, executor, spot = _make_env(tmp_path)
+    local_id = executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0,
+                                    target_sell_price=101.0)
+    cid = store.get_order(local_id)["client_order_id"]
+    spot.gone_cids.add(cid)
+    del spot.orders[cid]     # the exchange no longer knows this order at all
+    assert executor.cancel_all("BTC/USDT") is True
+    assert store.get_order(local_id)["status"] == "CANCELED"
+
+
+def test_timestamp_rejection_classified_as_definitive(tmp_path):
+    """-1021 (timestamp) means the request was never accepted: the order
+    does not exist, so submit failures classify as REJECTED, not UNKNOWN."""
+    from exchange import OrderRejected
+    store, executor, spot = _make_env(tmp_path)
+    spot.reject_next_submit = True
+    spot.reject_code = -1021
+    with pytest.raises(OrderRejected):
+        executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0)

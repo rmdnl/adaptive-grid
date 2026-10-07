@@ -153,6 +153,9 @@ class FakeSpot:
         self.trade_seq = 5000
         self.submit_calls = []      # (type, cid, qty) for every accepted submission
         self.fail_next_submit = None  # "lost" | "pre" | None
+        self.reject_next_submit = False  # next submit raises a definitive rejection
+        self.reject_code = -1013         # Binance code used by that rejection
+        self.gone_cids: set = set()   # cids that vanish before cancel (-2011, absent)
         self.market_fill_fractions = []  # per-market-order executed fraction
         self.adjust_balance = adjust_balance
         self.balances = {}
@@ -204,6 +207,13 @@ class FakeSpot:
             raise self._exchange.ExchangeError("timeout: response lost")
         if mode == "pre":
             raise self._exchange.ExchangeError("network error before submission")
+        if self.reject_next_submit:
+            self.reject_next_submit = False
+            code = self.reject_code
+            msg = "Filter failure: LOT_SIZE" if code == -1013 else "timestamp error"
+            raise self._exchange.ExchangeError(
+                f'POST /api/v3/order -> HTTP 400: {{"code":{code},"msg":"{msg}"}}'
+            )
         self.submit_calls.append((order_type, cid, float(qty)))
         order = self._register(cid, symbol, side, order_type, price, qty)
         if order_type == "MARKET":
@@ -224,6 +234,10 @@ class FakeSpot:
         return self._submit("MARKET", symbol, side, None, qty, cid)
 
     def cancel_order(self, symbol, cid):
+        if cid in self.gone_cids:
+            # vanished before the cancel reached it: -2011, and the order
+            # is no longer queryable at all
+            raise self._exchange.ExchangeError("-2011 Unknown order sent")
         order = self.orders[cid]
         if order["status"] in ("FILLED", "CANCELED", "EXPIRED", "REJECTED"):
             # real Binance behaviour: cancelling a terminal order -> -2011
@@ -232,6 +246,8 @@ class FakeSpot:
         return dict(order)
 
     def get_order(self, symbol, cid):
+        if cid in self.gone_cids:
+            return None
         order = self.orders.get(cid)
         return dict(order) if order else None
 
@@ -258,6 +274,9 @@ class FakeSpot:
         if self.fail_balance:
             raise self._exchange.ExchangeError("balance unavailable")
         return float(self.balances.get(asset, 0.0))
+
+    def get_free_balance(self, asset):
+        return self.get_balance(asset)
 
     def get_filters(self, symbol):
         from grid import ExchangeFilters
