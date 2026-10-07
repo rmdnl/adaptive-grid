@@ -120,6 +120,7 @@ RISK_STATUS_LABELS = {
     "stale_data": "STALE DATA — Candle freshness check failed",
     "spread_wide": "SPREAD WIDE — Liquidity risk detected",
     "inventory_high": "INVENTORY HIGH — Position limit approached",
+    "error": "ERROR — Risk engine failure, symbol stopped",
     "unknown": "UNKNOWN RISK STATE — Investigate",
 }
 
