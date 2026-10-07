@@ -252,11 +252,14 @@ class FakeSpot:
         return dict(order) if order else None
 
     def get_open_orders(self, symbol=None):
-        return [
+        rows = [
             dict(o)
             for o in self.orders.values()
             if o["status"] in ("NEW", "PARTIALLY_FILLED")
         ]
+        if symbol is None:
+            return rows
+        return [o for o in rows if o["symbol"] == symbol]
 
     def get_my_trades(self, symbol, order_id=None):
         return [dict(t) for t in self.trades.get(order_id, [])]

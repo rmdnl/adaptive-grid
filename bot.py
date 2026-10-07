@@ -1191,8 +1191,9 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
     5. Symbol's current risk_status is exactly "stopped" or "error"
     6. Symbol is NOT in COOLDOWN (cooldown_until must be None or in the past)
 
-    If ANY verification fails for ANY symbol, the operation aborts without
-    changing ANY symbol state. The operation is deterministic and idempotent.
+    Verification is per symbol: symbols that pass are recovered; symbols
+    that fail verification are left untouched (fail-closed) and reported.
+    The operation is deterministic and idempotent.
 
     After successful recovery, symbols transition to strategy_state="WAITING"
     with risk_status="ok" — a neutral state where the normal cycle will
@@ -1233,6 +1234,7 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
         print(f"RESUME-STOPPED: PAPER mode — verifying {len(targets)} symbol(s): {', '.join(targets)}", file=out)
         print("", file=out)
         all_clean = True
+        refused_paper = []
         for symbol in targets:
             st = store.get_symbol(symbol)
             symbol_clean = True
@@ -1257,14 +1259,12 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
                 print("  VERIFICATION: PASSED")
             else:
                 print("  VERIFICATION: FAILED")
+                refused_paper.append(symbol)
             print("", file=out)
             all_clean = all_clean and symbol_clean
 
-        if not all_clean:
-            print("OVERALL: FAIL-CLOSED", file=out)
-            return 1
-
-        for symbol in targets:
+        recovered = [s for s in targets if s not in refused_paper]
+        for symbol in recovered:
             store.update_symbol(
                 symbol,
                 risk_status="ok",
@@ -1278,8 +1278,10 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
                 soft_exit_ts=None,
             )
             print(f"  {symbol}: risk_status=ok strategy_state=WAITING (adaptive params preserved)", file=out)
-        print("OVERALL: OK (recovery applied)", file=out)
-        return 0
+        if refused_paper:
+            print(f"  refused (verification failed, left untouched): {', '.join(refused_paper)}", file=out)
+        print("OVERALL:", "OK (recovery applied)" if not refused_paper else "PARTIAL (clean symbols recovered, refused ones left untouched)", file=out)
+        return 0 if not refused_paper else 1
     if cfg.execution_mode != "testnet":
         print("RESUME-STOPPED: only available in EXECUTION_MODE=testnet.", file=out)
         print("OVERALL: FAIL-CLOSED (mode not supported)", file=out)
@@ -1420,15 +1422,20 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
     for vr in verification_results:
         status = "PASS" if vr["clean"] else "FAIL"
         print(f"  {vr['symbol']:<12} {status}", file=out)
-    print(f"OVERALL: {'OK' if all_clean else 'FAIL-CLOSED'}", file=out)
+    if all_clean:
+        print("OVERALL: OK", file=out)
+    else:
+        print("OVERALL: PARTIAL (failed symbols will be left untouched)", file=out)
 
-    if not all_clean:
-        return 1
+    # Apply per symbol: only the VERIFIED symbols are recovered; symbols
+    # that failed verification are left untouched (fail-closed) and
+    # reported, so one bad symbol cannot wedge the others.
+    recovered = [vr for vr in verification_results if vr["clean"]]
+    refused = [vr for vr in verification_results if not vr["clean"]]
 
-    # All verifications passed — apply the state transition
     print("", file=out)
     print("APPLYING RECOVERY", file=out)
-    for vr in verification_results:
+    for vr in recovered:
         symbol = vr["symbol"]
         st = vr["st"]
         # Preserve adaptive parameters and all historical data.
@@ -1451,10 +1458,15 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
         )
         print(f"  {symbol}: risk_status=ok strategy_state=WAITING (adaptive params preserved)", file=out)
 
+    if refused:
+        print(f"  refused (verification failed, left untouched): "
+              f"{', '.join(vr['symbol'] for vr in refused)}", file=out)
     print("", file=out)
-    print("RECOVERY COMPLETE: symbols returned to neutral WAITING state.", file=out)
-    print("Next cycle will evaluate entry signals normally.", file=out)
-    return 0
+    if recovered:
+        print("RECOVERY COMPLETE: verified symbols returned to neutral WAITING state.", file=out)
+        print("Next cycle will evaluate entry signals normally.", file=out)
+    print("OVERALL:", "OK (recovery applied)" if not refused else "PARTIAL (clean symbols recovered, refused ones left untouched)", file=out)
+    return 0 if not refused else 1
 
 
 def reset_execution_session(cfg: Config, store: StateStore) -> None:

@@ -127,8 +127,10 @@ def test_resume_stopped_successful_recovery_multiple_symbols(tmp_path):
 # b. unknown order blocks recovery
 # ---------------------------------------------------------------------------
 
-def test_resume_stopped_unknown_local_order_blocks(tmp_path):
-    """A local open order that cannot be found on exchange (UNKNOWN) blocks recovery."""
+def test_resume_stopped_absent_local_order_resolved_and_recovered(tmp_path):
+    """A local open order the exchange definitively does not know
+    (-2013 class) never reached the book: reconciliation resolves it
+    (marked CANCELED locally) and recovery proceeds."""
     store, cfg, spot = _env(tmp_path)
     _stop_symbol(store, "AAA/USDT", "lower_boundary_breach")
     # Create a local open order that doesn't exist on exchange
@@ -140,15 +142,13 @@ def test_resume_stopped_unknown_local_order_blocks(tmp_path):
     code = bot._resume_stopped_symbols(cfg, spot, store, out)
     output = out.getvalue()
 
-    assert code == 1
-    assert "FAIL-CLOSED" in output
-    assert "BLOCKED: reconciliation detected unknown order" in output
-
-    # Verify NO state change
+    assert code == 0, output
+    assert "VERIFICATION: PASSED" in output
+    # the ghost row was resolved, not left open
+    assert store.get_order_by_client_id("ghost-buy")["status"] == "CANCELED"
     st = store.get_symbol("AAA/USDT")
-    assert st.risk_status == "stopped"
-    assert st.strategy_state == "STOPPED"
-    assert st.exit_reason == "lower_boundary_breach"
+    assert st.risk_status == "ok"
+    assert st.strategy_state == "WAITING"
 
 
 def test_resume_stopped_unexpected_exchange_order_blocks(tmp_path):
@@ -163,7 +163,7 @@ def test_resume_stopped_unexpected_exchange_order_blocks(tmp_path):
     output = out.getvalue()
 
     assert code == 1
-    assert "FAIL-CLOSED" in output
+    assert "PARTIAL" in output
     # The error message from reconciliation includes "unknown order(s): rogue-buy"
     assert "unknown order" in output.lower()
 
@@ -194,7 +194,7 @@ def test_resume_stopped_exchange_error_blocks(tmp_path):
     output = out.getvalue()
 
     assert code == 1
-    assert "FAIL-CLOSED" in output
+    assert "PARTIAL" in output
     assert "BLOCKED: reconciliation failed" in output
 
     # Verify NO state change
@@ -218,7 +218,7 @@ def test_resume_stopped_open_exchange_orders_blocks(tmp_path):
     output = out.getvalue()
 
     assert code == 1
-    assert "FAIL-CLOSED" in output
+    assert "PARTIAL" in output
     assert "BLOCKED:" in output and "open order" in output
 
     # Verify NO state change
@@ -243,7 +243,7 @@ def test_resume_stopped_nonzero_inventory_blocks(tmp_path):
     output = out.getvalue()
 
     assert code == 1
-    assert "FAIL-CLOSED" in output
+    assert "PARTIAL" in output
     assert "BLOCKED: non-zero inventory" in output
 
     # Verify NO state change
@@ -264,7 +264,7 @@ def test_resume_stopped_ledger_mismatch_blocks(tmp_path):
     output = out.getvalue()
 
     assert code == 1
-    assert "FAIL-CLOSED" in output
+    assert "PARTIAL" in output
     assert "BLOCKED: ledger mismatch" in output
 
     # Verify NO state change
@@ -378,7 +378,7 @@ def test_resume_stopped_stopped_with_active_cooldown_blocks(tmp_path):
     output = out.getvalue()
 
     assert code == 1
-    assert "FAIL-CLOSED" in output
+    assert "PARTIAL" in output
     assert "BLOCKED: symbol is in COOLDOWN" in output
 
     # Verify NO state change
@@ -423,8 +423,9 @@ def test_resume_stopped_idempotent_second_execution(tmp_path):
 # i. failed verification causes zero state mutation
 # ---------------------------------------------------------------------------
 
-def test_resume_stopped_failed_verification_zero_mutation(tmp_path):
-    """If ANY symbol fails verification, NO symbol state is changed."""
+def test_resume_stopped_failed_verification_refuses_only_failing_symbol(tmp_path):
+    """Recovery is per symbol: the verified symbol is recovered, the
+    failing one is left untouched (fail-closed) and reported."""
     pair = ("AAA/USDT", "BBB/USDT")
     store, cfg, spot = _env(tmp_path, pair)
     _stop_symbol(store, "AAA/USDT", "lower_boundary_breach")
@@ -437,15 +438,15 @@ def test_resume_stopped_failed_verification_zero_mutation(tmp_path):
     output = out.getvalue()
 
     assert code == 1
-    assert "FAIL-CLOSED" in output
+    assert "PARTIAL" in output
+    assert "refused (verification failed, left untouched): BBB/USDT" in output
 
-    # AAA should NOT have been recovered (all-or-nothing)
+    # AAA was verified clean -> recovered
     st_aaa = store.get_symbol("AAA/USDT")
-    assert st_aaa.risk_status == "stopped"
-    assert st_aaa.strategy_state == "STOPPED"
-    assert st_aaa.exit_reason == "lower_boundary_breach"
+    assert st_aaa.risk_status == "ok"
+    assert st_aaa.strategy_state == "WAITING"
 
-    # BBB should also remain stopped
+    # BBB remains stopped, untouched
     st_bbb = store.get_symbol("BBB/USDT")
     assert st_bbb.risk_status == "stopped"
     assert st_bbb.strategy_state == "STOPPED"
@@ -634,9 +635,9 @@ def test_resume_stopped_paper_mode_recovers_error_symbol(tmp_path):
     assert st.strategy_state == "WAITING"
 
 
-def test_resume_stopped_paper_mode_fail_closed_on_inventory(tmp_path):
-    """PAPER recovery refuses symbols holding inventory or open orders —
-    no state is changed for ANY symbol when one fails verification."""
+def test_resume_stopped_paper_mode_refuses_only_failing_symbol(tmp_path):
+    """PAPER recovery is per symbol: the verified symbol is recovered; a
+    symbol holding inventory is refused and left untouched."""
     store, cfg, spot = _env(tmp_path, pair=("AAA/USDT", "BBB/USDT"))
     cfg = make_config(
         pair_list=("AAA/USDT", "BBB/USDT"),
@@ -645,16 +646,16 @@ def test_resume_stopped_paper_mode_fail_closed_on_inventory(tmp_path):
     )
     _stop_symbol(store, "AAA/USDT", "lower_boundary_breach")
     _stop_symbol(store, "BBB/USDT", "other")
-    # BBB holds inventory without open orders -> must block recovery
+    # BBB holds inventory without open orders -> must block ITS recovery
     buy = store.create_order("cid-b", "BBB/USDT", "BUY", "LIMIT_MAKER", 100.0, 1.0, "dry_run")
     store.record_fill(buy, "BBB/USDT", "BUY", 100.0, 1.0, 0.0, trade_id="t-b")
 
     out = io.StringIO()
     code = bot._resume_stopped_symbols(cfg, spot, store, out)
     assert code == 1
-    assert "OVERALL: FAIL-CLOSED" in out.getvalue()
-    # no symbol was modified
-    assert store.get_symbol("AAA/USDT").risk_status == "stopped"
+    assert "OVERALL: PARTIAL" in out.getvalue()
+    # AAA verified clean -> recovered
+    assert store.get_symbol("AAA/USDT").risk_status == "ok"
     assert store.get_symbol("BBB/USDT").risk_status == "stopped"
 
 

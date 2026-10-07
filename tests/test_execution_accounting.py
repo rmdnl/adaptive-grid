@@ -231,16 +231,47 @@ def _last_local_cid(store):
     return rows[-1]["client_order_id"]
 
 
-def test_local_open_order_missing_on_exchange_fails_closed(tmp_path):
+def test_local_open_order_missing_on_exchange_resolved(tmp_path):
+    """A locally-open order absent from the exchange (-2013 class) never
+    reached the book: sync marks it CANCELED and keeps going."""
     store, executor, spot = _make_env(tmp_path)
     executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0, target_sell_price=101.0)
     spot.orders.clear()  # exchange knows nothing about it
 
-    with pytest.raises(OrderUnknownState):
-        executor.sync_fills("BTC/USDT", None)
+    executor.sync_fills("BTC/USDT", None)   # must not raise
 
     rows = _all_orders(store)
-    assert rows[0]["status"] == "UNKNOWN"
+    assert rows[0]["status"] == "CANCELED"
+    events = [e["event"] for e in store.recent_risk_events()]
+    assert "order_never_reached_book" in events
+
+
+def test_ghost_child_sell_rolls_back_conversion_and_respawns(tmp_path):
+    """The XRP outage scenario: a child SELL booked locally but never
+    accepted by the exchange (-2013). Resolution must (a) cancel the row,
+    (b) roll its booked quantity back into pending conversion, and
+    (c) the terminal-BUY sweep then respawns the full child sell."""
+    store, executor, spot = _make_env(tmp_path)
+    local_id = executor.place_limit("BTC/USDT", "BUY", 100.0, 1.0,
+                                    target_sell_price=101.0)
+    cid = store.get_order(local_id)["client_order_id"]
+    spot.fill(cid, 1.0, 100.0, fee=0.001, fee_asset="BTC")   # net 0.999
+    # ghost: the child sell row exists locally but was never accepted
+    ghost_cid = "ag-ghost-child"
+    store.create_child_sell_order(ghost_cid, "BTC/USDT", 101.0, 0.999,
+                                  local_id, "live")
+    assert store.get_order(local_id)["child_sell_qty"] == pytest.approx(0.999)
+    # the ghost was never accepted by the exchange (never registered there)
+
+    executor.sync_fills("BTC/USDT", None)
+
+    # ghost canceled, conversion rolled back, sweep respawned the full qty
+    assert store.get_order_by_client_id(ghost_cid)["status"] == "CANCELED"
+    live_children = [o for o in child_sells(store, local_id)
+                     if o["client_order_id"] != ghost_cid]
+    assert len(live_children) == 1
+    assert live_children[0]["qty"] == pytest.approx(0.999)
+    assert store.get_order(local_id)["child_sell_qty"] == pytest.approx(0.999)
 
 
 def test_liquidation_retry_uses_tracked_client_ids(tmp_path):

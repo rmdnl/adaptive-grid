@@ -350,7 +350,12 @@ class BinanceSpot:
         )
 
     def get_order(self, symbol: str, client_order_id: str) -> Optional[Dict]:
-        """Order status by client id; None when the order does not exist."""
+        """Order status by client id; None when the order definitively does
+        not exist (-2011 on lookup variants, -2013 "Order does not exist").
+        Both codes are Binance's definitive absent-order answers for a
+        well-formed exact-id query: the order never reached the book, so it
+        cannot have traded and no fills can exist for it. Every other
+        failure raises."""
         try:
             return self._request(
                 "GET",
@@ -359,7 +364,12 @@ class BinanceSpot:
                 signed=True,
             )
         except ExchangeError as exc:
-            if "-2011" in str(exc):  # Unknown order sent.
+            code = _binance_error_code(exc)
+            if code in (-2011, -2013):
+                log.warning(
+                    "order %s on %s definitively absent from exchange (%s)",
+                    client_order_id, symbol, code,
+                )
                 return None
             raise
 
@@ -1052,6 +1062,30 @@ class LiveExecutor(BaseExecutor):
             log.error("open-order verification failed for %s: %s", symbol, exc)
             return False
 
+    def _resolve_absent_local_order(self, symbol: str, order: Dict) -> None:
+        """Resolve a locally-open order the exchange definitively does not
+        know (get_order returned None on an exact-id query).
+
+        The order never reached the book, so it cannot have traded: mark
+        the local row CANCELED, and when the row is a child SELL roll its
+        booked quantity back into the parent's pending conversion so the
+        terminal-BUY respawn sweep re-places it (the conversion marker was
+        booked before submission; an order that never existed converts
+        nothing). Audited as a risk event."""
+        unfilled = float(order["qty"]) - float(order["filled_qty"] or 0.0)
+        self.store.update_order_status(order["id"], "CANCELED", order["filled_qty"] or 0.0)
+        if order["side"] == "SELL" and unfilled > QTY_TOLERANCE and order.get("parent_order_id"):
+            self.store.rollback_child_sell_conversion(order["parent_order_id"], unfilled)
+        self.store.add_risk_event(
+            symbol, "order_never_reached_book",
+            f"local order {order['client_order_id']} ({order['side']} qty={order['qty']}) "
+            f"absent from exchange (-2011/-2013); marked CANCELED locally",
+        )
+        log.warning(
+            "local order %s on %s never reached the book — marked CANCELED locally",
+            order["client_order_id"], symbol,
+        )
+
     def sync_fills(self, symbol: str, candle: Optional[Dict], allow_renewal: bool = True) -> None:
         """Reconcile local open orders against the exchange. Trades are
         accounted exactly once (idempotent by trade id) as they happen,
@@ -1060,8 +1094,9 @@ class LiveExecutor(BaseExecutor):
             cid = order["client_order_id"]
             remote = self.spot.get_order(symbol, cid)
             if remote is None:
-                self.store.update_order_status(order["id"], "UNKNOWN")
-                raise OrderUnknownState(f"local open order {cid} not found on exchange")
+                # Definitive absence: the order never reached the book.
+                self._resolve_absent_local_order(symbol, order)
+                continue
             self._sync_order_from_remote(symbol, order, remote, allow_renewal)
         remote_open = self.spot.get_open_orders(symbol)
         local_cids = {o["client_order_id"] for o in self.store.open_orders(symbol)}
@@ -1145,18 +1180,24 @@ class LiveExecutor(BaseExecutor):
     def restart_reconcile(self, symbol: str) -> Dict:
         """Reconcile local state against the exchange BEFORE resuming.
 
-        Strict, idempotent, no-side-effect: mirrors each local order to its
-        authoritative exchange status (a status the local DB had missed — e.g.
-        a partial fill while offline), accounts any exchange trades not yet in
-        the ledger (idempotent by trade id), and detects unknown local orders
-        or unexpected exchange orders. It creates NO orders, cancels nothing
-        and liquidates nothing. Raises on exchange failure or on unknown
-        state (fail-closed); the caller must then stop, not resume."""
+        Strict, idempotent: mirrors each local order to its authoritative
+        exchange status (a status the local DB had missed — e.g. a partial
+        fill while offline), accounts any exchange trades not yet in the
+        ledger (idempotent by trade id), and detects unknown local orders
+        or unexpected exchange orders. It creates NO exchange orders,
+        cancels nothing and liquidates nothing. Local bookkeeping that the
+        exchange proves impossible (an open order definitively absent,
+        -2011/-2013) is corrected with an audit trail: the row is marked
+        CANCELED and a child SELL's booked conversion is rolled back into
+        pending — the order never existed, so no fills can be lost. Raises
+        on exchange failure or on genuinely unknown state (fail-closed);
+        the caller must then stop, not resume."""
         report: Dict = {
             "symbol": symbol,
             "checked": 0,
             "updated": 0,
             "fills_recorded": 0,
+            "resolved_absent": 0,
             "unknown": 0,
             "unknown_orders": [],
         }
@@ -1164,9 +1205,10 @@ class LiveExecutor(BaseExecutor):
             cid = order["client_order_id"]
             remote = self.spot.get_order(symbol, cid)
             if remote is None:
-                self.store.update_order_status(order["id"], "UNKNOWN")
-                report["unknown"] += 1
-                report["unknown_orders"].append(cid)
+                # Definitive absence (-2011/-2013): correct the local
+                # bookkeeping; the order never reached the book.
+                self._resolve_absent_local_order(symbol, order)
+                report["resolved_absent"] += 1
                 continue
             report["fills_recorded"] += self._sync_order_from_remote(
                 symbol, order, remote, allow_renewal=False, reconcile_only=True

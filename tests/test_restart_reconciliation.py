@@ -150,14 +150,18 @@ def test_reconcile_no_duplicate_child_sell(tmp_path):
 # fail-closed: unknown / unexpected orders
 # ---------------------------------------------------------------------------
 
-def test_unknown_local_order_fails_closed(tmp_path):
+def test_absent_local_order_resolved_not_unknown(tmp_path):
+    """A locally-open order the exchange definitively does not know
+    (-2013 class) never reached the book: reconciliation resolves it
+    locally (CANCELED) instead of failing closed."""
     store, cfg, spot, executor = _env(tmp_path)
     store.create_order("ghost", "AAA/USDT", "BUY", "LIMIT_MAKER", 100.0, 1.0, "live")
     # remote side has no such order -> get_order returns None
 
-    with pytest.raises(OrderUnknownState):
-        executor.restart_reconcile("AAA/USDT")
-    assert store.get_order_by_client_id("ghost")["status"] == "UNKNOWN"
+    report = executor.restart_reconcile("AAA/USDT")
+    assert report["resolved_absent"] == 1
+    assert report["unknown"] == 0
+    assert store.get_order_by_client_id("ghost")["status"] == "CANCELED"
 
 
 def test_unexpected_exchange_order_fails_closed(tmp_path):
@@ -193,9 +197,11 @@ def test_reconcile_state_testnet_clean(tmp_path):
     assert spot.submit_calls == []          # read-only: nothing submitted
 
 
-def test_reconcile_state_unknown_exit_nonzero_and_stops_symbol(tmp_path):
+def test_reconcile_state_unexpected_exchange_order_exits_nonzero(tmp_path):
+    """A live exchange order the local DB does not know is a genuine
+    unknown state: reconcile exits nonzero and stops the symbol."""
     store, cfg, spot, _ = _env(tmp_path)
-    store.create_order("ghost", "AAA/USDT", "BUY", "LIMIT_MAKER", 100.0, 1.0, "live")
+    spot._register("rogue", "AAA/USDT", "BUY", "LIMIT_MAKER", 100.0, 1.0)
     out = io.StringIO()
     code = bot._reconcile_state(cfg, spot, store, out)
     assert code == 1
