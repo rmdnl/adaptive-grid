@@ -99,6 +99,7 @@ def test_payload_symbol_fields(seeded):
     assert btc["inventory_qty"] == pytest.approx(0.00021)
     assert btc["avg_cost"] == pytest.approx(49650.0)
     assert btc["unrealized_pnl"] == pytest.approx(0.00021 * (50000.0 - 49650.0))
+    assert btc["fills_count"] == 2
     assert btc["open_orders"] == 1
     assert btc["realized_pnl"] == pytest.approx(0.0735)
     assert btc["fees"] == pytest.approx(0.0104 + 0.0105)
@@ -116,6 +117,7 @@ def test_payload_missing_data_is_none_not_inferred(seeded):
     assert eth["grid_mode"] is None
     assert eth["grid_count"] == 0
     assert eth["unrealized_pnl"] is None
+    assert eth["fills_count"] == 0
 
 
 def test_payload_state_is_verbatim_from_db(seeded):

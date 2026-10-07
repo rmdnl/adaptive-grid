@@ -749,6 +749,20 @@ class StateStore:
         conn.close()
         return int(row["n"])
 
+    def count_fills(self, symbol: Optional[str] = None) -> int:
+        """Total fill-ledger rows for one symbol (or globally when None).
+        Zero means the session has never executed anything — the dashboard
+        uses this to distinguish 'no trades yet' from a measured zero."""
+        conn = self._connect()
+        if symbol is None:
+            row = conn.execute("SELECT COUNT(*) AS n FROM fills").fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM fills WHERE symbol=?", (symbol,)
+            ).fetchone()
+        conn.close()
+        return int(row["n"])
+
     def order_net_filled_qty(self, order_id: int) -> float:
         """Total NET filled quantity for a BUY order from the fills ledger.
 

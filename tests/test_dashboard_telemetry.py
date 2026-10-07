@@ -364,8 +364,12 @@ def test_js_multi_symbol_telemetry_independent(tmp_path):
 def test_js_existing_price_and_state_rendering_unchanged(tmp_path):
     path = _store_with_telemetry(tmp_path)
     store = StateStore(path)
+    # A real fill so the PnL rows display measured values, not the
+    # empty-ledger state: BUY 0.002 @ 50000 -> inventory 0.002, avg 50000.
+    store.record_fill(None, "BTC/USDT", "BUY", 50000.0, 0.002, 0.0,
+                      trade_id="t-pnl-1")
     store.update_symbol("BTC/USDT", last_price=50123.45, strategy_state="ACTIVE",
-                        risk_status="ok", inventory_qty=0.002, avg_cost=50000.0)
+                        risk_status="ok")
     flat = _run_js(_full_payload(path), tmp_path)
     rows = _card_rows(flat, occurrence=0)
     assert rows["PRICE"] == "50,123.45"                  # existing fmtPrice path
@@ -373,6 +377,34 @@ def test_js_existing_price_and_state_rendering_unchanged(tmp_path):
     assert rows["RISK"] == "OK — All risk gates clear"
     # unrealized PnL = 0.002 * (50123.45 - 50000.0) = 0.2469 -> "+0.25"
     assert rows["UNREALIZED PNL"] == "+0.25"
+    assert rows["PNL"] == "0.00"                         # no sell yet: real zero
+
+
+def test_js_empty_ledger_renders_no_fills_yet(tmp_path):
+    """An untouched session (zero fill-ledger rows) must display
+    'NO FILLS YET' for both PnL rows — never a zero that reads as a
+    measured value, never a dash that reads as broken."""
+    path = _store_with_telemetry(tmp_path)
+    flat = _run_js(_full_payload(path), tmp_path)
+    for occurrence in (0, 1):
+        rows = _card_rows(flat, occurrence)
+        assert rows["PNL"] == "NO FILLS YET", occurrence
+        assert rows["UNREALIZED PNL"] == "NO FILLS YET", occurrence
+
+
+def test_js_traded_but_position_closed_renders_dash_unrealized(tmp_path):
+    """Fills exist but inventory is fully closed: realized shows the
+    measured value, unrealized is the unavailable dash."""
+    path = _store_with_telemetry(tmp_path)
+    store = StateStore(path)
+    store.record_fill(None, "BTC/USDT", "BUY", 50000.0, 0.002, 0.0,
+                      trade_id="t-pnl-2")
+    store.record_fill(None, "BTC/USDT", "SELL", 50100.0, 0.002, 0.0,
+                      trade_id="t-pnl-3")
+    flat = _run_js(_full_payload(path), tmp_path)
+    rows = _card_rows(flat, occurrence=0)
+    assert rows["PNL"] == "+0.20"
+    assert rows["UNREALIZED PNL"] == DASH
 
 
 def test_js_adaptive_params_render_when_present(tmp_path):

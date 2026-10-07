@@ -208,6 +208,7 @@ def _global_payload(store: StateStore) -> Dict:
         "open_orders": store.count_open_orders(),
         "realized_pnl": store.sum_realized_pnl(),
         "fees": store.sum_fees(),
+        "fills_count": store.count_fills(),
         "runtime_status": runtime_status,
         "last_cycle_ts": last_cycle_ts,
         "database": store.database_status(),
@@ -264,6 +265,7 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "avg_cost": st.avg_cost,
         "unrealized_pnl": _unrealized(st),
         "open_orders": store.count_open_orders(st.symbol),
+        "fills_count": store.count_fills(st.symbol),
         "realized_pnl": store.sum_realized_pnl(st.symbol),
         "fees": store.sum_fees(st.symbol),
         "risk_status": st.risk_status,
@@ -728,7 +730,18 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     m.appendChild(kv("LAST GRID REJECT", telemetryText(t, "last_grid_reject_reason", humanGridReject)));
   }
 
-function renderGlobal(g) {
+  function pnlCell(pnl, fillsCount, colorClass) {
+    // An empty fills ledger is 'no trades yet', not a measured zero —
+    // display the distinction so an untouched session is never mistaken
+    // for a broken one. Zero AFTER trades is a real +0.00.
+    if (fillsCount === 0) return { text: "NO FILLS YET", cls: "" };
+    return {
+      text: fmtSigned(pnl),
+      cls: typeof pnl === "number" ? (pnl >= 0 ? "ok" : "danger") : "",
+    };
+  }
+
+  function renderGlobal(g) {
     set("k-equity", fmtNum(g.equity, 2));
     set("k-ref", fmtNum(g.reference_equity, 2));
     set("k-dd", g.drawdown === null || g.drawdown === undefined ? DASH : fmtPctFrac(g.drawdown).replace("+", ""));
@@ -739,7 +752,9 @@ function renderGlobal(g) {
     set("k-maxdd", maxdd);
     set("k-open", g.open_orders === null || g.open_orders === undefined
       ? DASH : String(g.open_orders).padStart(3, "0"));
-    set("k-pnl", fmtSigned(g.realized_pnl));
+    var gpnl = pnlCell(g.realized_pnl, g.fills_count);
+    set("k-pnl", gpnl.text);
+    setCls("k-pnl", "val " + gpnl.cls);
     set("k-fees", fmtNum(g.fees, 4));
     set("k-kill", g.kill_active ? "ACTIVE" : "INACTIVE");
     setCls("k-kill", "val " + (g.kill_active ? "danger" : "ok"));
@@ -861,12 +876,12 @@ function renderGlobal(g) {
       m.appendChild(kv("AVG COST", fmtPrice(s.avg_cost)));
       m.appendChild(kv("OPEN", s.open_orders === null || s.open_orders === undefined
                        ? DASH : String(s.open_orders)));
-      m.appendChild(kv("PNL", fmtSigned(s.realized_pnl),
-                       typeof s.realized_pnl === "number"
-                       ? (s.realized_pnl >= 0 ? "ok" : "danger") : ""));
-      m.appendChild(kv("UNREALIZED PNL", fmtSigned(s.unrealized_pnl),
-                       typeof s.unrealized_pnl === "number"
-                       ? (s.unrealized_pnl >= 0 ? "ok" : "danger") : ""));
+      var rpnl = pnlCell(s.realized_pnl, s.fills_count);
+      m.appendChild(kv("PNL", rpnl.text, rpnl.cls));
+      // fills>0 with no inventory: unrealized is genuinely unavailable (dash);
+      // empty ledger: 'NO FILLS YET' (handled by pnlCell).
+      var upnl = pnlCell(s.unrealized_pnl, s.fills_count);
+      m.appendChild(kv("UNREALIZED PNL", upnl.text, upnl.cls));
       m.appendChild(kv("FEES", fmtNum(s.fees, 4)));
       renderEntryTelemetry(m, s);
       grid.appendChild(m);
