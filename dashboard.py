@@ -504,8 +504,8 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
 
 <header class="mast">
   <div class="brand">
-    <h1>ADAPTIVE-GRID</h1>
-    <div class="sub">SPOT TRADING CONTROL SYSTEM // MK-IV CONSOLE</div>
+    <h1>DONAL ADAPTIVE-GRID</h1>
+    <div class="sub">RAMDONAL HABIBI SPOT TRADING CONTROL SYSTEM // MK-IV CONSOLE</div>
   </div>
   <div class="idrow">
     <span class="ind" id="ind-system"><span class="dot"></span><span class="lbl">SYSTEM</span><span id="system">BOOT</span></span>
