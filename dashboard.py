@@ -934,11 +934,20 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     ctx.shadowBlur = 5;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
-    points.forEach(function (p, i) {
-      var x = points.length === 1 ? w : i / (points.length - 1) * w;
-      var y = h - (p.net - lo) / (hi - lo) * h;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
+    if (points.length === 1) {
+      // A lone moveTo strokes nothing: draw a short marker segment for the
+      // very first fill (centered) so the curve is visible from bar one.
+      var x0 = w / 2;
+      var y0 = h - (points[0].net - lo) / (hi - lo) * h;
+      ctx.moveTo(x0 - 3, y0);
+      ctx.lineTo(x0 + 3, y0);
+    } else {
+      points.forEach(function (p, i) {
+        var x = i / (points.length - 1) * w;
+        var y = h - (p.net - lo) / (hi - lo) * h;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+    }
     ctx.stroke();
     ctx.shadowBlur = 0;
     set("chart-lo", "MIN " + fmtNum(Math.min.apply(null, vals), 2));
