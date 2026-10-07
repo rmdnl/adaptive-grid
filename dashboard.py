@@ -71,6 +71,8 @@ ENTRY_BLOCKER_LABELS = {
     # Risk veto reasons (risk.py order_veto)
     "symbol_stopped": "Symbol risk-stopped",
     "symbol_error": "Symbol in error state",
+    # Transient exchange outage (ExchangeUnavailable — retried next cycle)
+    "exchange_unavailable": "Exchange unavailable — no orders this cycle",
     # global_kill:<reason> is rendered by the fallback path (human_entry_blocker callers / JS)
 }
 
@@ -650,6 +652,7 @@ footer .ro{margin-left:auto; color:var(--green); letter-spacing:.22em}
     risk_veto: "RISK ENGINE VETOED ENTRY",
     symbol_stopped: "SYMBOL RISK-STOPPED",
     symbol_error: "SYMBOL IN ERROR STATE",
+    exchange_unavailable: "EXCHANGE UNAVAILABLE — RETRYING NEXT CYCLE",
     grid_placement_failed: "GRID GENERATION FAILED",
     insufficient_balance: "INSUFFICIENT USDT BALANCE",
     balance_unavailable: "USDT BALANCE UNAVAILABLE",

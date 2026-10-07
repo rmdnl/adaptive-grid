@@ -33,6 +33,7 @@ from exchange import (
     BinanceSpot,
     DryRunExecutor,
     ExchangeError,
+    ExchangeUnavailable,
     LiveExecutor,
     OrderRejected,
     OrderUnknownState,
@@ -316,6 +317,18 @@ class Bot:
                     entry_blocker="symbol_error",
                 )
                 self.store.add_risk_event(symbol, "order_rejected", str(exc))
+            except ExchangeUnavailable as exc:
+                # Exchange-side availability failure on an idempotent read
+                # (5xx / network): no order state was touched and nothing
+                # is unknown. Fail closed for THIS cycle (no orders) and
+                # retry on the next one — never an operator-attention ERROR.
+                log.warning(
+                    "exchange unavailable for %s — no orders this cycle (retry next cycle): %s",
+                    symbol, exc,
+                )
+                self.store.set_symbol_state(
+                    symbol, "ENTRY_BLOCKED", entry_blocker="exchange_unavailable"
+                )
             except Exception as exc:  # keep the loop alive, mark the symbol
                 log.exception("cycle failed for %s", symbol)
                 self.store.set_symbol_state(
@@ -1175,9 +1188,8 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
     2. Zero inventory for the symbol (inventory_qty == 0)
     3. Zero exchange open orders for the symbol
     4. Global kill switch is INACTIVE
-    5. Symbol's current risk_status is exactly "stopped" (not "error", not "ok")
+    5. Symbol's current risk_status is exactly "stopped" or "error"
     6. Symbol is NOT in COOLDOWN (cooldown_until must be None or in the past)
-    7. Symbol is NOT in ERROR state (risk_status != "error")
 
     If ANY verification fails for ANY symbol, the operation aborts without
     changing ANY symbol state. The operation is deterministic and idempotent.
@@ -1259,6 +1271,7 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
                 strategy_state="WAITING",
                 exit_reason=None,
                 exit_status=0,
+                entry_blocker=None,
                 # A stale soft-exit marker would route the next grid into the
                 # soft-exit branch and instantly escalate its first fill to a
                 # market sell — the lifecycle marker must not survive a resume.
@@ -1281,19 +1294,22 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
         print("OVERALL: FAIL-CLOSED (global kill active)", file=out)
         return 1
 
-    # 2. Find symbols with risk_status == "stopped"
+    # 2. Find symbols with risk_status "stopped" or "error" — both are
+    # operator-attention latches, and both are recoverable through the
+    # same strict verification (clean reconciliation, zero inventory,
+    # zero open orders, ledger consistent).
     stopped_symbols = []
     for symbol in cfg.pair_list:
         st = store.get_symbol(symbol)
-        if st is not None and st.risk_status == "stopped":
+        if st is not None and st.risk_status in ("stopped", "error"):
             stopped_symbols.append(symbol)
 
     if not stopped_symbols:
-        print("RESUME-STOPPED: no symbols with risk_status='stopped' found.", file=out)
+        print("RESUME-STOPPED: no symbols with risk_status 'stopped'/'error' found.", file=out)
         print("OVERALL: OK (nothing to recover)", file=out)
         return 0
 
-    print(f"RESUME-STOPPED: verifying {len(stopped_symbols)} stopped symbol(s): {', '.join(stopped_symbols)}", file=out)
+    print(f"RESUME-STOPPED: verifying {len(stopped_symbols)} latched symbol(s): {', '.join(stopped_symbols)}", file=out)
     print("", file=out)
 
     executor = LiveExecutor(cfg, spot, store)
@@ -1305,20 +1321,14 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
         symbol_clean = True
         st = store.get_symbol(symbol)
 
-        # Check 2a: Symbol must NOT be in ERROR state
-        if st is not None and st.risk_status == "error":
-            print(f"  BLOCKED: symbol is in ERROR state (risk_status='error')", file=out)
-            symbol_clean = False
-            all_clean = False
-
-        # Check 2b: Symbol must NOT be in COOLDOWN
+        # Check 2a: Symbol must NOT be in COOLDOWN
         if st is not None and st.cooldown_until is not None and st.cooldown_until > time.time():
             print(f"  BLOCKED: symbol is in COOLDOWN (until {st.cooldown_until})", file=out)
             symbol_clean = False
             all_clean = False
 
-        # Check 2c: Symbol must have risk_status == "stopped" (already filtered, but double-check)
-        if st is None or st.risk_status != "stopped":
+        # Check 2b: Symbol must have risk_status "stopped" or "error" (already filtered, but double-check)
+        if st is None or st.risk_status not in ("stopped", "error"):
             print(f"  BLOCKED: symbol risk_status is not 'stopped' (current: {st.risk_status if st else 'None'})", file=out)
             symbol_clean = False
             all_clean = False
@@ -1429,6 +1439,9 @@ def _resume_stopped_symbols(cfg: Config, spot: "BinanceSpot", store: StateStore,
             strategy_state="WAITING",
             exit_reason=None,
             exit_status=0,
+            # A stale blocker would mislabel WAITING as blocked until the
+            # next entry evaluation rewrites it.
+            entry_blocker=None,
             # A stale soft-exit marker would route the next grid into the
             # soft-exit branch and instantly escalate its first fill to a
             # market sell — the lifecycle marker must not survive a resume.
@@ -1833,9 +1846,10 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--resume-stopped", action="store_true",
-        help="safely clear symbol-level STOPPED state after strict verification: "
+        help="safely clear symbol-level STOPPED/ERROR state after strict verification: "
              "reconciles exchange/local state, requires zero inventory, zero open orders, "
-             "no unknown orders, no global kill, and only affects risk_status='stopped' symbols",
+             "no unknown orders, no global kill; only affects risk_status='stopped' or "
+             "'error' symbols",
     )
     args = parser.parse_args(argv)
 

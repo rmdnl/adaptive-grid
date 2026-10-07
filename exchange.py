@@ -88,6 +88,14 @@ class OrderUnknownState(ExchangeError):
     """The final state of an order submission is unknown (fail-closed)."""
 
 
+class ExchangeUnavailable(ExchangeError):
+    """The exchange could not be reached, or answered a read-only GET with
+    a server-side availability failure (5xx/429/network). No order state
+    was touched and nothing is unknown: the caller may fail closed for the
+    current cycle and retry the read on the next one — this is a normal
+    operating condition, not a defect demanding operator attention."""
+
+
 class OrderRejected(ExchangeError):
     """The exchange definitively rejected the order (HTTP 400 with a Binance
     error code, e.g. a filter failure) — the order was never created and a
@@ -161,6 +169,13 @@ class BinanceSpot:
                     )
                     time.sleep(0.5 * (attempt + 1))
                     continue
+                if method == "GET" and exc.code in transient_http:
+                    # Read-side availability failure (exchange outage /
+                    # gateway 5xx / rate limit): classified so callers can
+                    # fail closed for the cycle without latching ERROR.
+                    raise ExchangeUnavailable(
+                        f"{method} {path} -> HTTP {exc.code}: {body}"
+                    ) from None
                 raise ExchangeError(f"{method} {path} -> HTTP {exc.code}: {body}") from None
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = exc
@@ -173,6 +188,12 @@ class BinanceSpot:
                 raise ExchangeError(
                     f"{method} {path} returned a malformed response: {exc}"
                 ) from None
+        if method == "GET":
+            # Network-level failure (DNS / timeout / connection) on an
+            # idempotent read: same availability semantics as a 5xx.
+            raise ExchangeUnavailable(
+                f"{method} {path} failed after retries: {last_error}"
+            )
         raise ExchangeError(f"{method} {path} failed after retries: {last_error}")
 
     # ----- public market data -----

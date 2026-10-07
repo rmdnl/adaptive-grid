@@ -8,7 +8,7 @@ Covers all safety requirements:
 - Require global kill switch to be inactive
 - Only affect symbols whose current risk_status is exactly "stopped"
 - Never clear global kill state
-- Never clear ERROR state
+- Clear ERROR state only through the same strict verification
 - Never clear cooldown state
 - Never create orders during --resume-stopped
 - Never change balances, positions, PnL, historical fills, risk events, or session ID
@@ -303,14 +303,17 @@ def test_resume_stopped_global_kill_active_blocks(tmp_path):
 # f. ERROR is not cleared
 # ---------------------------------------------------------------------------
 
-def test_resume_stopped_error_state_not_cleared(tmp_path):
-    """Symbols with risk_status='error' are NOT cleared (only 'stopped' symbols affected)."""
+def test_resume_stopped_error_state_recovered_after_verification(tmp_path):
+    """ERROR symbols are now recoverable through the same strict
+    verification as STOPPED ones (zero inventory, zero open orders, clean
+    ledger) — e.g. after a transient-outage latch was diagnosed and
+    resolved by the operator."""
     store, cfg, spot = _env(tmp_path)
-    # Set symbol to ERROR state (not STOPPED)
     store.update_symbol(
         "AAA/USDT",
         risk_status="error",
         strategy_state="ERROR",
+        entry_blocker="symbol_error",
         exit_reason="liquidation_failed",
         exit_status=1,
     )
@@ -319,15 +322,14 @@ def test_resume_stopped_error_state_not_cleared(tmp_path):
     code = bot._resume_stopped_symbols(cfg, spot, store, out)
     output = out.getvalue()
 
-    # Should succeed (no stopped symbols to recover) but NOT clear ERROR
-    assert code == 0
-    assert "no symbols with risk_status='stopped' found" in output
-
-    # Verify ERROR state preserved
+    assert code == 0, output
+    assert "verifying 1 latched symbol(s): AAA/USDT" in output
+    assert "VERIFICATION: PASSED" in output
     st = store.get_symbol("AAA/USDT")
-    assert st.risk_status == "error"
-    assert st.strategy_state == "ERROR"
-    assert st.exit_reason == "liquidation_failed"
+    assert st.risk_status == "ok"
+    assert st.strategy_state == "WAITING"
+    assert st.entry_blocker is None
+    assert st.exit_reason is None and st.exit_status == 0
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +355,7 @@ def test_resume_stopped_cooldown_not_cleared(tmp_path):
 
     # Should succeed (no stopped symbols) but NOT clear COOLDOWN
     assert code == 0
-    assert "no symbols with risk_status='stopped' found" in output
+    assert "no symbols with risk_status 'stopped'/'error' found" in output
 
     # Verify COOLDOWN state preserved
     st = store.get_symbol("AAA/USDT")
@@ -409,7 +411,7 @@ def test_resume_stopped_idempotent_second_execution(tmp_path):
     code2 = bot._resume_stopped_symbols(cfg, spot, store, out2)
     output2 = out2.getvalue()
     assert code2 == 0
-    assert "no symbols with risk_status='stopped' found" in output2
+    assert "no symbols with risk_status 'stopped'/'error' found" in output2
 
     # State should remain unchanged (still WAITING)
     st = store.get_symbol("AAA/USDT")

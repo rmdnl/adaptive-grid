@@ -1447,3 +1447,73 @@ def test_hard_exit_clears_stale_entry_blocker(tmp_path):
     st = store.get_symbol("BTC/USDT")
     assert st.strategy_state in ("COOLDOWN", "EXITING")
     assert st.entry_blocker is None
+
+
+def test_exchange_outage_does_not_latch_error(tmp_path):
+    """A transient exchange-side availability failure on a read (e.g. a
+    testnet 502 during klines fetch) must NOT latch the symbol into
+    ERROR: fail closed for the cycle (ENTRY_BLOCKED / exchange_unavailable),
+    risk_status stays ok, and the next healthy cycle evaluates normally."""
+    bot, store, market = _env(tmp_path)
+    from exchange import ExchangeUnavailable
+
+    real_snapshot = market.snapshot
+
+    def _flaky_then_healthy(symbol, cfg, now_ms):
+        if not getattr(_flaky_then_healthy, "_failed", False):
+            _flaky_then_healthy._failed = True
+            raise ExchangeUnavailable("GET /api/v3/klines -> HTTP 502: outage")
+        return real_snapshot(symbol, cfg, now_ms)
+
+    market.snapshot = _flaky_then_healthy
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ENTRY_BLOCKED"
+    assert st.entry_blocker == "exchange_unavailable"
+    assert st.risk_status == "ok"                      # no operator latch
+
+    bot.run_once()                                     # exchange recovered
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ENTRY_BLOCKED"        # normal evaluation resumes
+    assert st.entry_blocker != "exchange_unavailable"  # real gate decided
+
+
+def test_resume_stopped_clears_error_state_after_verification(tmp_path):
+    """--resume-stopped recovers risk_status='error' symbols through the
+    same strict verification (zero inventory, zero open orders, clean
+    ledger) — the recovery path for e.g. a transient-outage latch."""
+    from bot import _resume_stopped_symbols
+    import io
+    bot, store, _market = _env(tmp_path)
+    store.update_symbol(
+        "BTC/USDT",
+        risk_status="error",
+        strategy_state="ERROR",
+        entry_blocker="symbol_error",
+        exit_status=1,
+        exit_reason="time_stop_escalation",
+    )
+    out = io.StringIO()
+    rc = _resume_stopped_symbols(bot.cfg, None, store, out=out)
+    assert rc == 0, out.getvalue()
+    st = store.get_symbol("BTC/USDT")
+    assert st.risk_status == "ok"
+    assert st.strategy_state == "WAITING"
+    assert st.entry_blocker is None
+    assert st.exit_reason is None and st.exit_status == 0
+
+
+def test_resume_stopped_refuses_error_symbol_with_open_orders(tmp_path):
+    """Verification is strict for ERROR recovery too: an ERROR symbol with
+    open orders must NOT be recovered."""
+    from bot import _resume_stopped_symbols
+    import io
+    bot, store, _market = _env(tmp_path)
+    store.update_symbol("BTC/USDT", risk_status="error", strategy_state="ERROR")
+    store.create_order("cid-open-err", "BTC/USDT", "BUY", "LIMIT_MAKER",
+                       49650.0, 0.00021, "dry_run")
+    out = io.StringIO()
+    rc = _resume_stopped_symbols(bot.cfg, None, store, out=out)
+    assert rc == 1
+    st = store.get_symbol("BTC/USDT")
+    assert st.risk_status == "error"                   # unchanged, fail-closed
