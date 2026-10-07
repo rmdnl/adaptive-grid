@@ -54,54 +54,60 @@ STATE_LABELS = {
 }
 
 ENTRY_BLOCKER_LABELS = {
-    "exit_priority": "Exit signal takes priority",
+    # Strategy gates (strategy.entry_blockers)
+    "adx_not_low": "ADX above entry limit",
     "adx_rising": "ADX rising — regime strengthening",
     "stoch_no_cross": "Stoch RSI %K has not crossed up through %D",
     "stoch_k_too_high": "Stoch RSI %K above entry limit",
+    "insufficient_data": "Insufficient indicator data",
+    # Bot-layer gates (bot.py entry path)
+    "exit_priority": "Exit signal takes priority",
     "min_interval_not_elapsed": "Minimum hours between entries not elapsed",
-    "rsi_not_low": "RSI above entry threshold",
-    "adx_trending": "ADX indicates trending market",
-    "bb_not_low": "Price not at lower Bollinger Band",
-    "volume_osc_insufficient": "Volume oscillator too low",
-    "zscore_too_high": "Z-score exceeds entry limit",
-    "boundary_breach": "15m candle breached lower boundary",
+    "no_closed_candle": "No closed candle",
+    "stale_market_data": "Market data too old",
     "boundary_unknown": "15m boundary data unavailable",
-    "risk_veto": "Risk engine vetoed entry",
-    "grid_placement_failed": "Grid generation failed",
+    "balance_unavailable": "USDT balance unavailable",
     "insufficient_balance": "Insufficient USDT balance",
-    "no_active_symbol_config": "No active symbol configuration",
-    "stale_data": "Market data too old",
+    # Risk veto reasons (risk.py order_veto)
+    "symbol_stopped": "Symbol risk-stopped",
+    "symbol_error": "Symbol in error state",
+    # global_kill:<reason> is rendered by the fallback path (human_entry_blocker callers / JS)
 }
 
 EXIT_REASON_LABELS = {
-    "adx_trending": "ADX trending — trend strength confirmed",
-    "rsi_overbought": "RSI overbought — mean reversion likely",
-    "bb_percent_b_max": "Price at upper Bollinger Band",
-    "zscore_abs_max": "Z-score extreme — statistical edge exhausted",
-    "exit_adx_min": "ADX minimum threshold met",
-    "exit_rsi_min": "RSI minimum threshold met",
-    "exit_bb_percent_b_min": "BB %B minimum threshold met",
-    "exit_zscore_abs_max": "Z-score absolute maximum exceeded",
+    # Regime + Recovery strategy exits (strategy.evaluate_exit)
     "adx_trending_up": "ADX trending up with +DI dominant — SOFT exit (buys cancelled, sells left to fill)",
-    "stoch_k_overbought": "Stoch RSI %K overbought — SOFT exit (buys cancelled, sells left to fill)",
     "adx_trending_down": "ADX trending with -DI dominant — HARD exit (liquidated)",
+    "stoch_k_overbought": "Stoch RSI %K overbought — SOFT exit (buys cancelled, sells left to fill)",
+    # Lifecycle exits (bot.py)
     "time_stop": "Time stop — grid older than HOLD_MAX_HOURS (SOFT exit)",
     "time_stop_escalation": "Time stop — inventory remained after the SOFT window (HARD exit)",
+    "soft_exit_escalation": "SOFT exit did not clear in time — escalated to HARD exit",
+    "adx_trending_up_escalation": "SOFT exit (ADX up) did not clear in time — escalated to HARD exit",
+    "adx_trending_down_escalation": "SOFT exit (ADX down) did not clear in time — escalated to HARD exit",
+    "stoch_k_overbought_escalation": "SOFT exit (Stoch overbought) did not clear in time — escalated to HARD exit",
     "lower_boundary_breach": "15m close breached lower stop boundary",
+    "interrupted_exit_recovery": "Interrupted exit recovered — uncovered inventory liquidated",
+    # Global kill
     "global_drawdown": "Global equity drawdown limit hit",
     "risk_engine_veto": "Risk engine vetoed continuation",
 }
 
 BLOCK_REASON_LABELS = {
-    "exit_priority": "Exit signal active — new entry blocked",
-    "rsi_not_low": "RSI not in oversold zone",
-    "adx_trending": "ADX shows trending — no ranging entry",
-    "boundary_unknown": "15m boundary data missing — fail-closed",
-    "boundary_breach": "15m close below lower boundary — STOPPED",
-    "risk_veto": "Risk engine veto",
-    "stale_data": "Market data stale — cannot verify safety",
-    "insufficient_balance": "USDT balance below grid minimum",
-    "grid_placement_failed": "Grid economics failed validation",
+    # block_reason carries grid-economics reject codes (bot writes
+    # plan.block_reason / quote_budget_exceeded / adaptive planner errors
+    # here); entry-gate codes live in ENTRY_BLOCKER_LABELS instead.
+    "invalid_mode": "Invalid grid mode",
+    "insufficient_data": "Insufficient data (no closed candles / no ATR)",
+    "invalid_filters": "Invalid exchange filters",
+    "reference_price_unavailable": "Reference price unavailable",
+    "percent_price_band": "Outside percent price band",
+    "no_valid_levels": "Insufficient valid levels",
+    "gross_below_minimum": "Gross profit below minimum",
+    "net_below_minimum": "Net profit below minimum",
+    "current_price_below_lower_bound": "Current price below lower bound",
+    "current_price_above_upper_bound": "Current price above upper bound",
+    "quote_budget_exceeded": "Total quote budget exceeded",
     "unknown": "Unknown blocker — check logs",
 }
 
@@ -132,6 +138,8 @@ def human_state(state: str) -> str:
 def human_entry_blocker(blocker: Optional[str]) -> str:
     if not blocker:
         return "No blocker"
+    if blocker.startswith("global_kill:"):
+        return "Global kill: " + blocker[len("global_kill:"):].replace("_", " ")
     return ENTRY_BLOCKER_LABELS.get(blocker, blocker.replace("_", " ").title())
 
 def human_exit_reason(reason: Optional[str]) -> str:
@@ -142,6 +150,10 @@ def human_exit_reason(reason: Optional[str]) -> str:
 def human_block_reason(reason: Optional[str]) -> str:
     if not reason:
         return "No block reason"
+    if reason.startswith("adaptive_grid_failed:"):
+        detail = reason[len("adaptive_grid_failed:"):].strip()
+        return "Adaptive planner: " + BLOCK_REASON_LABELS.get(
+            detail, detail.replace("_", " ").title())
     return BLOCK_REASON_LABELS.get(reason, reason.replace("_", " ").title())
 
 def human_risk_status(status: str) -> str:

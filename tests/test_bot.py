@@ -1409,3 +1409,41 @@ def test_place_grid_failure_cancels_placed_levels(tmp_path):
         bot._place_grid("BTC/USDT", plan)
     assert executor.calls == 3                     # failed on level 3
     assert store.count_open_orders("BTC/USDT") == 0  # levels 1-2 cancelled
+
+
+def test_cycle_error_writes_symbol_error_blocker(tmp_path):
+    """An unexpected cycle failure marks the symbol ERROR with the
+    symbol_error entry blocker (dashboard displays 'SYMBOL IN ERROR STATE',
+    not a stale strategy gate)."""
+    bot, store, market = _env(tmp_path)
+
+    def _boom(*a, **k):
+        raise RuntimeError("boom")
+
+    market.snapshot = _boom
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state == "ERROR"
+    assert st.risk_status == "error"
+    assert st.entry_blocker == "symbol_error"
+
+
+def test_hard_exit_clears_stale_entry_blocker(tmp_path):
+    """Entering EXITING must clear any leftover entry blocker: during an
+    exit, entry is not evaluated and an old gate must not be displayed."""
+    bot, store, market = _env(tmp_path)
+    store.update_symbol("BTC/USDT", entry_blocker="exit_priority")
+    market.set("BTC/USDT", snap_entry(), close_15m=49000.0, candle=NO_FILL_CANDLE)
+    # drive a hard exit via boundary breach (close far below the boundary)
+    market.set("BTC/USDT", snap_entry(), close_15m=100.0, candle=NO_FILL_CANDLE)
+    # need an active grid first: place one with a normal candle
+    market.set("BTC/USDT", snap_entry(), close_15m=49500.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    assert store.get_symbol("BTC/USDT").strategy_state == "ACTIVE"
+    # now breach the 15m boundary -> HARD exit -> EXITING
+    store.update_symbol("BTC/USDT", entry_blocker="exit_priority")  # simulate stale
+    market.set("BTC/USDT", snap_entry(), close_15m=100.0, candle=NO_FILL_CANDLE)
+    bot.run_once()
+    st = store.get_symbol("BTC/USDT")
+    assert st.strategy_state in ("COOLDOWN", "EXITING")
+    assert st.entry_blocker is None

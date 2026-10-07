@@ -210,3 +210,65 @@ def test_dashboard_server_read_only(seeded):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ----- label coverage over the codes the bot actually writes -----
+
+def test_exit_reason_labels_cover_escalation_attribution():
+    """Since exit-reason attribution, soft exits escalate as
+    '<original>_escalation': every reachable escalation label must exist."""
+    from dashboard import EXIT_REASON_LABELS
+    for reason in (
+        "time_stop_escalation",
+        "soft_exit_escalation",
+        "adx_trending_up_escalation",
+        "adx_trending_down_escalation",
+        "stoch_k_overbought_escalation",
+        "interrupted_exit_recovery",
+        "lower_boundary_breach",
+        "time_stop",
+        "adx_trending_up",
+        "adx_trending_down",
+        "stoch_k_overbought",
+    ):
+        assert reason in EXIT_REASON_LABELS, reason
+    # legacy strategy codes that can no longer occur are pruned
+    for dead in ("rsi_overbought", "bb_percent_b_max", "zscore_abs_max",
+                 "adx_trending", "exit_adx_min"):
+        assert dead not in EXIT_REASON_LABELS, dead
+
+
+def test_block_reason_labels_cover_grid_codes():
+    """block_reason carries grid-economics codes: every code build_grid /
+    _place_grid can write must be labeled, and the adaptive planner prefix
+    renders readably."""
+    from dashboard import BLOCK_REASON_LABELS, human_block_reason
+    for code in (
+        "invalid_mode", "insufficient_data", "invalid_filters",
+        "reference_price_unavailable", "percent_price_band",
+        "no_valid_levels", "gross_below_minimum", "net_below_minimum",
+        "current_price_below_lower_bound", "current_price_above_upper_bound",
+        "quote_budget_exceeded",
+    ):
+        assert code in BLOCK_REASON_LABELS, code
+    assert human_block_reason("net_below_minimum") == "Net profit below minimum"
+    assert human_block_reason(
+        "adaptive_grid_failed: no valid grid found"
+    ) == "Adaptive planner: No Valid Grid Found"
+
+
+def test_entry_blocker_labels_cover_live_codes():
+    """Every entry_blocker the bot writes (bot.py + strategy.py +
+    risk.order_veto) must be labeled; legacy strategy codes pruned."""
+    from dashboard import ENTRY_BLOCKER_LABELS, human_entry_blocker
+    for code in (
+        "adx_not_low", "adx_rising", "stoch_no_cross", "stoch_k_too_high",
+        "insufficient_data", "exit_priority", "min_interval_not_elapsed",
+        "no_closed_candle", "stale_market_data", "boundary_unknown",
+        "balance_unavailable", "insufficient_balance",
+        "symbol_stopped", "symbol_error",
+    ):
+        assert code in ENTRY_BLOCKER_LABELS, code
+    assert human_entry_blocker("global_kill:max_drawdown_breach") == (
+        "Global kill: max drawdown breach"
+    )

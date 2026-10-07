@@ -301,18 +301,27 @@ class Bot:
                 # Unknown order state can never be reconciled: fail closed
                 # permanently for this symbol (risk veto, no re-entry).
                 log.error("fail-closed (%s): %s", symbol, exc)
-                self.store.set_symbol_state(symbol, "STOPPED", risk_status="stopped")
+                self.store.set_symbol_state(
+                    symbol, "STOPPED", risk_status="stopped",
+                    entry_blocker="symbol_stopped",
+                )
                 self.store.add_risk_event(symbol, "order_unknown_state", str(exc))
             except OrderRejected as exc:
                 # The exchange definitively refused an order (e.g. a filter
                 # failure): not unknown, but never retried blindly — the
                 # symbol stops for operator attention.
                 log.error("order rejected (%s): %s", symbol, exc)
-                self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                self.store.set_symbol_state(
+                    symbol, "ERROR", risk_status="error",
+                    entry_blocker="symbol_error",
+                )
                 self.store.add_risk_event(symbol, "order_rejected", str(exc))
             except Exception as exc:  # keep the loop alive, mark the symbol
                 log.exception("cycle failed for %s", symbol)
-                self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
+                self.store.set_symbol_state(
+                    symbol, "ERROR", risk_status="error",
+                    entry_blocker="symbol_error",
+                )
                 self.store.add_risk_event(symbol, "cycle_error", str(exc))
         self._update_equity(now)
         self._update_wallet()
@@ -863,7 +872,11 @@ class Bot:
         cooldown (or risk stop when cooldown_hours is None). Any
         verification failure is fail-closed (state ERROR)."""
         log.info("hard exit %s reason=%s", symbol, reason)
-        self.store.set_symbol_state(symbol, "EXITING", exit_reason=reason)
+        # Entry is not evaluated during an exit: clear any stale blocker so
+        # the dashboard cannot attribute an old gate to the EXITING state.
+        self.store.set_symbol_state(
+            symbol, "EXITING", exit_reason=reason, entry_blocker=None,
+        )
         if not self.executor.cancel_all(symbol):
             self.store.add_risk_event(symbol, "cancel_verify_failed", reason)
             self.store.set_symbol_state(symbol, "ERROR", risk_status="error")
