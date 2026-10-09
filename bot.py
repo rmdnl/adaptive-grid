@@ -666,6 +666,7 @@ class Bot:
                     grid_mode=plan.mode,
                     grid_step=plan.step,
                     grid_lower=adaptive_plan.lowest_buy,
+                    grid_upper=adaptive_plan.upper_price,
                     gross_pct=plan.gross_pct,
                     net_pct=plan.net_pct,
                     # Persist adaptive parameters (locked for active grid)
@@ -715,6 +716,7 @@ class Bot:
                     grid_mode=plan.mode,
                     grid_step=plan.step,
                     grid_lower=plan.lower_price,
+                    grid_upper=plan.upper_price,
                     gross_pct=plan.gross_pct,
                     net_pct=plan.net_pct,
                     grid_started_ts=now,

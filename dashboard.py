@@ -261,6 +261,8 @@ def _symbol_payload(store: StateStore, st) -> Dict:
         "cooldown_until": st.cooldown_until,
         "grid_mode": st.grid_mode,
         "grid_step": st.grid_step,
+        "grid_lower": st.grid_lower,
+        "grid_upper": st.grid_upper,
         "grid_count": store.count_completed_grids(st.symbol),
         "gross_pct": st.gross_pct,
         "net_pct": st.net_pct,

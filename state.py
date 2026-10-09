@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     exit_status INTEGER DEFAULT 0,
     exit_reason TEXT,
     cooldown_until REAL,
-    grid_mode TEXT, grid_step REAL, grid_lower REAL,
+    grid_mode TEXT, grid_step REAL, grid_lower REAL, grid_upper REAL,
     gross_pct REAL, net_pct REAL,
     -- Adaptive grid parameters (Phase 1): locked when grid becomes active
     adaptive_lower_price REAL, adaptive_upper_price REAL,
@@ -92,7 +92,7 @@ _SYMBOL_COLUMNS = {
     "timeframe", "last_price", "adx", "rsi", "percent_b", "volume_osc",
     "zscore", "atr", "strategy_state", "entry_blocker", "block_reason",
     "exit_status", "exit_reason", "cooldown_until", "grid_mode", "grid_step",
-    "grid_lower", "gross_pct", "net_pct",
+    "grid_lower", "grid_upper", "gross_pct", "net_pct",
     # Adaptive grid parameters (Phase 1): locked when grid becomes active
     "adaptive_lower_price", "adaptive_upper_price", "adaptive_total_grids",
     "adaptive_quote_budget", "adaptive_grid_step", "adaptive_reference_price",
@@ -146,6 +146,7 @@ class SymbolState:
     grid_mode: Optional[str] = None
     grid_step: Optional[float] = None
     grid_lower: Optional[float] = None
+    grid_upper: Optional[float] = None
     gross_pct: Optional[float] = None
     net_pct: Optional[float] = None
     # Adaptive grid parameters (Phase 1): locked when grid becomes active
